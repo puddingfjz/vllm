@@ -1,0 +1,19 @@
+# pack-refs with: peeled fully-peeled sorted 
+07e9197014ce0dbbbd7015fe765ab92159dee492 refs/remotes/origin/longchat-test
+1f24755bf802a2061bd46f3dd1191b7898f13f45 refs/remotes/origin/main
+ba5d161d185721b5fe91ff91e874850327b9d2ba refs/remotes/origin/pa-1d
+4124386cc9625e5f0e1e244ec2098c0c5aef64d7 refs/remotes/origin/rope-fp32
+c149a9819c2f83c2b8850c79d54e014d4f27e836 refs/remotes/origin/test-acc
+91691734c3091eaa4c9c2c85f206f129dc8de937 refs/remotes/origin/vllm-without-tokenization-sampling
+aa50b17ca776f8c69a793787d0ce06dfa4671884 refs/tags/submission
+67d96c29fba9b72cb4c4edbc26211c208a00ebdd refs/tags/v0.1.0
+83658c8ace771617460f9e2d5f1cf6f811d6d6fb refs/tags/v0.1.1
+1c395b4eaa805fc7cacf2f591e658ce395761537 refs/tags/v0.1.2
+aa84c92ef636e689b506b9842c712e5c615cc73a refs/tags/v0.1.3
+791d79de3261402fae1b9d0b1650655071a68095 refs/tags/v0.1.4
+852ef5b4f5481ce526c804ea234d1de0df91f48d refs/tags/v0.1.5
+1117aa1411d9858ea5eef8a81e044379432e6d0e refs/tags/v0.1.6
+90eb3f43ca5228647c834243d98881d53c7745d0 refs/tags/v0.1.7
+e2fb71ec9f2c3168ba8614408fa807a5f65707c5 refs/tags/v0.2.0
+651c614aa43e497a2e2aab473493ba295201ab20 refs/tags/v0.2.1
+3d40c834f020a0d180a0af49bf25ffa9b22fa84b refs/tags/v0.2.1.post1
