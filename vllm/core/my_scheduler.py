@@ -630,6 +630,10 @@ class Scheduler:
                 # If the number of batched tokens exceeds the limit, stop.
                 new_seq_lens = seq_lens + [num_prompt_tokens]
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
+                # <jingzhi> For Profiling: temporarily remove this condition checking
+                # if (num_batched_tokens >
+                #         self.scheduler_config.max_num_batched_tokens * 15):
+                #     break
                 if (num_batched_tokens >
                         self.scheduler_config.max_num_batched_tokens):
                     break
@@ -1311,8 +1315,8 @@ class Scheduler:
             # scheduler_outputs = self._my_schedule()
             scheduler_outputs = self._schedule_outlen_aware()
         else:
-            # scheduler_outputs = self._schedule()
-            scheduler_outputs = self._schedule_peak_demand_aware_paged()
+            scheduler_outputs = self._schedule()
+            # scheduler_outputs = self._schedule_peak_demand_aware_paged()
 
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
@@ -1402,7 +1406,7 @@ class Scheduler:
                 preemption_mode = PreemptionMode.RECOMPUTE
 
                 # <jingzhi> For DEBUG
-                # preemption_mode = PreemptionMode.SWAP
+                preemption_mode = PreemptionMode.SWAP
 
             else:
                 preemption_mode = PreemptionMode.SWAP
@@ -1576,7 +1580,10 @@ def DP_select_requests_to_release(curr_on_card, candidates, tot_blk_num, to_rele
         return True
 
     # 
-    assert curr_on_card[-len(candidates):] == candidates
+
+    # <jingzhi> For DEBUG
+    # print(curr_on_card, candidates)
+    assert (curr_on_card[-len(candidates):] == candidates) or (len(candidates) == 0) # candidates=[] means this solution is not feasible
 
 
     best_idx = None

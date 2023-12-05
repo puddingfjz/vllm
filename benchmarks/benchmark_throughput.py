@@ -1,6 +1,6 @@
 """Benchmark offline inference throughput."""
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='3'
+os.environ['CUDA_VISIBLE_DEVICES']='2'
 os.environ['USE_OUR_METHOD'] = 'False'
 
 os.environ['run_profile'] = 'False'
@@ -112,15 +112,17 @@ def my_sample_requests(
             continue
         # if (prompt_len < 1180 or prompt_len + output_len > 1260):
         #     continue
-        # if prompt_len != 1232:
+        # if prompt_len > 1024:
         #     continue
         # if (output_len > 128) or (output_len < 100):
         #     continue
         filtered_dataset.append((prompt, prompt_len, output_len))
 
 
-    # for extreme case test
+    # for extreme case test or for cost model profiling
     # filtered_dataset = [(filtered_dataset[0][0],filtered_dataset[0][1], 2+16)]
+    # filtered_dataset = [(filtered_dataset[0][0],filtered_dataset[0][1], 120)]
+    # filtered_dataset = [(info[0],info[1], 120) for info in filtered_dataset]
 
     # Sample the requests.
     print(f"len(filtered_dataset): {len(filtered_dataset)}")
@@ -135,7 +137,7 @@ def my_sample_requests(
         sampled_requests = [(None, 5, 6), (None, 8, 3)]
 
 
-    sampled_requests = sorted(sampled_requests, key=lambda info: info[2], reverse=True)
+    sampled_requests = sorted(sampled_requests, key=lambda info: info[2]) #, reverse=True)
     print(f"sampled_requests: {[info[1:] for info in sampled_requests]}")
 
     return sampled_requests
@@ -682,7 +684,7 @@ def run_vllm(
         dtype=dtype,
 
         # <jingzhi> parameter setting
-        gpu_memory_utilization=0.1801,
+        gpu_memory_utilization= 0.9, # 0.4, #  0.1801,
         swap_space=58,
 
     )

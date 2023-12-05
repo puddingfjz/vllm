@@ -18,6 +18,10 @@ from vllm.utils import get_gpu_memory, get_max_shared_memory_bytes
 
 
 
+# <jingzhi>
+import numpy as np
+
+
 class MyWorkerConfig(object):
     """docstring for MyWorkerConfig"""
     def __init__(self):
@@ -411,14 +415,16 @@ class Worker:
             seq_groups.append((seq_ids, sampling_params))
 
             for seq_id in seq_ids:
+                seq_data = seq_group_metadata.seq_data[seq_id]
+                generation_token = seq_data.get_last_token_id()
+
                 block_table = seq_group_metadata.block_tables[seq_id]
                 context_len = seq_data.get_len()
                 if self.sliding_window is not None:
                     context_len = min(context_len, self.sliding_window)
                 position = context_len - 1
 
-                seq_data = seq_group_metadata.seq_data[seq_id]
-                generation_token = seq_data.get_last_token_id()
+
 
                 # <jingzhi>
                 compute_poses = None
@@ -453,11 +459,12 @@ class Worker:
                     input_positions.append([position])
 
                     # get generation block tables
+                    tmp_blk_table = block_table
                     if self.sliding_window is not None:
                         sliding_window_blocks = (self.sliding_window //
                                                  self.block_size)
-                        block_table = block_table[-sliding_window_blocks:]
-                    generation_block_tables.append(block_table)
+                        tmp_blk_table = tmp_blk_table[-sliding_window_blocks:]
+                    generation_block_tables.append(tmp_blk_table)
                     
                     # get content length
                     context_lens.append(context_len)
@@ -545,6 +552,24 @@ class Worker:
             sliding_window=self.sliding_window,
             selected_token_indices=selected_token_indices,
         )
+
+
+        # <jingzhi> For DEBUG: and for profiling, print input information for each iteration
+        # print(max_seq_len*len(input_tokens))
+        # print(sum([len(_) for _ in generation_block_tables]))
+        # print(max_num_blocks_per_seq)
+        # print(self.block_size)
+        # print(f"(req_num, token_num, padded_token_num, tot_seq_len, max_seq_len): {(len(seq_groups), sum([len(_) for _ in input_tokens]))}")
+        # print(f"(req_num, token_num, padded_token_num, tot_seq_len, max_seq_len): {(len(seq_groups), sum([len(_) for _ in input_tokens]), max_seq_len*len(input_tokens))}")
+        # print(f"(req_num, token_num, padded_token_num, tot_seq_len, max_seq_len): {(len(seq_groups), sum([len(_) for _ in input_tokens]), max_seq_len*len(input_tokens), sum([len(_) for _ in generation_block_tables])*self.block_size)}")
+        if self.block_size == None:
+            set_block_size = 16
+        else:
+            set_block_size = self.block_size
+        print(f"(req_num, token_num, padded_token_num, tot_seq_len, max_seq_len): {(len(seq_groups), sum([len(_) for _ in input_tokens]), max_seq_len*len(input_tokens), sum([len(_) for _ in generation_block_tables])*set_block_size, max_num_blocks_per_seq*set_block_size)}")
+
+
+
         return tokens_tensor, positions_tensor, input_metadata
 
 

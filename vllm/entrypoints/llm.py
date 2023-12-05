@@ -10,6 +10,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
 
 
+
+# <jingzhi>
+import time
+
+
+
 class LLM:
     """An LLM for generating texts from given prompts and sampling parameters.
 
@@ -181,6 +187,12 @@ class LLM:
         # <jingzhi> For Profiling--------------------
         import torch
         step_i = 0
+        finished_num = 0
+        # start = None
+        # end = None
+        start = time.perf_counter()
+        last = start
+        req_latencys = list()
         # -------------------------------------------
 
         while self.llm_engine.has_unfinished_requests():
@@ -198,13 +210,34 @@ class LLM:
             step_outputs = self.llm_engine.step()
 
             print(f"iter_num: {step_i}, on_card_num: {len(self.llm_engine.scheduler.running)}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}")
+            iter_finish_time = time.perf_counter()
 
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
                     if use_tqdm:
                         pbar.update(1)
+                        finished_num+=1
+                        req_latencys.append(iter_finish_time-start)
+
+            print(f"finished num: {finished_num}, time point: {iter_finish_time-last}")
+            # record the cost of each iteration instead of the time point of finishing each iteration
+            last = time.perf_counter()
+
+            # <jingzhi> For DEBUG
+            # if finished_num == 189:
+            #     print(f"Finished 189 requests, this iter is {step_i}")
+            #     start = time.perf_counter()
+
+        
+        # <jingzhi> For DEBUG
+        # end = time.perf_counter()
+        # print(f"Total time from after finishing 189 requests: {end - start}")
+
+
         print(f"Total iteration number: {step_i}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}")
+        print(f"Total latency: {sorted(req_latencys)}")
+        print(f"Min, Max, Mean latency: {min(req_latencys), max(req_latencys), sum(req_latencys)/len(req_latencys)}")
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.
