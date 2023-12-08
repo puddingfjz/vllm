@@ -176,6 +176,15 @@ class LLM:
     def _run_engine(self, use_tqdm: bool, run_profile: bool = False,
         step_start: float=0, step_end: float=float('inf'),
         ) -> List[RequestOutput]:
+
+
+        # <jingzhi> first generate a plan
+        time1 = time.perf_counter()
+        self.llm_engine.scheduler._gen_schedule_plan()
+        time2 = time.perf_counter()
+        self.llm_engine.scheduler.my_scheduler_config.plan_gen_time = time2 - time1
+
+
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -209,7 +218,7 @@ class LLM:
 
             step_outputs = self.llm_engine.step()
 
-            print(f"iter_num: {step_i}, on_card_num: {len(self.llm_engine.scheduler.running)}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}")
+            print(f"iter_num: {step_i}, iter in plan: {self.llm_engine.scheduler.my_scheduler_config.plan_iter_num}, on_card_num: {len(self.llm_engine.scheduler.running)}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}, free blk num: {self.llm_engine.scheduler.block_manager.gpu_allocator.get_num_free_blocks()}")
             iter_finish_time = time.perf_counter()
 
             for output in step_outputs:

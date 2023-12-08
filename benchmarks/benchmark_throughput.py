@@ -1,6 +1,14 @@
 """Benchmark offline inference throughput."""
+
+'''
+Command: 
+python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 1000 > log_plan1.log
+'''
+
+
+
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='2'
+os.environ['CUDA_VISIBLE_DEVICES']='3'
 os.environ['USE_OUR_METHOD'] = 'False'
 
 os.environ['run_profile'] = 'False'
@@ -104,11 +112,14 @@ def my_sample_requests(
     filtered_dataset: List[Tuple[str, int, int]] = []
     for prompt, prompt_token_ids, output_len in tokenized_dataset:
         prompt_len = len(prompt_token_ids)
-        if prompt_len < 4 or output_len < 4:
-            # Prune too short sequences.
-            continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
+        # if prompt_len < 4 or output_len < 4:
+        #     # Prune too short sequences.
+        #     continue
+        # if prompt_len > 1024 or prompt_len + output_len > 2048:
+        #     # Prune too long sequences.
+        #     continue
+        if (prompt_len < 900) or (output_len < 900) or (prompt_len + output_len > 2048):
+            # Prune too short sequences and too long sequences
             continue
         # if (prompt_len < 1180 or prompt_len + output_len > 1260):
         #     continue
@@ -684,7 +695,7 @@ def run_vllm(
         dtype=dtype,
 
         # <jingzhi> parameter setting
-        gpu_memory_utilization= 0.9, # 0.4, #  0.1801,
+        gpu_memory_utilization= 0.5, # 0.4, #  0.1801,
         swap_space=58,
 
     )
@@ -712,7 +723,7 @@ def run_vllm(
         step_start=int(os.environ['step_start']), step_end=int(os.environ['step_end']))
     end = time.perf_counter()
 
-    print(f"total time: {end - start}, DP time: {llm.llm_engine.scheduler.my_scheduler_config.DP_time}")
+    print(f"total time: {end - start}, DP time: {llm.llm_engine.scheduler.my_scheduler_config.DP_time}, plan gen time: {llm.llm_engine.scheduler.my_scheduler_config.plan_gen_time}")
     return end - start
 
 

@@ -109,6 +109,16 @@ class MySchedulerConfig(object):
 
 
 
+        # -----------------------------------------
+        self.plan = None
+        self.plan_iter_num = 0
+        self.plan_step_i = 0
+        self.plan_ignored = None
+        self.has_decode_in_plan_iter = None
+        self.plan_gen_time = 0
+
+
+
     def delete_finished_released_requests(self, request_ids):
         for request_id in request_ids:
             del self.seq_group_dict[request_id]
@@ -683,7 +693,7 @@ class Scheduler:
         self.running = sorted(self.running, key=lambda seq_group: seq_group.get_seqs()[0].get_len()) # sort by increasing in_lens
         # curr_on_card： [(tot_in, future_out, idx)], tot_in=prompt+generated_out
         curr_on_card = [(seq_group.get_seqs()[0].get_len(), \
-            seq_group.sampling_params.max_tokens + len(seq_group.prompt) - seq_group.get_seqs()[0].get_len(), seq_group_i) \
+            seq_group.sampling_params.max_tokens + len(seq_group.prompt_token_ids) - seq_group.get_seqs()[0].get_len(), seq_group_i) \
             for seq_group_i, seq_group in enumerate(self.running)]
 
         demand = sum(get_blk_num(np.asarray([info[0] for info in curr_on_card])))
@@ -863,9 +873,290 @@ class Scheduler:
 
 
 
+    # generate an offline plan assume we know the output lengths
+    def _gen_schedule_plan(self) -> None:
+
+        # first sort the waiting requests
+        self.waiting = sorted(self.waiting, 
+            key=lambda seq_group:seq_group.sampling_params.max_tokens, reverse=True)
+
+        (requests, schedule, makespan, capacities), ignored = serial_scheduling(
+            self.waiting, self.block_manager.num_total_gpu_blocks, self.block_manager.block_size)
+
+        print(f"requests: {requests}")
+        print(f"Plan After adjustment: {makespan}")
+        print(f"schedule: {len(schedule)}, {schedule}")
+        print(f"capacities: {capacities.tolist()}")
+        print(f"ignored: {ignored}")
+
+        self.my_scheduler_config.plan = schedule
+        self.my_scheduler_config.plan_ignored = ignored
+
+        # sort self.waiting by schedule
+        self.waiting = [self.waiting[req_i] for req_i, _ in schedule]
+        print(f"self.waiting: {[(len(seq_group.prompt_token_ids), seq_group.sampling_params.max_tokens) for seq_group in self.waiting]}")
 
 
 
+
+
+    def _schedule_by_plan(self) -> SchedulerOutputs:
+        assert self.my_scheduler_config.plan != None, "There is no schedule plan."
+
+        # Blocks that need to be swaped or copied before model execution.
+        blocks_to_swap_in: Dict[int, int] = {}
+        blocks_to_swap_out: Dict[int, int] = {}
+        blocks_to_copy: Dict[int, List[int]] = {}
+
+        # Fix the current time.
+        now = time.monotonic()
+
+        # Join waiting sequences if possible.
+        # Only if according to the plan we need to add requests
+
+        # 这个地方的调度还是需要修改一下，应该有decoding的时候先做decoding才符合我们的调度。
+        # 但是这样很奇怪啊，感觉少了一部分我们能利用的内存。再想想。
+        # 这个调度好难啊
+
+        # <jingzhi> change to while so that we can break
+        while (not self.swapped) and \
+            (self.my_scheduler_config.plan_step_i < len(self.my_scheduler_config.plan)) and \
+            (self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i][1] \
+                == self.my_scheduler_config.plan_iter_num):
+
+
+            # update has_decode_in_plan_iter
+            # condition: 1. the first request to be added in this "iteration in plan"
+            # 2. we have not updated has_decode_in_plan_iter for this "iter in plan"
+            
+            # <jingzhi> For DEBUG
+            print(f"before checking first in rng: plan step i: {self.my_scheduler_config.plan_step_i}, steps: {self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i-1], self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i]}, has_decode_in_plan_iter: {self.my_scheduler_config.has_decode_in_plan_iter}")
+
+            if ((self.my_scheduler_config.plan_step_i == 0) \
+                    or (self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i-1][1]\
+                        !=self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i][1]))\
+                and (self.my_scheduler_config.has_decode_in_plan_iter == None):
+                self.my_scheduler_config.has_decode_in_plan_iter = (len(self.running) > 0)
+
+                # <jingzhi> For DEBUG
+                print(f"checking first in rng: {self.my_scheduler_config.has_decode_in_plan_iter}")
+
+                if self.my_scheduler_config.has_decode_in_plan_iter:
+                    break
+
+
+            ignored_seq_groups: List[SequenceGroup] = []
+            scheduled: List[SequenceGroup] = []
+            # The total number of sequences on the fly, including the
+            # requests in the generation phase.
+            num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
+                                for seq_group in self.running)
+            seq_lens: List[int] = []
+
+            # Optimization: We do not sort the waiting queue since the preempted
+            # sequence groups are added to the front and the new sequence groups
+            # are added to the back.
+            while self.waiting:
+                seq_group = self.waiting[0]
+
+                assert seq_group.num_seqs() == 1, (
+                    "Waiting sequence group should have only one prompt "
+                    "sequence.")
+                num_prompt_tokens = seq_group.get_seqs()[0].get_len()
+                if num_prompt_tokens > self.prompt_limit:
+
+                    # <jingzhi>
+                    assert False, "Input prompt should not be too long."
+
+                    logger.warning(
+                        f"Input prompt ({num_prompt_tokens} tokens) is too long"
+                        f" and exceeds limit of {self.prompt_limit}")
+                    for seq in seq_group.get_seqs():
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(seq_group)
+                    self.waiting.pop(0)
+                    continue
+
+                # If the sequence group cannot be allocated, stop.
+                # <jingzhi> Do not need to do memory check
+                # if not self.block_manager.can_allocate(seq_group):
+                #     break
+
+                # If the number of batched tokens exceeds the limit, stop.
+                new_seq_lens = seq_lens + [num_prompt_tokens]
+                num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
+                if (num_batched_tokens >
+                        self.scheduler_config.max_num_batched_tokens):
+                    break
+
+                # The total number of sequences in the RUNNING state should not
+                # exceed the maximum number of sequences.
+                num_new_seqs = seq_group.get_max_num_running_seqs()
+
+                # <jingzhi> For DEBUG temporarily delete this condition checking
+                # if (num_curr_seqs + num_new_seqs >
+                #         self.scheduler_config.max_num_seqs):
+                #     # <jingzhi>
+                #     assert False, "We do not consider max_running_seqs now."
+                #     break
+
+                num_paddings = num_batched_tokens - sum(new_seq_lens)
+                if num_paddings > self.scheduler_config.max_paddings:
+                    break
+                seq_lens = new_seq_lens
+
+                seq_group = self.waiting.pop(0)
+                self._allocate(seq_group)
+                self.running.append(seq_group)
+                num_curr_seqs += num_new_seqs
+                scheduled.append(seq_group)
+
+
+                # <jingzhi> Update plan_step_i
+                self.my_scheduler_config.plan_step_i += 1
+
+                # update plan_iter_num
+                # condition: 1. no requests are in decoding stage [delete this]
+                # 2. the last request to be added in this "iteration in plan"
+
+                if ((self.my_scheduler_config.plan_step_i == len(self.my_scheduler_config.plan)) \
+                        or (self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i-1][1]\
+                            !=self.my_scheduler_config.plan[self.my_scheduler_config.plan_step_i][1])):
+                    
+                    # <jingzhi> For DEBUG
+                    print(f"is last in rng: plan_step_i: {self.my_scheduler_config.plan_step_i}")
+
+
+                    self.my_scheduler_config.plan_iter_num += 1
+                    self.my_scheduler_config.has_decode_in_plan_iter = None
+                    # we should stop adding new requests after finishing the last one
+                    break
+
+
+                # <jingzhi> DEBUG
+                # if seq_group.request_id == '157':
+                #     print(f"load 157: {seq_group.request_id, seq_group.get_seqs()[0].get_len()}")
+
+            print(f"selected requests info: {[(len(seq_group.prompt_token_ids), seq_group.sampling_params.max_tokens, len(seq_group.get_seqs()[0].logical_token_blocks)) for seq_group in scheduled]}")
+
+            if scheduled or ignored_seq_groups:
+                scheduler_outputs = SchedulerOutputs(
+                    scheduled_seq_groups=scheduled,
+                    prompt_run=True,
+                    num_batched_tokens=len(seq_lens) * max(seq_lens),
+                    blocks_to_swap_in=blocks_to_swap_in,
+                    blocks_to_swap_out=blocks_to_swap_out,
+                    blocks_to_copy=blocks_to_copy,
+                    ignored_seq_groups=ignored_seq_groups,
+                )
+                return scheduler_outputs
+
+        
+
+        # <jingzhi> For DEBUG
+        print(f"DECODING-----------")
+
+
+        # <jingzhi> Update plan_iter_num
+        if self.my_scheduler_config.has_decode_in_plan_iter == None:
+            # means there is not request to be added in this "iter in plan"
+            self.my_scheduler_config.plan_iter_num += 1
+
+
+        # NOTE(woosuk): Preemption happens only when there is no available slot
+        # to keep all the sequence groups in the RUNNING state.
+        # In this case, the policy is responsible for deciding which sequence
+        # groups to preempt.
+        self.running = self.policy.sort_by_priority(now, self.running)
+
+        # Reserve new token slots for the running sequence groups.
+        running: List[SequenceGroup] = []
+        preempted: List[SequenceGroup] = []
+        while self.running:
+            seq_group = self.running.pop(0)
+            # while not self.block_manager.can_append_slot(seq_group):
+
+            # <jingzhi> For DEBUG. Currently we do not contain preeption in our schedule plan
+            if False:
+
+                assert False, "Should not need preemption now."
+
+                if self.running:
+                    # Preempt the lowest-priority sequence groups.
+                    victim_seq_group = self.running.pop(-1)
+
+                    # <jingzhi> DEBUG
+                    self.my_scheduler_config.recompute_blk_num = self.my_scheduler_config.recompute_blk_num + \
+                        self.block_manager.get_gpu_blk_num(seq_group=victim_seq_group) * 2
+
+                    print(f"to recompute 1: {victim_seq_group.request_id, victim_seq_group.get_seqs()[0].get_len()}")
+
+                    self._preempt(victim_seq_group, blocks_to_swap_out)
+                    preempted.append(victim_seq_group)
+                else:
+                    # <jingzhi> DEBUG
+                    self.my_scheduler_config.recompute_blk_num = self.my_scheduler_config.recompute_blk_num + \
+                        self.block_manager.get_gpu_blk_num(seq_group=seq_group) * 2
+
+                    print(f"to recompute 2: {seq_group.request_id, seq_group.get_seqs()[0].get_len()}")
+
+                    # No other sequence groups can be preempted.
+                    # Preempt the current sequence group.
+                    self._preempt(seq_group, blocks_to_swap_out)
+                    preempted.append(seq_group)
+                    break
+            else:
+                # Append new slots to the sequence group.
+                self._append_slot(seq_group, blocks_to_copy)
+                running.append(seq_group)
+        self.running = running
+
+        # Swap in the sequence groups in the SWAPPED state if possible.
+        self.swapped = self.policy.sort_by_priority(now, self.swapped)
+        if not preempted:
+            num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
+                                for seq_group in self.running)
+
+            while self.swapped:
+                seq_group = self.swapped[0]
+                # If the sequence group cannot be swapped in, stop.
+                if not self.block_manager.can_swap_in(seq_group):
+                    break
+
+                # The total number of sequences in the RUNNING state should not
+                # exceed the maximum number of sequences.
+                num_new_seqs = seq_group.get_max_num_running_seqs()
+                if (num_curr_seqs + num_new_seqs >
+                        self.scheduler_config.max_num_seqs):
+                    break
+
+                seq_group = self.swapped.pop(0)
+                self._swap_in(seq_group, blocks_to_swap_in)
+                self._append_slot(seq_group, blocks_to_copy)
+                num_curr_seqs += num_new_seqs
+                self.running.append(seq_group)
+
+                # <jingzhi> For DEBUG
+                print(f"load: {seq_group.request_id, seq_group.get_seqs()[0].get_len()}")
+
+
+        # Each sequence in the generation phase only takes one token slot.
+        # Therefore, the number of batched tokens is equal to the number of
+        # sequences in the RUNNING state.
+        num_batched_tokens = sum(
+            seq_group.num_seqs(status=SequenceStatus.RUNNING)
+            for seq_group in self.running)
+
+        scheduler_outputs = SchedulerOutputs(
+            scheduled_seq_groups=self.running,
+            prompt_run=False,
+            num_batched_tokens=num_batched_tokens,
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_copy=blocks_to_copy,
+            ignored_seq_groups=[],
+        )
+        return scheduler_outputs
 
 
 
@@ -1315,8 +1606,13 @@ class Scheduler:
             # scheduler_outputs = self._my_schedule()
             scheduler_outputs = self._schedule_outlen_aware()
         else:
-            scheduler_outputs = self._schedule()
+            # scheduler_outputs = self._schedule()
             # scheduler_outputs = self._schedule_peak_demand_aware_paged()
+            scheduler_outputs = self._schedule_by_plan()
+
+        # <jingzhi> For DEBUG
+        print(f"free blk num before computation: {self.block_manager.gpu_allocator.get_num_free_blocks()}")
+
 
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
@@ -1612,3 +1908,205 @@ def DP_select_requests_to_release(curr_on_card, candidates, tot_blk_num, to_rele
 
 
     return False
+
+
+
+
+
+
+
+# <jingzhi> Called before scheduling on GPU is started to determine the overall scheduling plan
+# Assume we know the exact output lengths for each requests.
+# All the input requests to be scheduled are stored in scheduler.waiting now.
+def serial_scheduling(requests: List[SequenceGroup], tot_blk_num: int, block_size: int
+    ):
+    
+    def get_blk_num(seqlen):
+        return (seqlen+block_size-1)//block_size
+
+    requests = [(len(seq_group.prompt_token_ids), seq_group.sampling_params.max_tokens) \
+        for seq_group in requests]
+    # sorted requests by their output lengths
+    # will sort the sequence groups when doing actual scheduling later
+    # sorted_requests = sorted(requests, key=lambda info:info[1], reverse=True)
+
+    # assume the input requests have been sorted
+    assert sorted(requests, key=lambda info:info[1], reverse=True) == requests
+    sorted_requests = requests
+    
+    # first get a non-preemptive schedule
+    # in schedule, each tuple is the request ID (after sorting), start iter ID
+    schedule: List[Tuple[int, int]] = list()
+    ignored: List[int] = list()
+    
+    max_iter_num = 2000 # will adjust the max iter num during the scheduling
+    capacities = np.full(int(max_iter_num), tot_blk_num)
+    makespan = 0
+    # [(start iter, end iter)]
+    # capa_rngs: List[Tuple[int, int]] = [(0, 1e9)]
+
+    for req_i, info in enumerate(sorted_requests):    
+
+        # ============================================================================
+        # # metadata: 
+        # # earlist_iters1: based on the right-end capacity, the earlist iter ID it allows
+        # # earlist_iters2: based on the end_blk_num, the latest iter ID it allows
+
+        # earlist_iters1 = np.asarray([(capacities[rng[1]]*block_size - info[0]) for rng in capa_rngs])
+        # earlist_iters1 = (earlist_iters1 < 0) * 1e9 + \
+        #     (np.asarray([rng[1] for rng in capa_rngs]) - earlist_iters1) * (earlist_iters1 >= 0)
+        
+        # # find the last iter in each rng whose capa >= end_blk_num
+        # earlist_iters2 = [ rng[0][0] + rng[0][1] - end_blk_num -  ]
+        # =============================================================================
+
+        # find the earlist start iter ID for this request
+
+        # ensure the capacities array is long enough
+        if makespan + info[1] > max_iter_num:
+            max_iter_num = max_iter_num + max(2000, info[0])
+            capacities = np.concatenate([capacities, np.full(int(max(2000, info[0])), tot_blk_num)])
+
+        # <jingzhi> TODO: improve the efficiency here
+        demand = get_blk_num(np.arange(info[0], info[0]+info[1]))
+
+        if demand[-1] > tot_blk_num:
+            ignored.append(req_i)
+            continue
+
+        # cand_iters = np.arange(len(capacities))
+        # for iter_i in range(info[1]):
+        #     tmp_cands = np.nonzero(capacities >= demand[iter_i])[0] - iter_i
+        #     cand_iters = np.intersect1d(cand_iters, tmp_cands, assume_unique=True)
+        #     if len(cand_iters) == 0:
+        #         assert False, f"ERROR: capacities is not long enough: {len(capacities)} vs makespan {makespan}, outlen: {info[1]}"
+
+        cand_iters = np.full(len(capacities)+info[1], 0)
+        for iter_i in range(info[1]):
+            tmp_cands = np.nonzero(capacities >= demand[iter_i])[0] - iter_i
+            cand_iters[tmp_cands + info[1]] += 1
+        cand_iters = np.nonzero(cand_iters[info[1]:] == info[1])[0]
+        if len(cand_iters) == 0:
+            assert False, f"ERROR: capacities is not long enough: {len(capacities)} vs makespan {makespan}, outlen: {info[1]}"
+
+
+        
+        start_iter = cand_iters[0] # as cand_iters is sorted
+        makespan = max(makespan, start_iter + info[1] - 1)
+        capacities[start_iter:start_iter+info[1]] = capacities[start_iter:start_iter+info[1]]-demand
+        schedule.append((req_i, start_iter))
+
+        print(f"step: {schedule[-1]}, len(capacities): {len(capacities)}", flush=True)
+
+    # return sorted_requests, schedule, makespan, capacities
+
+
+    print(f"Plan before adjustment: {makespan}")
+    print(f"schedule: {len(schedule)}, {sorted(schedule, key=lambda step: step[1])}")
+    print(f"capacities: {capacities.tolist()}")
+
+    return adjustment(sorted_requests, schedule, makespan, capacities, block_size), ignored
+
+
+
+
+
+# this function condense an initial non-preemptive schedule by doing adjustment
+# 比较担心这样的效果依然没有什么可以提高的地方。
+def adjustment(requests, schedule, makespan, capacities, block_size):
+
+    def get_blk_num(seqlen):
+        return (seqlen+block_size-1)//block_size
+
+    # first move backward then move forward
+    schedule = sorted(schedule, key=lambda step: step[1] + requests[step[0]][1], reverse=True)
+    new_schedule = list()
+    min_start_iter = makespan
+    for step in schedule:
+        info = requests[step[0]]
+        # check whether this step can be moved backward
+        if step[1] + info[1] - 1 == makespan:
+            # this step cannot be move backward
+            new_schedule.append(step)
+            min_start_iter = min(min_start_iter, step[1])
+            continue
+
+        demand = get_blk_num(np.arange(info[0], info[0]+info[1]))
+
+        capacities[step[1]:step[1] + info[1]] = capacities[step[1]:step[1] + info[1]] + demand
+
+        cand_iters = np.full(len(capacities)+info[1], 0)
+        for iter_i in range(info[1]):
+            tmp_cands = np.nonzero(
+                capacities[step[1]+iter_i:makespan+1-info[1]+iter_i] >= demand[iter_i])[0]+step[1]
+            cand_iters[tmp_cands + info[1]] += 1
+        cand_iters = np.nonzero(cand_iters[info[1]:] == info[1])[0]
+        if len(cand_iters) == 0:
+            assert False, f"ERROR: len capacities {len(capacities)}, makespan {makespan}, step: {step}, request: {info}"
+
+        start_iter = cand_iters[-1] # cand_iters is sorted
+        new_schedule.append((step[0], start_iter))
+        capacities[start_iter:start_iter+info[1]] = capacities[start_iter:start_iter+info[1]] - demand
+        min_start_iter = min(min_start_iter, start_iter)
+
+        if new_schedule[-1] != step:
+            print(f"backward adjustment step: {step} -> {new_schedule[-1]}", flush=True)
+
+
+
+    # then do forward adjustment
+    schedule = sorted(new_schedule, key=lambda step: step[1] + requests[step[0]][1])
+    new_schedule = list()
+    makespan = 0
+    for step in schedule:
+        info = requests[step[0]]
+        # check whether this step can be moved backward
+        if step[1] == min_start_iter:
+            # this step cannot be move forward
+            new_schedule.append(step)
+            makespan = max(makespan, step[1] + info[1] - 1)
+            continue
+
+        demand = get_blk_num(np.arange(info[0], info[0]+info[1]))
+
+        capacities[step[1]:step[1] + info[1]] = capacities[step[1]:step[1] + info[1]] + demand
+
+        cand_iters = np.full(len(capacities)+info[1], 0)
+        for iter_i in range(info[1]):
+            tmp_cands = np.nonzero(
+                capacities[min_start_iter+iter_i:step[1]+iter_i+1]>=demand[iter_i])[0]+min_start_iter 
+            cand_iters[tmp_cands + info[1]] += 1
+        cand_iters = np.nonzero(cand_iters[info[1]:] == info[1])[0]
+        if len(cand_iters) == 0:
+            assert False, f"ERROR: len capacities {len(capacities)}, makespan {makespan}, step: {step}, request: {info}"
+
+        start_iter = cand_iters[0] # cand_iters is sorted
+        new_schedule.append((step[0], start_iter))
+        capacities[start_iter:start_iter+info[1]] = capacities[start_iter:start_iter+info[1]] - demand
+        makespan = max(makespan, start_iter + info[1] - 1)
+
+        if new_schedule[-1] != step:
+            print(f"forward adjustment step: {step} -> {new_schedule[-1]}", flush=True)
+
+    schedule = [(step[0], step[1] - min_start_iter) for step in new_schedule]
+    makespan = makespan - min_start_iter
+
+    # sort the steps by start iters
+    schedule = sorted(schedule, key=lambda step: step[1])
+
+    return requests, schedule, makespan, capacities
+
+
+
+
+
+
+# this function condense a non-preemptive schedule by adding preemption
+# leave this part later, like a kind of metaheuristic method, based on modification
+# we try to move former tokens into later iterations, as it is easier to check the validity
+# need more heuristics
+# 感觉这个功能会有点难写啊，先暂时不管。
+def add_preemption():
+    pass
+
+        
