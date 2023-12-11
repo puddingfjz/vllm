@@ -10,12 +10,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
 
 
-
-# <jingzhi>
-import time
-
-
-
 class LLM:
     """An LLM for generating texts from given prompts and sampling parameters.
 
@@ -140,25 +134,21 @@ class LLM:
         if isinstance(prompts, str):
             # Convert a single prompt to a list.
             prompts = [prompts]
-        if prompts is not None and prompt_token_ids is not None:
-            if len(prompts) != len(prompt_token_ids):
-                raise ValueError("The lengths of prompts and prompt_token_ids "
-                                 "must be the same.")
+        if (prompts is not None and prompt_token_ids is not None
+                and len(prompts) != len(prompt_token_ids)):
+            raise ValueError("The lengths of prompts and prompt_token_ids "
+                             "must be the same.")
         if sampling_params is None:
             # Use default sampling params.
             sampling_params = SamplingParams()
 
         # Add requests to the engine.
-        if prompts is not None:
-            num_requests = len(prompts)
-        else:
-            num_requests = len(prompt_token_ids)
+        num_requests = len(prompts) if prompts is not None else len(
+            prompt_token_ids)
         for i in range(num_requests):
             prompt = prompts[i] if prompts is not None else None
-            if prompt_token_ids is None:
-                token_ids = None
-            else:
-                token_ids = prompt_token_ids[i]
+            token_ids = None if prompt_token_ids is None else prompt_token_ids[
+                i]
             self._add_request(prompt, sampling_params, token_ids)
         return self._run_engine(use_tqdm)
 
@@ -172,81 +162,20 @@ class LLM:
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
 
-    # support running profile
-    def _run_engine(self, use_tqdm: bool, run_profile: bool = False,
-        step_start: float=0, step_end: float=float('inf'),
-        ) -> List[RequestOutput]:
-
-
-        # <jingzhi> first generate a plan
-        time1 = time.perf_counter()
-        self.llm_engine.scheduler._gen_schedule_plan()
-        time2 = time.perf_counter()
-        self.llm_engine.scheduler.my_scheduler_config.plan_gen_time = time2 - time1
-
-
+    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
             pbar = tqdm(total=num_requests, desc="Processed prompts")
         # Run the engine.
         outputs: List[RequestOutput] = []
-
-
-        # <jingzhi> For Profiling--------------------
-        import torch
-        step_i = 0
-        finished_num = 0
-        # start = None
-        # end = None
-        start = time.perf_counter()
-        last = start
-        req_latencys = list()
-        # -------------------------------------------
-
         while self.llm_engine.has_unfinished_requests():
-
-            # <jingzhi> For Profiling-----------------
-            step_i+=1
-            if (step_i == step_start) and (run_profile):
-                print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
-                torch.cuda.cudart().cudaProfilerStart()
-            elif (step_i == step_end) and (run_profile):
-                print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
-                torch.cuda.cudart().cudaProfilerStop()
-            # ----------------------------------------
-
             step_outputs = self.llm_engine.step()
-
-            print(f"iter_num: {step_i}, iter in plan: {self.llm_engine.scheduler.my_scheduler_config.plan_iter_num}, on_card_num: {len(self.llm_engine.scheduler.running)}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}, free blk num: {self.llm_engine.scheduler.block_manager.gpu_allocator.get_num_free_blocks()}")
-            iter_finish_time = time.perf_counter()
-
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
                     if use_tqdm:
                         pbar.update(1)
-                        finished_num+=1
-                        req_latencys.append(iter_finish_time-start)
-
-            print(f"finished num: {finished_num}, time point: {iter_finish_time-last}")
-            # record the cost of each iteration instead of the time point of finishing each iteration
-            last = time.perf_counter()
-
-            # <jingzhi> For DEBUG
-            # if finished_num == 189:
-            #     print(f"Finished 189 requests, this iter is {step_i}")
-            #     start = time.perf_counter()
-
-        
-        # <jingzhi> For DEBUG
-        # end = time.perf_counter()
-        # print(f"Total time from after finishing 189 requests: {end - start}")
-
-
-        print(f"Total iteration number: {step_i}, preempted blk num: {self.llm_engine.scheduler.my_scheduler_config.recompute_blk_num}")
-        print(f"Total latency: {sorted(req_latencys)}")
-        print(f"Min, Max, Mean latency: {min(req_latencys), max(req_latencys), sum(req_latencys)/len(req_latencys)}")
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.

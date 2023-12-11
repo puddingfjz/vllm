@@ -1,9 +1,19 @@
-# pack-refs with: peeled fully-peeled sorted 
+# pack-refs with: peeled fully-peeled 
+a44bcf5c66c27c9eb8e0037cee8d6d301369ec38 refs/remotes/origin/benchmark-mii
+c2b7615f024f6f2a43c9c501516802d76adde3e8 refs/remotes/origin/cuda-graph
+5fa4e9986d39434a2646eb56dbe0172f71cc6cd6 refs/remotes/origin/fix-class-naming
+b60fd16791e8e27f13b8a53d9c45203dbff923f7 refs/remotes/origin/fix-main-format
+f1805b94df8899e10f5180c04fd958f5fa8caa5a refs/remotes/origin/graph
 07e9197014ce0dbbbd7015fe765ab92159dee492 refs/remotes/origin/longchat-test
-1f24755bf802a2061bd46f3dd1191b7898f13f45 refs/remotes/origin/main
+2e8fc0d4c3bf8374f1f55569069e59ef45d4bc98 refs/remotes/origin/main
+b9d785a66a9e88d38d80922526bc576766f54488 refs/remotes/origin/minimal-gptq
 ba5d161d185721b5fe91ff91e874850327b9d2ba refs/remotes/origin/pa-1d
+0407c1ba0097583e0e67c9b22ac6edbaa8386661 refs/remotes/origin/paged-attn
+ad470e56d5dcc3e9bed381b87935d4232ccb3422 refs/remotes/origin/qmm
 4124386cc9625e5f0e1e244ec2098c0c5aef64d7 refs/remotes/origin/rope-fp32
 c149a9819c2f83c2b8850c79d54e014d4f27e836 refs/remotes/origin/test-acc
+f474b4bd22408ed625b6b3313b31d0dea60f2639 refs/remotes/origin/torch-compile
+a91a7a4adfab51b490325f7424f5550e3cb4c4ba refs/remotes/origin/torch-compile2
 91691734c3091eaa4c9c2c85f206f129dc8de937 refs/remotes/origin/vllm-without-tokenization-sampling
 aa50b17ca776f8c69a793787d0ce06dfa4671884 refs/tags/submission
 67d96c29fba9b72cb4c4edbc26211c208a00ebdd refs/tags/v0.1.0
@@ -17,3 +27,5 @@ aa84c92ef636e689b506b9842c712e5c615cc73a refs/tags/v0.1.3
 e2fb71ec9f2c3168ba8614408fa807a5f65707c5 refs/tags/v0.2.0
 651c614aa43e497a2e2aab473493ba295201ab20 refs/tags/v0.2.1
 3d40c834f020a0d180a0af49bf25ffa9b22fa84b refs/tags/v0.2.1.post1
+c5f7740d89737744438e08c26da1d4fbadcb3893 refs/tags/v0.2.2
+0f90effc660317070b88b860eda76bfb3b596701 refs/tags/v0.2.3

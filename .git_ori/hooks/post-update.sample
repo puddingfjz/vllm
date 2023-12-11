@@ -1,4 +1,4 @@
-#!/usr/bin/sh
+#!/bin/sh
 #
 # An example hook script to prepare a packed repository for use over
 # dumb transports.

@@ -1,9 +1,13 @@
 """A block manager that manages token blocks."""
+import enum
 from typing import Dict, List, Optional, Set, Tuple
 
 from vllm.block import PhysicalTokenBlock
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
+
+# Mapping: logical block number -> physical block.
+BlockTable = List[PhysicalTokenBlock]
 
 
 class BlockAllocator:
@@ -25,7 +29,7 @@ class BlockAllocator:
         self.num_blocks = num_blocks
 
         # Initialize the free blocks.
-        self.free_blocks: List[PhysicalTokenBlock] = []
+        self.free_blocks: BlockTable = []
         for i in range(num_blocks):
             block = PhysicalTokenBlock(device=device,
                                        block_number=i,
@@ -50,8 +54,18 @@ class BlockAllocator:
         return len(self.free_blocks)
 
 
-# Mapping: logical block number -> physical block.
-BlockTable = List[PhysicalTokenBlock]
+class AllocStatus(enum.Enum):
+    """Result for BlockSpaceManager.can_allocate
+
+    1. Ok: seq_group can be allocated now.
+    2. Later: seq_group cannot be allocated.
+      The capacity of allocator is larger than seq_group required.
+    3. Never: seq_group can never be allocated.
+      The seq_group is too large to allocated in GPU.
+    """
+    OK = enum.auto()
+    LATER = enum.auto()
+    NEVER = enum.auto()
 
 
 class BlockSpaceManager:
@@ -86,7 +100,7 @@ class BlockSpaceManager:
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
-    def can_allocate(self, seq_group: SequenceGroup) -> bool:
+    def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs()[0]
@@ -95,30 +109,15 @@ class BlockSpaceManager:
             num_required_blocks = min(num_required_blocks,
                                       self.block_sliding_window)
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+
         # Use watermark to avoid frequent cache eviction.
-        return (num_free_gpu_blocks - num_required_blocks >=
-                self.watermark_blocks)
-
-    
-    def my_can_allocate(self, seq_group: SequenceGroup, reserved_for_running: int) -> bool:
-        # FIXME(woosuk): Here we assume that all sequences in the group share
-        # the same prompt. This may not be true for preempted sequences.
-        seq = seq_group.get_seqs()[0]
-        # num_required_blocks = len(seq.logical_token_blocks)
-
-        # <jingzhi>: allocate enough blocks for block-size-iteration inference
-        num_required_blocks = (seq.get_len() + seq.block_size + seq.block_size - 1) // seq.block_size
-
-        if self.block_sliding_window is not None:
-            num_required_blocks = min(num_required_blocks,
-                                      self.block_sliding_window)
-        # <jingzhi> we need to reserve a block for each running sequence
-        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks() - reserved_for_running
-        # Use watermark to avoid frequent cache eviction.
-        return (num_free_gpu_blocks - num_required_blocks >=
-                self.watermark_blocks)
-
-
+        if (self.num_total_gpu_blocks - num_required_blocks <
+                self.watermark_blocks):
+            return AllocStatus.NEVER
+        if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
+            return AllocStatus.OK
+        else:
+            return AllocStatus.LATER
 
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same
@@ -140,44 +139,6 @@ class BlockSpaceManager:
         # Assign the block table for each sequence.
         for seq in seq_group.get_seqs():
             self.block_tables[seq.seq_id] = block_table.copy()
-
-
-
-
-    def my_allocate(self, seq_group: SequenceGroup) -> None:
-        # NOTE: Here we assume that all sequences in the group have the same
-        # prompt.
-        seq = seq_group.get_seqs()[0]
-
-        # Allocate new physical token blocks that will store the prompt tokens.
-        block_table: BlockTable = []
-        # for logical_idx in range(len(seq.logical_token_blocks)):
-        # <jingzhi>
-        for logical_idx in range((seq.get_len() + seq.block_size + seq.block_size - 1) // seq.block_size):
-            if (self.block_sliding_window is not None
-                    and logical_idx >= self.block_sliding_window):
-                block = block_table[logical_idx % self.block_sliding_window]
-            else:
-                block = self.gpu_allocator.allocate()
-            # Set the reference counts of the token blocks.
-            block.ref_count = seq_group.num_seqs()
-            block_table.append(block)
-
-        # Assign the block table for each sequence.
-        for seq in seq_group.get_seqs():
-            self.block_tables[seq.seq_id] = block_table.copy()
-
-
-
-    # <jingzhi> DEBUG
-    def get_gpu_blk_num(self, seq_group=None, seq_id=None):
-        if seq_id:
-            return len([blk for blk in self.block_tables[seq_id] if blk.device == Device.GPU])
-        return len([blk for blk in self.block_tables[seq_group.get_seqs()[0].seq_id] if blk.device == Device.GPU])
-
-
-
-
 
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block
@@ -272,117 +233,6 @@ class BlockSpaceManager:
         }
         return block_number_mapping
 
-
-
-    # update block tables and free blocks
-    def my_update_block_status_swap_in(self, blocks_to_free, new_blocks) -> None:
-        for cpu_block in blocks_to_free:
-            self.cpu_allocator.free(cpu_block)
-            assert cpu_block.device==Device.CPU
-        for seq_id, block_i, gpu_block in new_blocks:
-            self.block_tables[seq_id][block_i] = gpu_block
-            assert gpu_block.device==Device.GPU
-
-        # <jingzhi> DEBUG
-        seq_ids = set([_[0] for _ in new_blocks])
-        print("when my_update_block_status_swap_in: ")
-        print([(seq_id,\
-                len(self.block_tables[seq_id]), \
-                len([blk for blk in self.block_tables[seq_id] if blk.device == Device.GPU])) for seq_id in seq_ids])
-
-
-
-
-    # <jingzhi> 
-    def my_do_swap_in(
-        self, swap_in_this_iter: List[Tuple[str, int]], 
-        recompute_list: List[Tuple[str, int]], 
-        seq_group_dict: Dict[str, SequenceGroup]
-        ) -> Tuple[Dict[int, int], List[SequenceGroup], List[Tuple[int, int, PhysicalTokenBlock]]]:
-        # CPU block -> GPU block.
-        mapping_swap: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
-        mapping_recompute: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
-        blocks_to_free:List[SequenceGroup] = []
-        new_blocks:List[Tuple[int, int, PhysicalTokenBlock]] = []        
-
-        for mapping, block_infos in ((mapping_swap, swap_in_this_iter), (mapping_recompute, recompute_list)):
-            for request_id, block_i in block_infos:
-                seq_group = seq_group_dict[request_id]
-                assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-                seq = seq_group.get_seqs()[0]
-
-                block_table = self.block_tables[seq.seq_id]
-                cpu_block = block_table[block_i]
-
-                if cpu_block in mapping:
-                    gpu_block = mapping[cpu_block]
-                    gpu_block.ref_count += 1
-                else:
-                    gpu_block = self.gpu_allocator.allocate()
-                    mapping[cpu_block] = gpu_block
-
-                blocks_to_free.append(cpu_block)
-                new_blocks.append((seq.seq_id, block_i, gpu_block))
-
-        block_number_mapping = {
-            cpu_block.block_number: gpu_block.block_number
-            for cpu_block, gpu_block in mapping_swap.items()
-        }
-        return block_number_mapping, blocks_to_free, new_blocks
-
-
-
-
-
-
-    # <jingzhi> reload requests block by block, update the block tabel and free blocks
-    def my_do_swap_in_free_and_update_blocktables(
-        self, swap_in_this_iter: List[Tuple[str, int]], 
-        recompute_list: List[Tuple[str, int]], 
-        seq_group_dict: Dict[str, SequenceGroup]
-        ) -> Dict[int, int]:
-        # CPU block -> GPU block.
-        mapping_swap: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
-        mapping_recompute: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {} 
-
-        for mapping, block_infos in ((mapping_swap, swap_in_this_iter), (mapping_recompute, recompute_list)):
-            for request_id, block_i in block_infos:
-                seq_group = seq_group_dict[request_id]
-                assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-                seq = seq_group.get_seqs()[0]
-
-                block_table = self.block_tables[seq.seq_id]
-                cpu_block = block_table[block_i]
-                gpu_block = None
-
-                if (cpu_block != None) and (cpu_block in mapping):
-                    gpu_block = mapping[cpu_block]
-                    gpu_block.ref_count += 1
-                else:
-                    gpu_block = self.gpu_allocator.allocate()
-                    mapping[cpu_block] = gpu_block
-
-
-                # Free the CPU block swapped in to GPU.
-                if cpu_block != None:
-                    self.cpu_allocator.free(cpu_block)
-                block_table[block_i] = gpu_block
-
-        block_number_mapping = {
-            cpu_block.block_number: gpu_block.block_number
-            for cpu_block, gpu_block in mapping_swap.items()
-        }
-        return block_number_mapping
-
-
-
-
-
-
-
-
-
-
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         blocks = self._get_physical_blocks(seq_group)
         return len(blocks) <= self.cpu_allocator.get_num_free_blocks()
@@ -411,134 +261,6 @@ class BlockSpaceManager:
             for gpu_block, cpu_block in mapping.items()
         }
         return block_number_mapping
-
-
-    # update block tables and free blocks
-    def my_update_block_status_swap_out(self, blocks_to_free, new_blocks) -> None:
-        for gpu_block in blocks_to_free:
-            if gpu_block.ref_count == 0:
-                # this sequence should already be finished
-                continue
-            self.gpu_allocator.free(gpu_block)
-        for seq_id, block_i, cpu_block in new_blocks:
-            if seq_id not in self.block_tables:
-                # this sequence should already be finished
-                continue
-            self.block_tables[seq_id][block_i] = cpu_block
-
-
-
-
-    # <jingzhi> Do not update the block tabel or free any blocks
-    def my_do_swap_out(
-        self, swap_out_this_iter: List[Tuple[str, int]], 
-        for_recompute_this_iter: List[Tuple[str, int]], 
-        seq_group_dict: Dict[str, SequenceGroup]
-        ) -> Tuple[Dict[int, int], List[SequenceGroup], List[Tuple[int, int, PhysicalTokenBlock]]]:
-        
-        # <jingzhi> DEBUG
-        # print(f"self.block_tables: {self.block_tables.keys()}")
-
-        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
-        blocks_to_free:List[SequenceGroup] = []
-        new_blocks:List[Tuple[int, int, PhysicalTokenBlock]] = []
-
-        for request_id, block_i in swap_out_this_iter:
-            seq_group = seq_group_dict[request_id]
-            assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-            seq = seq_group.get_seqs()[0]
-            block_table = self.block_tables[seq.seq_id]
-            gpu_block = block_table[block_i]
-            if gpu_block in mapping:
-                cpu_block = mapping[gpu_block]
-                cpu_block.ref_count += 1
-            else:
-                cpu_block = self.cpu_allocator.allocate()
-                mapping[gpu_block] = cpu_block
-            
-            blocks_to_free.append(gpu_block)
-            new_blocks.append((seq.seq_id, block_i, cpu_block))
-
-        block_number_mapping = {
-            gpu_block.block_number: cpu_block.block_number
-            for gpu_block, cpu_block in mapping.items()
-        }
-
-        # deal with the gpus blocks directly to be released
-        for request_id, block_i in for_recompute_this_iter:
-            seq_group = seq_group_dict[request_id]
-            assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-            seq = seq_group.get_seqs()[0]
-            block_table = self.block_tables[seq.seq_id]
-            gpu_block = block_table[block_i]
-            
-            blocks_to_free.append(gpu_block)
-
-        return block_number_mapping, blocks_to_free, new_blocks
-
-
-
-
-
-
-    # <jingzhi> release requests block by block, update the block tabel and free blocks
-    def my_do_swap_out_free_and_update_blocktables(
-        self, swap_out_this_iter: List[Tuple[str, int]], 
-        for_recompute_this_iter: List[Tuple[str, int]], 
-        seq_group_dict: Dict[str, SequenceGroup]
-        ) -> Dict[int, int]:
-        
-        # <jingzhi> DEBUG
-        # print(f"swap_out_this_iter: {swap_out_this_iter}, for_recompute_this_iter: {for_recompute_this_iter}")
-        # print(f"self.block_tables: {self.block_tables.keys()}")
-
-        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
-
-        for request_id, block_i in swap_out_this_iter:
-            seq_group = seq_group_dict[request_id]
-            assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-            seq = seq_group.get_seqs()[0]
-            block_table = self.block_tables[seq.seq_id]
-            gpu_block = block_table[block_i]
-            cpu_block = None
-            if gpu_block in mapping:
-                cpu_block = mapping[gpu_block]
-                cpu_block.ref_count += 1
-            else:
-                cpu_block = self.cpu_allocator.allocate()
-                mapping[gpu_block] = cpu_block
-
-            # Free the GPU block swapped out to CPU.
-            # print(f"swapping-out---:{self.gpu_allocator.get_num_free_blocks()}")
-            self.gpu_allocator.free(gpu_block)
-            # print(f"free one:{self.gpu_allocator.get_num_free_blocks()}")
-            block_table[block_i] = cpu_block
-
-        block_number_mapping = {
-            gpu_block.block_number: cpu_block.block_number
-            for gpu_block, cpu_block in mapping.items()
-        }
-
-        # deal with the gpus blocks directly to be released
-        for request_id, block_i in for_recompute_this_iter:
-            seq_group = seq_group_dict[request_id]
-            assert len(seq_group.get_seqs()) == 1, 'We only support one-sequence seq_group now!'
-            seq = seq_group.get_seqs()[0]
-            block_table = self.block_tables[seq.seq_id]
-            gpu_block = block_table[block_i]
-            
-            # Free the GPU block swapped out to CPU.
-            self.gpu_allocator.free(gpu_block)
-            block_table[block_i] = None
-
-        return block_number_mapping
-
-
-
-
-
-
-
 
     def _free_block_table(self, block_table: BlockTable) -> None:
         for block in set(block_table):
