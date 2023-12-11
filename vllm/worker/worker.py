@@ -20,6 +20,7 @@ from vllm.utils import get_gpu_memory, get_max_shared_memory_bytes
 
 # <jingzhi>
 import numpy as np
+import time
 
 
 class MyWorkerConfig(object):
@@ -86,7 +87,13 @@ class Worker:
 
         # Initialize the model.
         set_random_seed(self.model_config.seed)
+
+
+        # <jingzhi> For Profile
+        time1 = time.perf_counter()
         self.model = get_model(self.model_config)
+        time2 = time.perf_counter()
+        print(f"outmost loading: {time2 - time1}")
 
     @torch.inference_mode()
     def profile_num_available_blocks(

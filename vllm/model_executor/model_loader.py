@@ -11,6 +11,13 @@ from vllm.model_executor.models import *  # pylint: disable=wildcard-import
 from vllm.model_executor.weight_utils import (get_quant_config,
                                               initialize_dummy_weights)
 
+
+
+import time
+
+
+
+
 # TODO(woosuk): Lazy-load the model classes.
 _MODEL_REGISTRY = {
     "AquilaModel": AquilaForCausalLM,
@@ -100,7 +107,23 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             initialize_dummy_weights(model)
         else:
             # Load the weights from the cached or downloaded files.
+
+
+            # <jingzhi> For Profiling
+            print(model)
+            print(next(model.parameters()).is_cuda)
+            time1 = time.perf_counter()
+
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
+
+            # <jingzhi> For Profiling
+            time2 = time.perf_counter()
+
             model = model.cuda()
+
+            # <jingzhi> For Profiling
+            time3 = time.perf_counter()
+            print(f"inner load: {time2-time1}, tocuda: {time3 - time2}")
+
     return model.eval()

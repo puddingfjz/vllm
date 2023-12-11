@@ -1606,9 +1606,9 @@ class Scheduler:
             # scheduler_outputs = self._my_schedule()
             scheduler_outputs = self._schedule_outlen_aware()
         else:
-            # scheduler_outputs = self._schedule()
+            scheduler_outputs = self._schedule()
             # scheduler_outputs = self._schedule_peak_demand_aware_paged()
-            scheduler_outputs = self._schedule_by_plan()
+            # scheduler_outputs = self._schedule_by_plan()
 
         # <jingzhi> For DEBUG
         print(f"free blk num before computation: {self.block_manager.gpu_allocator.get_num_free_blocks()}")

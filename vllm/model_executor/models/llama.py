@@ -46,6 +46,18 @@ from vllm.model_executor.weight_utils import (
     load_tensor_parallel_weights, load_padded_tensor_parallel_vocab)
 from vllm.sequence import SamplerOutput
 
+
+
+
+
+
+# <jingzhi> For DEBUG
+import time
+
+
+
+
+
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -299,10 +311,27 @@ class LlamaForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> SamplerOutput:
+
+        # <jingzhi> FOR DEBUG
+        torch.cuda.synchronize()
+        time1 = time.perf_counter()
+
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    input_metadata, cache_events)
+        
+        # <jingzhi> FOR DEBUG
+        torch.cuda.synchronize()
+        time2 = time.perf_counter()
         next_tokens = self.sampler(self.lm_head.weight, hidden_states,
                                    input_metadata)
+
+        
+        # <jingzhi> FOR DEBUG
+        torch.cuda.synchronize()
+        time3 = time.perf_counter()
+
+        print(f"breakdown: {time2 - time1}, {time3 - time2}")
+
         return next_tokens
 
     _column_parallel_layers = []
