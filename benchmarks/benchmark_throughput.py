@@ -1,9 +1,22 @@
 """Benchmark offline inference throughput."""
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='3'
+os.environ['CUDA_VISIBLE_DEVICES']='2'
+
+'''
+Command: 
+python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 1000 > layerBylayer1.log
+/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --cudabacktrace=true -x true -o ./nsys_profile/my_profile1 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 > DEBUG.log
+
+# with record range
+/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --capture-range=cudaProfilerApi  --capture-range-end=stop-shutdown --kill=sigkill --cudabacktrace=true -x true -o ./nsys_profile/my_profile3 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 > DEBUG.lpg
 
 
+try llama2
+python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model NousResearch/Llama-2-13b-hf --num-prompts 100 > layerBylayer_llama2_1.log
+
+
+'''
 
 
 
@@ -61,6 +74,10 @@ def sample_requests(
         if prompt_len > 1024 or prompt_len + output_len > 2048:
             # Prune too long sequences.
             continue
+        # <jingzhi>
+        # if output_len > 10:
+        #     continue
+
         filtered_dataset.append((prompt, prompt_len, output_len))
 
     # Sample the requests.
@@ -91,6 +108,8 @@ def run_vllm(
         trust_remote_code=trust_remote_code,
         dtype=dtype,
         max_model_len=max_model_len,
+        # <jingzhi>
+        gpu_memory_utilization=0.9,
     )
 
     # Add the requests to the engine.

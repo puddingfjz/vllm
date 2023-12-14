@@ -169,7 +169,30 @@ class LLM:
             pbar = tqdm(total=num_requests, desc="Processed prompts")
         # Run the engine.
         outputs: List[RequestOutput] = []
+
+        # <jingzhi> For Profiling--------------------
+        # import torch
+        # step_i = 0
+        # -------------------------------------------
+
+
         while self.llm_engine.has_unfinished_requests():
+
+            # <jingzhi> For Profiling-----------------
+            # step_i+=1
+            # # if (step_i == step_start) and (run_profile):
+            # if (step_i == 200):
+            #     # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+            #     print(f"step_i: {step_i}")
+            #     torch.cuda.cudart().cudaProfilerStart()
+            # elif (step_i == 300):
+            #     # elif (step_i == step_end) and (run_profile):
+            #     # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+            #     print(f"step_i: {step_i}")
+            #     torch.cuda.cudart().cudaProfilerStop()
+            # ----------------------------------------
+
+
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:

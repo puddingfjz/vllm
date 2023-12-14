@@ -13,6 +13,18 @@ from vllm.model_executor.weight_utils import (get_quant_config,
 from vllm.utils import is_hip
 from vllm.logger import init_logger
 
+
+
+
+
+# <jingzhi>
+import time
+
+
+
+
+
+
 logger = init_logger(__name__)
 
 # TODO(woosuk): Lazy-load the model classes.
@@ -119,7 +131,28 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             # random values to the weights.
             initialize_dummy_weights(model)
         else:
+
+            # <jingzhi> Profiling
+            print(model)
+            # model.cpu()
+            torch.cuda.synchronize()
+            time1 = time.perf_counter()
+
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
+
+
+            # <jingzhi> Profiling
+            torch.cuda.synchronize()
+            params_device = next(model.parameters()).device
+            time2 = time.perf_counter()
+
+            # model.cuda()
+            torch.cuda.synchronize()
+            time3 = time.perf_counter()
+            print(f"loading: {time2 - time1} {time3 - time2} {params_device}")
+            print(f"param size: {sum([param.nelement()*param.element_size() for param in model.parameters()])}")
+
+
     return model.eval()

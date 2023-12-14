@@ -244,7 +244,41 @@ class LlamaModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
+
+
+        # <jingzhi> to support loading parameters layer by layer
+        # Initialize the stream for loading parameters.
+        self.param_stream = torch.cuda.Stream()
+        assert self.param_stream != torch.cuda.current_stream()
+        # Initialize the events for stream synchronization.
+        self.load_param_events = [torch.cuda.Event() for _ in self.layers]
+        self.layer_waiting_for_params = [False for _ in self.layers]
+        self.layer_num = len(self.layers)
+
+
+        # <jingzhi> For offloading weights layer by layer
+        # compute the size of parameters for each layer
+        self.weight_cache: torch.Tensor = torch.Tensor([])
+        self.weight_cache_cpu: torch.Tensor = torch.Tensor([])
+        self.weight_range_in_blk: List[Tuple[int, int, torch.Size]] = list() # (int, int, size_tuple): (start position, offset, tensor shape)
+        self.weight_num_per_layer: int = -1
+        # because of the high memory transfer cost: almost 1/2 decoding time per iter, only allows 1 layer to be transferred
+        self.weight_cache_block_num: int = self.layer_num # self.layer_num - 1 # (self.layer_num + 1)//2
+        # example: if totally 5 layers, the cache blk num is 3, then l0 -> blk0, l1 -> blk1, l2 -> blk2, l3->blk0, l4->blk1
+        # self.weight_cache_block_idx: List[int] = list(range(self.weight_cache_block_num)) \
+        #     + list(range(self.layer_num - self.weight_cache_block_num))
+        # example: 5 layers, 4 param cache blk, l0->blk0, l1->blk1, l2-blk2, l3->blk0, l4->blk3
+        # self.weight_cache_block_idx: List[int] = list(range((self.layer_num + 1)//2)) + [0] + list(range((self.layer_num + 1)//2, self.layer_num-1))
+        # no weight loading during inference
+        self.weight_cache_block_idx: List[int] = list(range(self.layer_num))
+        # stores the parameters we will store in self.weight_cache in order.
+        self.layer_params = [list() for _ in self.layers]
+
+
+
+
+    # the original code from vllm with all parameters on GPU
+    def forward_ori(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -267,6 +301,98 @@ class LlamaModel(nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+
+
+    # <jingzhi> In this function, we will try offloading 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+        for i in range(len(self.layers)):
+
+            # waiting for the param loading if there is
+            # loading weight -----------------------------------------------------------------------------------------
+            # param_event = self.load_param_events[i] if self.layer_waiting_for_params[i] else None
+            # if param_event is not None:
+            #     param_event.wait()
+            #     # update the status of this layer params
+            #     self.layer_waiting_for_params[i] = False
+            # loading weight END -----------------------------------------------------------------------------------------
+
+
+
+            # print(f'in computation for layer {i}:')
+            # for param in self.layer_params[i]:
+            #     print(param)
+
+
+            cache_event = None if cache_events is None else cache_events[i]
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                kv_caches[i],
+                input_metadata,
+                cache_event,
+                residual,
+            )
+
+
+            # loading weight -----------------------------------------------------------------------------------------
+            # # <jingzhi> after finishing this layer, start loading the params of a waiting layer
+            # self.load_layer_params((i + self.weight_cache_block_num)%self.layer_num, self.weight_cache_block_idx[i], i)
+            # # currently just a fixed mode, may consider dynamic weight_cache space later
+            # self.layer_waiting_for_params[ (i + self.weight_cache_block_num)%self.layer_num ] = True
+
+            # currently only allow one layer on CPU
+            # if i in [0, ((self.layer_num + 1)//2)]:
+            #     self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
+            #     self.layer_waiting_for_params[ ((self.layer_num + 1)//2)-i ] = True
+            # loading weight END -----------------------------------------------------------------------------------------
+
+
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+
+
+
+    def load_layer_params(self, layer_i:int, dst_weight_blk_idx:int, replace_layer_i:int):
+        param_event = self.load_param_events[layer_i]
+
+        # print(f"to load later {layer_i} into layer {replace_layer_i}, dst_weight_blk_idx: {dst_weight_blk_idx}")
+        # print(self.weight_cache_cpu[layer_i])
+
+        with torch.cuda.stream(self.param_stream):
+            self.weight_cache[dst_weight_blk_idx].copy_(self.weight_cache_cpu[layer_i], non_blocking=True)
+            param_event.record(stream=self.param_stream)
+
+
+        # if only allow one layer on CPU, no need to update the param tensor address
+        return
+
+        # update param tensor address if necessary
+        if self.layer_num % self.weight_cache_block_num == 0:
+            return
+
+        # change the param tensor address
+        self.weight_cache_block_idx[layer_i] = dst_weight_blk_idx
+        for param, to_replace in zip(self.layer_params[layer_i], self.layer_params[replace_layer_i]):
+            param.data = to_replace.data
+
+
+
+
+
 
 
 class LlamaForCausalLM(nn.Module):
@@ -304,7 +430,7 @@ class LlamaForCausalLM(nn.Module):
                                    sampling_metadata)
         return next_tokens
 
-    def load_weights(self,
+    def load_weights_ori(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
@@ -320,6 +446,10 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
+
+            # <jingzhi> For Profiling
+            print(f"layer info: {name, loaded_weight.shape, loaded_weight.device}")
+
             if "rotary_emb.inv_freq" in name:
                 continue
             if ("rotary_emb.cos_cached" in name
@@ -330,12 +460,262 @@ class LlamaForCausalLM(nn.Module):
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+
+                # <jingzhi> For Profiling
+                print(f"specific weight loader: {name.replace(weight_name, param_name), loaded_weight.shape, loaded_weight.device}")
                 param = params_dict[name.replace(weight_name, param_name)]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+
+                # <jingzhi> For Profiling
+                print(f"other weight loader: {name, loaded_weight.shape, loaded_weight.device}")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+
+
+
+
+
+
+
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
+
+        # <jingzhi> For offloading weights layer by layer
+        # first do some preprocess
+        self.preprocess_for_offloading_weights(model_name_or_path, cache_dir, load_format, revision)
+
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
+
+            # <jingzhi> For Profiling
+            print(f"layer info: {name, loaded_weight.shape, loaded_weight.device}")
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                # <jingzhi> For Profiling
+                print(f"specific weight loader: {name.replace(weight_name, param_name), loaded_weight.shape, loaded_weight.device}")
+                
+                # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) < self.model.weight_cache_block_num):
+                # currently only allow one layer on CPU
+                # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
+                if True:
+                    print('loading-----')
+                    param = params_dict[name.replace(weight_name, param_name)]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+
+                    # print(f"layerBylayer_param_tensor of {name}: {param.data}")
+
+                break
+            else:
+
+                # <jingzhi> For Profiling
+                print(f"other weight loader: {name, loaded_weight.shape, loaded_weight.device}")
+                # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) < self.model.weight_cache_block_num):
+                # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
+                if True:
+                    print('loading-----')
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+
+                    # print(f"layerBylayer_param_tensor of {name}: {param.data}")
+
+
+
+
+
+
+
+
+
+    # <jingzhi> For offloading weights layer by layer
+    # Set up: (1) weight_num_per_layer, (2) weight_range_in_blk, (3) weight cache blocks
+    # (4) making the param tensors pointing to the new GPU physical addresses
+
+    # NOTE: we cannot assume the parameter tensors for the same layer will appear together;
+    #       we cannot assume the parameter tensors for different layers appear in the same order
+
+    def preprocess_for_offloading_weights(self,
+             model_name_or_path: str,
+             cache_dir: Optional[str] = None,
+             load_format: str = "auto",
+             revision: Optional[str] = None):
+
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+
+
+        visited_param_names = [list() for _ in self.model.layers]
+
+        print(f"init model size: {torch.cuda.memory_allocated()/1024/1024/1024} GB")
+
+
+        # we only need to consider layer params.
+        # we do weight loading.
+        # we collect layer parameters in order (no repetition).
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
+
+            # <jingzhi> For Profiling
+            # print(f"layer info: {name, loaded_weight.shape, loaded_weight.device}")
+
+            if 'model.layers.' not in name:
+                # we only need to consider layer params
+                continue
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                # <jingzhi> For Profiling
+                # print(f"specific weight loader: {name.replace(weight_name, param_name), loaded_weight.shape, loaded_weight.device}")
+
+                full_para_name = name.replace(weight_name, param_name)
+                param = params_dict[full_para_name]
+                # need load weight so that we can get packed weight_cache_cpu
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+
+                # print(f"ori_param_tensor of {name}: {param.data}")
+
+                # store this parameter
+                layer_i = self.get_layer_id_from_name(name)
+                if full_para_name not in visited_param_names[layer_i]:
+                    self.model.layer_params[layer_i].append(param)
+                    visited_param_names[layer_i].append(full_para_name)
+                break
+            else:
+
+                # <jingzhi> For Profiling
+                # print(f"other weight loader: {name, loaded_weight.shape, loaded_weight.device}")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+                # print(f"ori_param_tensor of {name}: {param.data}")
+
+                # store this parameter
+                layer_i = self.get_layer_id_from_name(name)
+                if name not in visited_param_names[layer_i]:
+                    self.model.layer_params[layer_i].append(param)
+                    visited_param_names[layer_i].append(name)
+                
+
+
+        # we need to ensure the params and param_names for different layers are in the same order
+        # name: 'model.layers.30.input_layernorm.weight'
+        for layer_i in range(self.model.layer_num):
+            param_names = [name.split('.')[3:] for name in visited_param_names[layer_i]]
+            order = sorted(range(len(param_names)), key=lambda i: param_names[i])
+            params = self.model.layer_params[layer_i]
+            self.model.layer_params[layer_i] = [params[i] for i in order]
+            visited_param_names[layer_i] = [visited_param_names[layer_i][i] for i in order]
+
+
+
+        weight_num_per_layer = 0
+        weight_range_in_blk: List[Tuple[int, int, torch.Size]] = list()
+        params_dtype = None
+
+        for param in self.model.layer_params[0]:
+            # for these information we only need to consider layer 0, as other layers are the same as it
+            # we also avoid repeat param as some weights may be packed into one param
+            weight_range_in_blk.append((weight_num_per_layer, param.nelement(), param.shape))
+            weight_num_per_layer += param.nelement()
+            assert (params_dtype == None) or (params_dtype == param.dtype)
+            params_dtype = param.dtype
+
+
+        print(f"visited_param_names[30]: {visited_param_names[30]}")
+        print(f"weight_range_in_blk: {weight_range_in_blk}")
+        print(f"weight_num_per_layer: {weight_num_per_layer}")
+
+
+        # obtain weights_cache_cpu and release the param tensors on GPU
+        # make sure weight_cache_cpu is a pinned memory
+        self.model.weight_cache_cpu = torch.empty(weight_num_per_layer*self.model.layer_num, dtype=self.model.layer_params[0][0].data.cpu().dtype, pin_memory=True)
+        torch.cat([param.data.cpu().view(-1) for params in self.model.layer_params for param in params], out=self.model.weight_cache_cpu)
+        self.model.weight_cache_cpu = self.model.weight_cache_cpu.view(self.model.layer_num, weight_num_per_layer)
+        for params in self.model.layer_params:
+            for param in params:
+                param.data = torch.Tensor([])
+
+        torch.cuda.empty_cache()
+        print(f"release param tensors: {torch.cuda.memory_allocated()/1024/1024/1024} GB")
+
+        self.model.weight_num_per_layer = weight_num_per_layer
+        self.model.weight_range_in_blk = weight_range_in_blk
+        self.model.weight_cache = torch.empty(self.model.weight_cache_block_num * self.model.weight_num_per_layer,
+                                       device=torch.cuda.current_device(),
+                                       dtype=params_dtype)
+
+        
+        print(f"after allocate param cache: {torch.cuda.memory_allocated()/1024/1024/1024} GB")
+
+        # make the layer param tensors point to the new address in self.weight_cache
+        for layer_i in range(len(self.model.layer_params)):
+            params = self.model.layer_params[layer_i]
+            for param, rng_info in zip(params, self.model.weight_range_in_blk):
+                param.data = torch.narrow(self.model.weight_cache, 
+                    0, 
+                    self.model.weight_cache_block_idx[layer_i]*self.model.weight_num_per_layer + rng_info[0], 
+                    rng_info[1]).view(rng_info[2])
+
+
+        self.model.weight_cache = self.model.weight_cache.view(self.model.weight_cache_block_num, self.model.weight_num_per_layer)
+
+        torch.cuda.empty_cache()
+
+
+
+    def get_layer_id_from_name(self, name:str) -> int:
+        # 'model.layers.24.input_layernorm.weight'
+        terms = name.split('.')
+        return int(terms[2])
