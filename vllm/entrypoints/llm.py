@@ -171,25 +171,25 @@ class LLM:
         outputs: List[RequestOutput] = []
 
         # <jingzhi> For Profiling--------------------
-        # import torch
-        # step_i = 0
+        import torch
+        step_i = 0
         # -------------------------------------------
 
 
         while self.llm_engine.has_unfinished_requests():
 
             # <jingzhi> For Profiling-----------------
-            # step_i+=1
-            # # if (step_i == step_start) and (run_profile):
-            # if (step_i == 200):
-            #     # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
-            #     print(f"step_i: {step_i}")
-            #     torch.cuda.cudart().cudaProfilerStart()
-            # elif (step_i == 300):
-            #     # elif (step_i == step_end) and (run_profile):
-            #     # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
-            #     print(f"step_i: {step_i}")
-            #     torch.cuda.cudart().cudaProfilerStop()
+            step_i+=1
+            # if (step_i == step_start) and (run_profile):
+            if (step_i == 1880):
+                # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+                print(f"step_i: {step_i}")
+                torch.cuda.cudart().cudaProfilerStart()
+            elif (step_i == 2300):
+                # elif (step_i == step_end) and (run_profile):
+                # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+                print(f"step_i: {step_i}")
+                torch.cuda.cudart().cudaProfilerStop()
             # ----------------------------------------
 
 
@@ -201,6 +201,19 @@ class LLM:
                         pbar.update(1)
         if use_tqdm:
             pbar.close()
+
+        print(f"total steps: {step_i}")
+        # <jingzhi> For layer-by-layer params loading------------------------------------------------
+        from vllm._C import cache_ops
+        import os
+        if os.environ['USE_VLLM']!='True':
+            # for cache_device_i in self.llm_engine.workers[0].model_runner.model.model.cache_device_ids:
+            #     cache_ops.disable_P2P_access(cache_device_i, 0, 0)
+            # in distributed inference, the current device for this worker may not be cuda:0
+            self.llm_engine.disable_P2P_access()
+        # -------------------------------------------------------------------------------------------
+        
+
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.

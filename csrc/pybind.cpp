@@ -63,6 +63,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     &swap_blocks,
     "Swap in (out) the cache blocks from src to dst");
   cache_ops.def(
+    "load_layer_weights",
+    &load_layer_weights,
+    "load layer weights from src to dst");
+  cache_ops.def(
+    "init_P2P_access",
+    &init_P2P_access,
+    "init_P2P_access");
+  cache_ops.def(
+    "disable_P2P_access",
+    &disable_P2P_access,
+    "disable_P2P_access");
+  cache_ops.def(
     "copy_blocks",
     &copy_blocks,
     "Copy the cache blocks from src to dst");

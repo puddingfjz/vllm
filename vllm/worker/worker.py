@@ -31,6 +31,9 @@ class Worker:
         scheduler_config: SchedulerConfig,
         rank: Optional[int] = None,
         distributed_init_method: Optional[str] = None,
+        # <jingzhi>
+        # tot_gpu_num: Optional[int] = None,
+        tot_ordered_gpus: Optional[str] = 'None',
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -47,6 +50,12 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
 
+        # <jingzhi>
+        # self.tot_gpu_num = tot_gpu_num
+        self.tot_ordered_gpus = tot_ordered_gpus
+        os.environ['TOT_ORDERED_GPUS']=tot_ordered_gpus
+        print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
+
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -54,10 +63,29 @@ class Worker:
         self.rank = self.rank if self.rank is not None else int(
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        self.device = torch.device(f"cuda:{local_rank}")
+
+
+        # <jingzhi> as the order in os.environ["CUDA_VISIBLE_DEVICES"] may be wrong due to Ray, we need to get the correct gpus
+        if self.tot_ordered_gpus != 'None':
+            ori_gpu_orders = self.tot_ordered_gpus.split(',')
+            curr_gpu_orders = os.environ["CUDA_VISIBLE_DEVICES"].split(',')
+            for i, gpu_i in enumerate(curr_gpu_orders):
+                if gpu_i == ori_gpu_orders[local_rank]:
+                    self.device = torch.device(f"cuda:{i}")
+                    print(f"After cuda remapping, torch.current_device set to {i}")
+                    break
+        else:
+            self.device = torch.device(f"cuda:{local_rank}")
+        # self.device = torch.device(f"cuda:{local_rank}")
+
+
+
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
         torch.cuda.set_device(self.device)
+
+        # <jingzhi> For DEBUG
+        print(f'rank: {self.rank}, local_rank: {local_rank}, visible gpus: {os.environ["CUDA_VISIBLE_DEVICES"]}')
 
         _check_if_gpu_supports_dtype(self.model_config.dtype)
 
@@ -67,6 +95,29 @@ class Worker:
 
         # Initialize the model.
         set_random_seed(self.model_config.seed)
+
+        # <jinzhi> Support layer param cached in other GPUs----------------------------
+        # import ray
+        print(f'In init_model: os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}') #, ray.get_gpu_ids():{ray.get_gpu_ids()}')
+        # # remaining_gpus = [i for i in range(torch.cuda.device_count()) if str(i) not in os.environ["CUDA_VISIBLE_DEVICES"]]
+        # worker_num = self.parallel_config.world_size
+        # # set the visible devices to all the available gpus
+        # cache_gpu_num = (torch.cuda.device_count() - worker_num) // worker_num
+        # cache_gpus = remaining_gpus[cache_gpu_num*local_rank : cache_gpu_num*(local_rank+1)]
+        # print(f"remaining_gpus:{remaining_gpus}, cache_gpu_num:{cache_gpu_num}, cache_gpus:{cache_gpus}, local_rank:{local_rank}")
+        # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]+','+','.join(str(i) for i in cache_gpus)
+        # print(f'In init_model (end): os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+        # -----------------------------------------------------------------------------
+
+
+
+    # <jingzhi>
+    def disable_p2ps(self):
+        from vllm._C import cache_ops
+        for cache_device_i in self.model_runner.model.model.cache_device_ids:        
+            cache_ops.disable_P2P_access(cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
+
+
 
     def load_model(self):
         self.model_runner.load_model()
@@ -173,6 +224,9 @@ def _init_distributed_environment(
             rank=rank,
             init_method=distributed_init_method,
         )
+
+
+    print(f"world size: {parallel_config.world_size}, rank: {rank}, init_method: {distributed_init_method}")
 
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())

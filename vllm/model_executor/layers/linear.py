@@ -48,9 +48,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def create_weights(self, input_size: int, output_size: int,
                        params_dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        # <jingzhi>
+        import os
+        device = torch.device("cpu")
+        if os.environ['USE_VLLM']=='True':
+            device = torch.cuda.current_device()
+
+
         weight = Parameter(torch.empty(output_size,
                                        input_size,
-                                       device=torch.cuda.current_device(),
+                                       # device=torch.cuda.current_device(),
+
+                                       # <jingzhi> to create weights on the current device (can be cpu)
+                                       device=device,
+
                                        dtype=params_dtype),
                            requires_grad=False)
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})

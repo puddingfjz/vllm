@@ -83,6 +83,12 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         self.swapped: List[SequenceGroup] = []
 
+
+
+
+        # <jingzhi> For DEBUG
+        self.tot_preempt = 0
+
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
         self.waiting.append(seq_group)
@@ -351,6 +357,12 @@ class Scheduler:
         # over sequence groups with a single sequence.
         # TODO(woosuk): Support recomputation for sequence groups with multiple
         # sequences. This may require a more sophisticated CUDA kernel.
+        
+        # <jingzhi> For DEBUG
+        self.tot_preempt = self.tot_preempt + seq_group.get_seqs()[0].get_len()
+        print(f"preempted count: {seq_group.get_seqs()[0].get_len()}/{self.tot_preempt}")
+
+
         if preemption_mode is None:
             if seq_group.get_max_num_running_seqs() == 1:
                 preemption_mode = PreemptionMode.RECOMPUTE

@@ -8,6 +8,11 @@ from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 
+
+# <jingzhi>
+import os
+
+
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
@@ -175,6 +180,13 @@ class ModelRunner:
                                              max_len=max_block_table_len,
                                              pad=0,
                                              dtype=torch.int)
+
+
+        # <jingzhi> For DEBUG
+        # if torch.cuda.current_device() == 0:
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"decoding: seq num: {len(context_lens)}, tot_tokens: {sum(context_lens)}")
+
 
         input_metadata = InputMetadata(
             prompt_lens=[],

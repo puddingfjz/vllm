@@ -126,6 +126,8 @@ class LLMEngine:
         # before CUDA_VISIBLE_DEVICES is set in the Worker
         from vllm.worker.worker import Worker
 
+        print('Run Init workers')
+
         assert self.parallel_config.world_size == 1, (
             "Ray is required if parallel_config.world_size > 1.")
 
@@ -157,12 +159,22 @@ class LLMEngine:
 
         self.workers: List[Worker] = []
         for bundle in placement_group.bundle_specs:
+
+            # <jingzhi>
+            print(f"bundle: {bundle}")
+
             if not bundle.get("GPU", 0):
                 continue
             if self.parallel_config.tensor_parallel_size == 1:
                 num_gpus = self.cache_config.gpu_memory_utilization
             else:
                 num_gpus = 1
+
+            # <jingzhi> consider the cache gpus
+            num_gpus = bundle['GPU']
+
+            print(f"placement_group:{placement_group}")
+
             worker = ray.remote(
                 num_cpus=0,
                 num_gpus=num_gpus,
@@ -178,6 +190,12 @@ class LLMEngine:
         model_config = copy.deepcopy(self.model_config)
         parallel_config = copy.deepcopy(self.parallel_config)
         scheduler_config = copy.deepcopy(self.scheduler_config)
+        
+        # <jingzhi>
+        import os
+        tot_ordered_gpus = ','.join(cuda_name for cuda_name in os.environ['CUDA_VISIBLE_DEVICES'].split(','))
+        print(f"BEFORE init workers: os.environ['CUDA_VISIBLE_DEVICES']: {os.environ['CUDA_VISIBLE_DEVICES']}, tot_ordered_gpus: {tot_ordered_gpus}")
+
         self._run_workers("init_worker",
                           get_all_outputs=True,
                           worker_init_fn=lambda: Worker(
@@ -186,6 +204,8 @@ class LLMEngine:
                               scheduler_config,
                               None,
                               None,
+                              # <jingzhi>
+                              tot_ordered_gpus,
                           ))
         self._run_workers(
             "init_model",
@@ -232,6 +252,15 @@ class LLMEngine:
 
         # Initialize the cache.
         self._run_workers("init_cache_engine", cache_config=self.cache_config)
+
+
+    # <jingzhi>
+    def disable_P2P_access(self) -> None:
+        '''
+            Disable the P2P access between gpu cards
+        '''
+        self._run_workers("disable_p2ps") #, get_all_outputs=True)
+
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":

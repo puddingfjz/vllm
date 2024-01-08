@@ -49,6 +49,105 @@ void swap_blocks(
   }
 }
 
+
+
+
+void init_P2P_access(
+  const int src_device_idx, 
+  const int dst_device_idx,
+  const int curr_device_idx) {
+
+  // not sure whether we need to do this every time
+  cudaSetDevice(src_device_idx);
+  cudaDeviceEnablePeerAccess(dst_device_idx, 0);
+  cudaSetDevice(dst_device_idx);
+  cudaDeviceEnablePeerAccess(src_device_idx, 0);
+
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) {
+    printf("Cuda failure '%s'\n", \
+             cudaGetErrorString(e));
+  }
+
+  // go back to current device
+  cudaSetDevice(curr_device_idx);
+}
+
+
+void load_layer_weights(
+  torch::Tensor& src,
+  torch::Tensor& dst,
+  const int layer_idx, 
+  const int src_device_idx,
+  const int dst_device_idx,
+  const int curr_device_idx) {
+
+  // // not sure whether we need to do this every time
+  // cudaSetDevice(src_device_idx);
+  // cudaDeviceEnablePeerAccess(dst_device_idx, 0);
+  // cudaSetDevice(dst_device_idx);
+  // cudaDeviceEnablePeerAccess(src_device_idx, 0);
+
+  // cudaError_t e = cudaGetLastError();
+  // if (e != cudaSuccess) {
+  //   printf("Cuda failure '%s'\n", \
+  //            cudaGetErrorString(e));
+  // }
+
+  // // go back to current device
+  // cudaSetDevice(curr_device_idx);
+
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // not sure whether we need synch here, I think we do not need this, otherwise we may need to wait previous copy to finish
+  // cudaStreamSynchronize(stream);
+
+  char *src_ptr = static_cast<char*>(src.data_ptr());
+  char *dst_ptr = static_cast<char*>(dst.data_ptr());
+
+  const int64_t layer_weight_in_bytes = src.element_size() * src.numel();
+  // printf("load amount '%d' '%d'\n", src.element_size(), src.numel());
+  cudaMemcpyPeerAsync( dst_ptr, dst_device_idx, src_ptr, src_device_idx, layer_weight_in_bytes, stream );
+
+
+  // cudaSetDevice(dst_device_idx);
+  // cudaDeviceDisablePeerAccess(src_device_idx);
+  // cudaSetDevice(src_device_idx);
+  // cudaDeviceDisablePeerAccess(dst_device_idx);
+
+  // // go back to current device
+  // cudaSetDevice(curr_device_idx);
+}
+
+
+
+
+
+void disable_P2P_access(
+  const int src_device_idx,
+  const int dst_device_idx,
+  const int curr_device_idx) {
+
+  cudaSetDevice(dst_device_idx);
+  cudaDeviceDisablePeerAccess(src_device_idx);
+  cudaSetDevice(src_device_idx);
+  cudaDeviceDisablePeerAccess(dst_device_idx);
+
+
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) {
+    printf("Cuda failure '%s'\n", \
+             cudaGetErrorString(e));
+  }
+
+  // go back to current device
+  cudaSetDevice(curr_device_idx);
+}
+
+
+
+
 namespace vllm {
 
 // Grid: (num_layers, num_pairs)

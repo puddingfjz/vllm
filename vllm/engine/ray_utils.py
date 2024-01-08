@@ -78,8 +78,16 @@ def initialize_cluster(
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
                      num_gpus=parallel_config.world_size)
+
+            # <jingzhi>
+            print(f"is hip-------")
+
         else:
             ray.init(address=ray_address, ignore_reinit_error=True)
+
+
+            # <jingzhi>
+            print(f"not hip-------")
 
     if not parallel_config.worker_use_ray:
         # Initialize cluster locally.
@@ -89,7 +97,15 @@ def initialize_cluster(
         distributed_init_method = f"tcp://localhost:{port}"
         return distributed_init_method, None
 
+
+    # <jingzhi>
+    print(f"parallel_config.worker_use_ray: {parallel_config.worker_use_ray}")
+
+
     current_placement_group = ray.util.get_current_placement_group()
+
+    print(f"current_placement_group: {current_placement_group}")
+
     if current_placement_group:
         # We are in a placement group
         bundles = current_placement_group.bundle_specs
@@ -108,14 +124,29 @@ def initialize_cluster(
                 "available GPUs in the placement group.")
     else:
         num_gpus_in_cluster = ray.cluster_resources().get("GPU", 0)
+
+
+        # <jingzhi>
+        print(f'num_gpus_in_cluster: {num_gpus_in_cluster}, parallel_config.world_size: {parallel_config.world_size}')
+
+
         if parallel_config.world_size > num_gpus_in_cluster:
             raise ValueError(
                 "The number of required GPUs exceeds the total number of "
                 "available GPUs in the cluster.")
         # Create a new placement group
+
+        # <jingzhi>
+        # consider cache gpu at the same time
+        gpu_num_per_worker = num_gpus_in_cluster//parallel_config.world_size
         current_placement_group = ray.util.placement_group([{
-            "GPU": 1
+            "GPU": gpu_num_per_worker # 1
         }] * parallel_config.world_size)
+
+        # current_placement_group = ray.util.placement_group([{
+        #     "GPU": 1
+        # }] * parallel_config.world_size)
+        
         # Wait until PG is ready - this will block until all
         # requested resources are available, and will timeout
         # if they cannot be provisioned.
