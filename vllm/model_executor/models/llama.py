@@ -272,24 +272,10 @@ class LlamaModel(nn.Module):
         # <jingzhi> to support loading parameters layer by layer
         self.cache_device_ids = [1] # example: [1] means we use GPU 1 as our cache
         # consider when there are multiple workers due to parallelism
-        worker_num = torch.distributed.get_world_size()
-        cache_gpu_num = (torch.cuda.device_count() - worker_num) // worker_num
-        # we need do cuda order remapping because ray would mess it up
-        # self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
-        if worker_num == 1:
-            self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
-        else:
-            cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
-            cand_cache_device_ids = list()
-            current_device_names_ordered = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
-            for cuda_name in cand_cache_device_names:
-                for i, to_check in enumerate(current_device_names_ordered):
-                    if cuda_name == to_check:
-                        cand_cache_device_ids.append(i)
-                        break
-            self.cache_device_ids = cand_cache_device_ids[int(os.environ["LOCAL_RANK"])*cache_gpu_num:(int(os.environ["LOCAL_RANK"])+1)*cache_gpu_num]
 
-        print(f'In model, os.environ["LOCAL_RANK"]:{os.getenv("LOCAL_RANK", "0")}, all card num: {torch.cuda.device_count()}, worker_num:{worker_num}, os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}, os.environ["TOT_ORDERED_GPUS"]:{os.environ["TOT_ORDERED_GPUS"]}  current_device: {torch.cuda.current_device()}, self.cache_device_ids: {self.cache_device_ids}')
+        self.set_cache_device_ids()
+
+        print(f'In model, os.environ["LOCAL_RANK"]:{os.getenv("LOCAL_RANK", "0")}, all card num: {torch.cuda.device_count()}, worker_num:{torch.distributed.get_world_size()}, os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}, os.environ["TOT_ORDERED_GPUS"]:{os.environ["TOT_ORDERED_GPUS"]}  current_device: {torch.cuda.current_device()}, self.cache_device_ids: {self.cache_device_ids}')
 
         # Initialize the stream for loading parameters.
         # self.param_stream = torch.cuda.Stream()
@@ -315,7 +301,7 @@ class LlamaModel(nn.Module):
         # because of the high memory transfer cost: almost 1/2 decoding time per iter, only allows 1 layer to be transferred
         # self.weight_cache_block_num: int = self.layer_num - 1 # (self.layer_num + 1)//2
         # we set a parameter: pipeline degree to control weight_cache_block_num
-        self.pipeline_degree: int = 40 # 1 iter decoding time = pipeline_degree * 1 layer weight loading time
+        self.pipeline_degree: int = 20 # 1 iter decoding time = pipeline_degree * 1 layer weight loading time
         self.pipeline_inteval = (self.layer_num + self.pipeline_degree - 1) // self.pipeline_degree # get ceiling value to ensure enough pipeline interval
         self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
         self.weight_cache_block_num = self.layer_num - (self.pipeline_degree - 1) # assuming all layers involved in weight offloading will take the same weight cache block
@@ -346,6 +332,62 @@ class LlamaModel(nn.Module):
 
         self.use_vllm = (os.environ['USE_VLLM'] == 'True')
         # ======================================================================
+
+
+    # <jingzhi>
+    def set_cache_device_ids_old(self):
+        '''
+        Set the cache_device_ids automatically.
+        Policy: given all the visible GPUs, the first worker_num GPUs is for computation (each for a worker), 
+                while the remaining GPUs are split and assigned to the workers as cache.
+        '''
+        # consider when there are multiple workers due to parallelism
+        worker_num = torch.distributed.get_world_size()
+        cache_gpu_num = (torch.cuda.device_count() - worker_num) // worker_num
+        # we need do cuda order remapping because ray would mess it up
+        # self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
+        if worker_num == 1:
+            self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
+        else:
+            cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
+            cand_cache_device_ids = list()
+            current_device_names_ordered = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+            for cuda_name in cand_cache_device_names:
+                for i, to_check in enumerate(current_device_names_ordered):
+                    if cuda_name == to_check:
+                        cand_cache_device_ids.append(i)
+                        break
+            self.cache_device_ids = cand_cache_device_ids[int(os.environ["LOCAL_RANK"])*cache_gpu_num:(int(os.environ["LOCAL_RANK"])+1)*cache_gpu_num]
+
+
+    # <jingzhi>
+    def set_cache_device_ids(self):
+        '''
+        Set the cache_device_ids automatically.
+        Policy: given all the visible GPUs, the first worker_num GPUs is for computation (each for a worker), 
+                while the remaining GPUs used by all the workers as cache.
+        '''
+        worker_num = torch.distributed.get_world_size()
+        cache_gpu_num = torch.cuda.device_count() - worker_num
+        # we need do cuda order remapping because ray would mess it up
+        # self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
+        if worker_num == 1:
+            # although the logic is the same as when worker_num > 1, but as in this branch, we do not have os.environ['TOT_ORDERED_GPUS'], 
+            # we deal with it seperately
+            self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
+        else:
+            cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
+            cand_cache_device_ids = list()
+            current_device_names_ordered = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+            for cuda_name in cand_cache_device_names:
+                for i, to_check in enumerate(current_device_names_ordered):
+                    if cuda_name == to_check:
+                        cand_cache_device_ids.append(i)
+                        break
+            self.cache_device_ids = cand_cache_device_ids
+
+
+
 
 
 

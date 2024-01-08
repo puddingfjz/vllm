@@ -136,12 +136,15 @@ def initialize_cluster(
                 "available GPUs in the cluster.")
         # Create a new placement group
 
-        # <jingzhi>
+        # <jingzhi>---------------------------------------------------------------
         # consider cache gpu at the same time
-        gpu_num_per_worker = num_gpus_in_cluster//parallel_config.world_size
-        current_placement_group = ray.util.placement_group([{
-            "GPU": gpu_num_per_worker # 1
-        }] * parallel_config.world_size)
+        # gpu_num_per_worker = num_gpus_in_cluster//parallel_config.world_size
+        # current_placement_group = ray.util.placement_group([{
+        #     "GPU": gpu_num_per_worker # 1
+        # }] * parallel_config.world_size)
+
+        current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster))
+        # ------------------------------------------------------------------------
 
         # current_placement_group = ray.util.placement_group([{
         #     "GPU": 1
@@ -153,3 +156,28 @@ def initialize_cluster(
         ray.get(current_placement_group.ready(), timeout=1800)
 
     return None, current_placement_group
+
+
+
+
+
+
+
+# <jingzhi>
+def get_gpu_assignment(worker_num: int, tot_gpu_num: int):
+    '''
+    Get the gpu number assignment plan given the worker number and the total gpu number.
+    Principle: the purpose is to make all gpus of the machine node visible to the workers on the machine.
+    '''
+    # --------------------------------------------------------
+    # gpu_num_per_worker = tot_gpu_num//worker_num
+    # plan = [{"GPU": gpu_num_per_worker}] * worker_num
+    # --------------------------------------------------------
+
+
+    # an example of the policy below: there are 4 GPUs, but 3 workers, will generate an assignment plan as {GPU:1, GPU:1, GPU:2}
+
+    gpu_num_per_worker = tot_gpu_num//worker_num
+    plan = [{"GPU": gpu_num_per_worker}] * (worker_num-1) + [{"GPU": tot_gpu_num - gpu_num_per_worker*(worker_num-1)}]
+    return plan
+
