@@ -1011,8 +1011,13 @@ class LlamaForCausalLM(nn.Module):
         weight_cache_cpu = weight_cache_cpu.view(self.model.layer_num, len(self.model.cache_device_ids), -1) #weight_num_per_layer)
 
         # we need to use gpus as a weight cache
-        for layer_weights in weight_cache_cpu:
+        for layer_i, layer_weights in enumerate(weight_cache_cpu):
             self.model.weight_cache_cpu.append(list())
+            # NOTE: we do not need to store the parameter of every layer on the cache GPUs, because some layers are kept only on the compute GPUs.
+            if (layer_i % self.model.pipeline_inteval) != 0:
+                # this layer will not be cached on other GPUs.
+                print(f"layer_i: {layer_i} is not cached, pipeline_inteval: {self.model.pipeline_inteval}")
+                continue
             for part_weights, cache_device_i in zip(layer_weights, self.model.cache_device_ids):
                 self.model.weight_cache_cpu[-1].append( part_weights.to(cache_device_i) )
 
