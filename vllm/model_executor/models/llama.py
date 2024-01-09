@@ -169,11 +169,35 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"qkv: {q, k, v}")
+
+
+
         q, k = self.rotary_emb(positions, q, k)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
                                 cache_event)
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     # print(f"attn_output: {attn_output}")
+        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
+        #         f.write(f"attn_output: {attn_output}\n")
+
         output, _ = self.o_proj(attn_output)
+
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 1:
+        #     print(f"o_proj: {output}")
+            # print(f"o_proj weights: {self.o_proj.linear_weights}")
+        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
+        #         f.write(f"o_proj: {output}\n")
+
+
         return output
 
 
@@ -226,6 +250,12 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"hidden_states before attn: {hidden_states}, {residual}")
+
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -237,7 +267,20 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"hidden_states after attn: {hidden_states}, {residual}")
+
+
         hidden_states = self.mlp(hidden_states)
+
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"hidden_states after mlp: {hidden_states}")
+
+
         return hidden_states, residual
 
 
@@ -301,7 +344,8 @@ class LlamaModel(nn.Module):
         # because of the high memory transfer cost: almost 1/2 decoding time per iter, only allows 1 layer to be transferred
         # self.weight_cache_block_num: int = self.layer_num - 1 # (self.layer_num + 1)//2
         # we set a parameter: pipeline degree to control weight_cache_block_num
-        self.pipeline_degree: int = 20 # 1 iter decoding time = pipeline_degree * 1 layer weight loading time
+        # self.pipeline_degree: int = 20 # 1 iter decoding time = pipeline_degree * 1 layer weight loading time
+        self.pipeline_degree: int = int(os.environ['WEIGHT_LOAD_DEGREE'])
         self.pipeline_inteval = (self.layer_num + self.pipeline_degree - 1) // self.pipeline_degree # get ceiling value to ensure enough pipeline interval
         self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
         self.weight_cache_block_num = self.layer_num - (self.pipeline_degree - 1) # assuming all layers involved in weight offloading will take the same weight cache block
@@ -331,6 +375,15 @@ class LlamaModel(nn.Module):
         self.layer_params = [list() for _ in self.layers]
 
         self.use_vllm = (os.environ['USE_VLLM'] == 'True')
+
+
+        # when there is tensor parallelism, to support using cache gpus, 
+        # we need ensure the weight loading happen after certain computation finishes
+        # 好像只用不给event分layer也OK？因为cuda api的issue都是按顺序的，然后event record不会放到stream里面运行？就是issue的瞬间就record完了；等会试试
+        self.synch_comp_events = [[torch.cuda.Event() for _ in self.layers] for _ in self.cache_device_ids]
+        for device_events in self.synch_comp_events:
+            device_events[((-1)%self.pipeline_degree)*self.pipeline_inteval].record(stream=torch.cuda.current_stream())
+
         # ======================================================================
 
 
@@ -468,6 +521,10 @@ class LlamaModel(nn.Module):
                     device_events[i].wait()
                 # update the status of this layer params
                 self.layer_waiting_for_params[i] = False                
+
+            # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            #     print(f"layer_i: {i}, {self.weight_cache_block_idx[i]}, {self.weight_cache[self.weight_cache_block_idx[i]]}")
+            #     print(f"- layer_i: - {i}, {self.weight_cache_block_idx[i]}, {self.weight_cache_cpu[i]}")
             # loading weight END -----------------------------------------------------------------------------------------
 
 
@@ -504,6 +561,13 @@ class LlamaModel(nn.Module):
             #     self.load_layer_params(to_load_layer_i, self.weight_cache_block_idx[i], i)
             #     self.layer_waiting_for_params[ to_load_layer_i ] = True
             # loading weight END -----------------------------------------------------------------------------------------
+
+
+            # record finish computation----------------------
+            if (i%self.pipeline_inteval) == 0:
+                for device_events in self.synch_comp_events:
+                    device_events[i].record(stream=torch.cuda.current_stream())
+            # -----------------------------------------------
 
 
 
@@ -577,10 +641,17 @@ class LlamaModel(nn.Module):
 
 
         # loading
+        last_last_layer_i = ((last_layer_i//self.pipeline_inteval-1)%self.pipeline_degree)*self.pipeline_inteval
         for part_i, cache_device_i in enumerate(self.cache_device_ids):
             param_event = self.load_param_events[part_i][layer_i]
+            to_synch_comp_event = self.synch_comp_events[part_i][last_last_layer_i]
+
             # use nvlink to copy from another device
             with torch.cuda.stream(self.param_streams[part_i]):
+
+                # the loading stream should wait the comp to finish
+                to_synch_comp_event.wait()
+
                 # in distributed inference, the current device may not be cuda:0
                 cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.weight_cache[dst_weight_blk_idx][part_i],
                     layer_i, cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
@@ -1013,6 +1084,10 @@ class LlamaForCausalLM(nn.Module):
         # we need to use gpus as a weight cache
         for layer_i, layer_weights in enumerate(weight_cache_cpu):
             self.model.weight_cache_cpu.append(list())
+            
+            # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            #     print(f"--layer_i-- {layer_i}, -- {layer_weights}")
+            
             # NOTE: we do not need to store the parameter of every layer on the cache GPUs, because some layers are kept only on the compute GPUs.
             if (layer_i % self.model.pipeline_inteval) != 0:
                 # this layer will not be cached on other GPUs.

@@ -108,8 +108,18 @@ class LLMEngine:
         else:
             self._init_workers(distributed_init_method)
 
+
+        # # <jingzhi>
+        # import torch
+        # torch.cuda.cudart().cudaProfilerStart()
+
+
         # Profile the memory usage and initialize the cache.
         self._init_cache()
+
+        # # <jingzhi>
+        # torch.cuda.cudart().cudaProfilerStop()
+
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
