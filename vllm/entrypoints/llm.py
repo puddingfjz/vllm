@@ -181,11 +181,11 @@ class LLM:
             # <jingzhi> For Profiling-----------------
             step_i+=1
             # if (step_i == step_start) and (run_profile):
-            if (step_i == 140):
+            if (step_i == 1709): #140):
                 # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
                 print(f"step_i: {step_i}")
                 torch.cuda.cudart().cudaProfilerStart()
-            elif (step_i == 200):
+            elif (step_i == 1770): #200):
                 # elif (step_i == step_end) and (run_profile):
                 # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
                 print(f"step_i: {step_i}")

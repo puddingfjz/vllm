@@ -508,12 +508,12 @@ class LlamaModel(nn.Module):
             #     self.layer_waiting_for_params[i] = False
             # 
 
-            # we can directly load the next layer to be loaded directly without waiting for this layer to finish its computation
-            if (i%self.pipeline_inteval) == 0:
-                # self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
-                to_load_layer_i = ((i//self.pipeline_inteval+1)%self.pipeline_degree)*self.pipeline_inteval
-                self.load_layer_params(to_load_layer_i, i)
-                self.layer_waiting_for_params[ to_load_layer_i ] = True
+            # # we can directly load the next layer to be loaded directly without waiting for this layer to finish its computation
+            # if (i%self.pipeline_inteval) == 0:
+            #     # self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
+            #     to_load_layer_i = ((i//self.pipeline_inteval+1)%self.pipeline_degree)*self.pipeline_inteval
+            #     self.load_layer_params(to_load_layer_i, i)
+            #     self.layer_waiting_for_params[ to_load_layer_i ] = True
 
             # waiting for the param loading if there is
             if self.layer_waiting_for_params[i]:
@@ -571,6 +571,18 @@ class LlamaModel(nn.Module):
 
 
 
+            # we can directly load the next layer to be loaded directly without waiting after this layer finish its computation
+            if (i%self.pipeline_inteval) == 0:
+                # self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
+                # supporse layer 0,2,4,6 particite the weight caching, after finish layer 0, we can load layer 4 (as layer 2 is already in memory)
+                to_load_layer_i = ((i//self.pipeline_inteval+2)%self.pipeline_degree)*self.pipeline_inteval
+                if to_load_layer_i != i:
+                    # the weights of a new layer need to be loaded
+                    self.load_layer_params(to_load_layer_i, i)
+                    self.layer_waiting_for_params[ to_load_layer_i ] = True
+
+
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -623,7 +635,7 @@ class LlamaModel(nn.Module):
 
 
 
-    def load_layer_params(self, layer_i:int, last_layer_i:int):
+    def load_layer_params_given_last_layer(self, layer_i:int, last_layer_i:int):
 
         # consider we have multiple GPUs as cache============================================================
         
@@ -660,6 +672,49 @@ class LlamaModel(nn.Module):
 
         return
 
+
+
+
+
+
+
+    def load_layer_params(self, layer_i:int, last_last_layer_i:int):
+
+        # consider we have multiple GPUs as cache============================================================
+        
+        # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
+
+        dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
+        last_last_layer_weight_blk_idx = self.weight_cache_block_idx[last_last_layer_i]
+        # NOTE we have changed to: last layer and layer i should point to the same weight cache blk id, i.e., layer_i will replace last_layer_i, 
+        # in fact, last_layer_i is last_last_layer_i
+        if dst_weight_blk_idx != last_last_layer_weight_blk_idx:
+            # we need to load layer weight in another buffer
+            self.weight_cache_block_idx[layer_i] = self.weight_cache_block_num - 1 - dst_weight_blk_idx
+            dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
+
+            for param, to_replace in zip(self.layer_params[layer_i], self.buffer_params[dst_weight_blk_idx]):
+                param.data = to_replace.data
+
+
+        # loading
+        for part_i, cache_device_i in enumerate(self.cache_device_ids):
+            param_event = self.load_param_events[part_i][layer_i]
+            to_synch_comp_event = self.synch_comp_events[part_i][last_last_layer_i]
+
+            # use nvlink to copy from another device
+            with torch.cuda.stream(self.param_streams[part_i]):
+
+                # the loading stream should wait the comp to finish
+                to_synch_comp_event.wait()
+
+                # in distributed inference, the current device may not be cuda:0
+                cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.weight_cache[dst_weight_blk_idx][part_i],
+                    layer_i, cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
+                param_event.record(stream=self.param_streams[part_i])
+
+
+        return
 
 
 
@@ -870,7 +925,7 @@ class LlamaForCausalLM(nn.Module):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
                 # determine the condition automatically based on pipeline_interval
                 if ('model.layers.' not in name) or \
-                    (self.get_layer_id_from_name(name)==0) or \
+                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_inteval]) or \
                     ((self.get_layer_id_from_name(name)%self.model.pipeline_inteval)!=0):
                     # if True:
                     # print('loading-----')
@@ -889,7 +944,7 @@ class LlamaForCausalLM(nn.Module):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) < self.model.weight_cache_block_num):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
                 if ('model.layers.' not in name) or \
-                    (self.get_layer_id_from_name(name)==0) or \
+                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_inteval]) or \
                     ((self.get_layer_id_from_name(name)%self.model.pipeline_inteval)!=0):
                     # if True:
                     # print('loading-----')

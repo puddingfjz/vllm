@@ -4,7 +4,7 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES']='1,2,3,0' # '2,3' # '3,0,1,2'
 os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
-os.environ['WEIGHT_LOAD_DEGREE'] = '16'
+os.environ['WEIGHT_LOAD_DEGREE'] = '20'
 
 '''
 Command: 
@@ -112,7 +112,7 @@ def run_vllm(
         dtype=dtype,
         max_model_len=max_model_len,
         # <jingzhi>
-        # gpu_memory_utilization=0.2,
+        # gpu_memory_utilization=0.6,
         # max_num_seqs=2048,
     )
 
