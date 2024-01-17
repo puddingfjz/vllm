@@ -52,6 +52,13 @@ class BlockAllocator:
 
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
+    
+
+    # <jingzhi>
+    def allocate_given_blk_idx_in_free_list(self, blk_idx: int, ref_count: int) -> PhysicalTokenBlock:
+        block = self.free_blocks.pop(blk_idx)
+        block.ref_count = ref_count
+        return block
 
 
 class AllocStatus(enum.Enum):
@@ -99,6 +106,10 @@ class BlockSpaceManager:
                                             num_cpu_blocks)
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
+
+
+        # <jingzhi>
+        self.actual_gpu_blk_rng_end: int = self.num_total_gpu_blocks
 
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
@@ -291,3 +302,90 @@ class BlockSpaceManager:
 
     def get_num_free_cpu_blocks(self) -> int:
         return self.cpu_allocator.get_num_free_blocks()
+
+
+    # <jingzhi>
+    def reorganize_gpu_blocks(self, num_layer_to_load: int) -> Dict[int, int]:
+        '''
+            Reorganize allocated GPU blocks to get enough continuous block ranges.
+            This is used when the remaining requests is not enough to make the computation time 
+            cover the weight loading time.
+            Input:
+                num_layer_to_load: int, how many layers' weights we need to load
+            Changed:
+                block_table, free_block_list, block.ref_count
+            Output:
+                the mapping {from_blk.block_number : to_blk.block_number}
+        '''
+        # update KVBlkPerLayerWeight.cached_layer_num
+        KVBlkPerLayerWeight.cached_layer_num = KVBlkPerLayerWeight.cached_layer_num - num_layer_to_load
+
+        num_blk_per_layer = KVBlkPerLayerWeight.blk_num_per_layer
+        tot_blk_num = num_blk_per_layer * num_layer_to_load
+        
+        release_rng_start = self.actual_gpu_blk_rng_end - tot_blk_num
+        release_rng_end = self.actual_gpu_blk_rng_end
+        # update the new KV cache block range end
+        self.actual_gpu_blk_rng_end = release_rng_start
+        
+        # get the blocks to remove, to move to, and to allocate
+        to_remove: List[int] = []
+        blk_is_free = [False] * self.num_total_gpu_blocks
+        blks_to_move_to: List[Tuple[int, PhysicalTokenBlock]] = list()
+        blk_to_allocate_index_in_freelist = []
+        for i, blk in enumerate(self.gpu_allocator.free_blocks):
+            blk_is_free[blk.block_number]=True
+            if blk.block_number < release_rng_start:
+                blks_to_move_to.append((i, blk))
+            else:
+                blk_to_allocate_index_in_freelist.append(i)
+        for blk_i in range(release_rng_start, release_rng_end):
+            if blk_is_free[blk_i] == False:
+                to_remove.append(blk_i)
+        
+        # get the blocks to move to
+        assert len(blks_to_move_to) >= len(to_remove)
+        blks_to_move_to = blks_to_move_to[:len(to_remove)]
+
+        # change the related block_table information
+        # also update the from_blk.ref_count to 1
+        remove_mapping: Dict[int, Tuple[PhysicalTokenBlock, int]] = {from_blk_number: to_blk for from_blk_number, (_, to_blk) in zip(to_remove, blks_to_move_to)}
+        for seq_i in self.block_tables:
+            for blk_i in self.block_tables[seq_i]:
+                from_blk = self.block_tables[seq_i][blk_i]
+                ori_blk_number = from_blk.block_number
+                if ori_blk_number in remove_mapping:
+                    to_blk = remove_mapping[ori_blk_number]
+                    to_blk.ref_count = from_blk.ref_count
+                    from_blk.ref_count = 1
+                    self.block_tables[seq_i][blk_i] = to_blk
+        
+        # allocate blks we need
+        for blk_i in blk_to_allocate_index_in_freelist:
+            self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, 1)
+        for blk_i, blk in blks_to_move_to:
+            self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, blk.ref_count)
+
+        # return the block number mapping information, so that we can do memory transfer
+        ret: Dict[int, int] = {from_blk_number: to_blk.block_number for from_blk_number, (_, to_blk) in zip(to_remove, blks_to_move_to)}
+        return ret
+
+        
+
+
+
+
+class KVBlkPerLayerWeight:
+    """
+    Store the number of KV cache blocks to release if we want to store the weights of a layer in an LLM.
+    blk_num_per_layer: int = -1
+    block_size: int = -1 (in bytes)
+    layer_weight_size: int = -1 (in bytes) 
+    cached_layer_num: int = -1
+    """
+    blk_num_per_layer: int = -1
+    block_size: int = -1
+    layer_weight_size: int = -1
+    cached_layer_num: int = -1
+
+

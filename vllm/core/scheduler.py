@@ -9,6 +9,13 @@ from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
 
+
+
+# <jingzhi>
+from vllm.core.block_manager import KVBlkPerLayerWeight
+
+
+
 logger = init_logger(__name__)
 
 
@@ -289,6 +296,11 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         scheduler_outputs = self._schedule()
 
+
+        # <jingzhi> support dynamically increasing on-card layer weights
+        self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_copy)
+
+
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for seq_group in scheduler_outputs.scheduled_seq_groups:
@@ -421,3 +433,38 @@ class Scheduler:
         blocks_to_swap_out.update(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
+
+
+
+    # <jingzhi>
+    def increase_layer_weight_on_comp_gpu(self, blocks_to_copy: Dict[int, List[int]]) -> None:
+        '''
+        Support increasing the number of layers whose weights are kept on the comp gpu (not cached on other gpus)
+        when the remaining requests are not enough to make the comp cost cover the weight loading cost.
+        Output:
+            return the KV cache remove mapping {from_block_num : to_block_num}
+        '''
+        if KVBlkPerLayerWeight.cached_layer_num == 0:
+            # when all layer weights are already on card
+            return
+
+        # first try a very simple strategy
+        if len(self.waiting) > 0:
+            # when there are still requests not started, we do not need to increase on-card layer weights
+            return
+
+        # compute the number of cache blocks we need to load all cached layer weights
+        blk_num_required = KVBlkPerLayerWeight.blk_num_per_layer * KVBlkPerLayerWeight.cached_layer_num
+        if self.block_manager.gpu_allocator.get_num_free_blocks() < blk_num_required:
+            # when the free blocks is not enough to load all cached weights
+            return
+        
+        # now we can load all cached weights
+        fromblknum_to_blknum = self.block_manager.reorganize_gpu_blocks(KVBlkPerLayerWeight.cached_layer_num)
+        for from_blk_number, to_blk_number in fromblknum_to_blknum.items():
+            if from_blk_number in blocks_to_copy:
+                blocks_to_copy[from_blk_number].append(to_blk_number)
+            else:
+                blocks_to_copy[from_blk_number] = [to_blk_number]
+    
+

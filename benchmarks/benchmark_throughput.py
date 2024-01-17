@@ -1,7 +1,7 @@
 """Benchmark offline inference throughput."""
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='1,2,3,0' # '2,3' # '3,0,1,2'
+os.environ['CUDA_VISIBLE_DEVICES']='2,3,1,0' # '2,3' # '3,0,1,2'
 os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
 os.environ['WEIGHT_LOAD_DEGREE'] = '20'
@@ -114,6 +114,7 @@ def run_vllm(
         # <jingzhi>
         # gpu_memory_utilization=0.6,
         # max_num_seqs=2048,
+        max_num_seqs=512,
     )
 
     # Add the requests to the engine.

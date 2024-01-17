@@ -67,7 +67,9 @@ class CacheEngine:
             self.block_size,
         )
 
-    def allocate_gpu_cache(self) -> List[KVCache]:
+
+    # this is the function in vllm
+    def allocate_gpu_cache_vllm(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
@@ -84,6 +86,45 @@ class CacheEngine:
             )
             gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
+    
+
+
+    # <jingzhi> we allocate a continuous memory for the KV cache. This will be ok for the 80G GPU memory (as the tensor index is in Long type)
+    # TODO (jingzhi): this function already allocates continuous memory for KV cache, we need to change the data layout of the KV cache again
+    def allocate_gpu_cache(self) -> List[KVCache]:
+        key_blk_size_per_layer = self.num_gpu_blocks
+        for i in self.get_key_block_shape():
+            key_blk_size_per_layer = key_blk_size_per_layer * i
+
+        value_blk_size_per_layer = self.num_gpu_blocks
+        for i in self.get_value_block_shape():
+            value_blk_size_per_layer = value_blk_size_per_layer * i
+
+        # allocate a whole KV cache memory
+        whole_cache = torch.empty(
+                size=self.num_layers*(key_blk_size_per_layer+value_blk_size_per_layer),
+                dtype=self.dtype,
+                device="cuda",
+            )
+
+        gpu_cache: List[KVCache] = []
+        key_block_shape = self.get_key_block_shape()
+        value_block_shape = self.get_value_block_shape()
+        for layer_i in range(self.num_layers):
+            key_blocks = torch.narrow(whole_cache, 
+                    0, 
+                    layer_i*(key_blk_size_per_layer+value_blk_size_per_layer),
+                    key_blk_size_per_layer).view(self.num_gpu_blocks, *key_block_shape)
+            
+            value_blocks = torch.narrow(whole_cache, 
+                    0, 
+                    layer_i*(key_blk_size_per_layer+value_blk_size_per_layer)+key_blk_size_per_layer,
+                    value_blk_size_per_layer).view(self.num_gpu_blocks, *value_block_shape)
+
+            gpu_cache.append((key_blocks, value_blocks))
+        return gpu_cache
+
+
 
     def allocate_cpu_cache(self) -> List[KVCache]:
         cpu_cache: List[KVCache] = []

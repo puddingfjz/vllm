@@ -351,6 +351,13 @@ class LlamaModel(nn.Module):
         self.weight_cache_block_num = self.layer_num - (self.pipeline_degree - 1) # assuming all layers involved in weight offloading will take the same weight cache block
         self.weight_cache_block_num += 1 # use another weight cache block so that we do not need to wait the current layer to finish
 
+
+        # support dynamically increasing the layer weights kept on the comp card
+        # these first two variables are only used when we change the number of on-card layers in the current forward round
+        self.new_pipeline_degree = None
+        self.new_pipeline_inteval = None
+        self.extra_weight_cache: Dict[int, torch.Tensor] = dict()
+
         # example: if totally 5 layers, the cache blk num is 3, then l0 -> blk0, l1 -> blk1, l2 -> blk2, l3->blk0, l4->blk1
         # self.weight_cache_block_idx: List[int] = list(range(self.weight_cache_block_num)) \
         #     + list(range(self.layer_num - self.weight_cache_block_num))
@@ -487,6 +494,64 @@ class LlamaModel(nn.Module):
 
 
 
+
+    # <jingzhi> support dynamically increase the on-card layer weights when there are too few requests and enough space
+    def pre_increase_oncard_layers(self) -> None:
+        '''
+        Change the related parameters when we want to increase on-card layers.
+        Changed:
+            self.new_pipeline_degree, self.new_pipeline_inteval, self.weight_cache_block_idx
+        '''
+        from vllm.core.block_manager import KVBlkPerLayerWeight
+        more_layer_num = self.layer_num - self.weight_cache_block_num - KVBlkPerLayerWeight.cached_layer_num
+
+        if more_layer_num == 0:
+            # we do not need to keep more layer weights on the comp card
+            return
+        
+        # we first assume all the layers will be kept on card
+        
+        self.new_pipeline_degree = self.pipeline_degree - more_layer_num
+        self.new_pipeline_inteval = (self.layer_num + self.new_pipeline_degree - 1) // self.new_pipeline_degree # get ceiling value to ensure enough pipeline interval
+        # self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
+        
+        # TODO (jingzhi): we currently assume layer_num % pipeline_degree == 0
+        # 如果pipeline degree不整除layer_num的话，这里的写法太复杂了。暂时没想好应该怎么写。其实可以写成 pipeline_inteval = layer_num // pipeline_degree
+        # 因为 无论如何 pipeline_inteval 对应的inteval的个数不能少于pipeline degree的值（所以只能取整了）
+        assert self.new_pipeline_degree == (self.layer_num + self.new_pipeline_inteval - 1) // self.new_pipeline_inteval # get the interval number
+        
+
+        # which layers will be on spare KV cache memory
+        # TODO (jingzhi): we assume new pipeline_interval % ori_pipeline_interval == 0
+        extra_i = self.weight_cache_block_num
+        for interval_i in range(self.pipeline_degree):
+            layer_i = interval_i * self.pipeline_inteval
+            if layer_i % self.new_pipeline_inteval != 0:
+                # this layer will be stored on spare KV cache memory
+                self.weight_cache_block_idx[layer_i] = extra_i
+                extra_i += 1
+            else:
+                # we do not want to change the weight cache block idx of layer 0
+                self.weight_cache_block_idx[layer_i] = self.weight_cache_block_idx[0] + \
+                        ((layer_i//self.new_pipeline_inteval)%2) * (self.weight_cache_block_num - 1)
+
+
+
+
+    # <jingzhi> support dynamically increase the on-card layer weights when there are too few requests and enough space
+    def post_increase_oncard_layers(self) -> None:
+        '''
+        Change the related parameters when we want to increase on-card layers.
+        Changed:
+            self.pipeline_degree, self.pipeline_inteval, self.new_pipeline_degree, self.new_pipeline_inteval
+        '''
+        self.pipeline_degree = self.new_pipeline_degree
+        self.pipeline_inteval = self.new_pipeline_inteval
+        self.new_pipeline_degree = None
+        self.new_pipeline_inteval = None
+
+
+
     # <jingzhi> In this function, we will try offloading 
     def forward_ours(
         self,
@@ -498,6 +563,10 @@ class LlamaModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+
+        # support dynamically increase on-card layer weight amount
+        self.pre_increase_oncard_layers()
+
         for i in range(len(self.layers)):
 
             # loading weight -----------------------------------------------------------------------------------------
@@ -584,6 +653,10 @@ class LlamaModel(nn.Module):
 
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # support dynamically increase on-card layer weight amount
+        self.post_increase_oncard_layers()
+
         return hidden_states
 
 
@@ -678,7 +751,7 @@ class LlamaModel(nn.Module):
 
 
 
-    def load_layer_params(self, layer_i:int, last_last_layer_i:int):
+    def load_layer_params_no_dynamicIncreaseOnCardWeight(self, layer_i:int, last_last_layer_i:int) -> None:
 
         # consider we have multiple GPUs as cache============================================================
         
@@ -718,6 +791,66 @@ class LlamaModel(nn.Module):
 
 
 
+
+
+
+    def load_layer_params_when_dynamicIncreaseOnCardWeight(self, layer_i:int, last_last_layer_i:int) -> None:
+        '''
+            We need to support the dynamic increase of on-card layer weights: we will change their para data pointer here.
+        '''
+
+        # consider we have multiple GPUs as cache============================================================
+        
+        # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
+
+        dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
+        last_last_layer_weight_blk_idx = self.weight_cache_block_idx[last_last_layer_i]
+
+        # we are trying to increase the on-card layer weights in this forward round
+        # we need to first update para.data address
+        for param, to_replace in zip(self.layer_params[layer_i], self.buffer_params[dst_weight_blk_idx]):
+            param.data = to_replace.data
+        
+        # compute the real last_last_layer_i
+        if layer_i//self.new_pipeline_inteval == 1:
+            last_last_layer_i = self.pipeline_interval
+        else:
+            last_last_layer_i = ((layer_i//self.new_pipeline_inteval-2)%self.new_pipeline_degree)*self.new_pipeline_inteval
+
+        need_to_wait = False
+        if layer_i%self.new_pipeline_inteval == 0:
+            need_to_wait = True
+
+        # loading
+        for part_i, cache_device_i in enumerate(self.cache_device_ids):
+            param_event = self.load_param_events[part_i][layer_i]
+            to_synch_comp_event = self.synch_comp_events[part_i][last_last_layer_i]
+
+            # use nvlink to copy from another device
+            with torch.cuda.stream(self.param_streams[part_i]):
+
+                # the loading stream should wait the comp to finish
+                if need_to_wait:
+                    to_synch_comp_event.wait()
+
+                # in distributed inference, the current device may not be cuda:0
+                cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.extra_weight_cache[dst_weight_blk_idx][part_i],
+                    layer_i, cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
+                param_event.record(stream=self.param_streams[part_i])
+
+        return
+
+
+
+
+    def load_layer_params(self, layer_i:int, last_last_layer_i:int) -> None:
+        '''
+            We need to support the dynamic increase of on-card layer weights: we will change their para data pointer here.
+        '''
+        if self.new_pipeline_degree == None:
+            self.load_layer_params_no_dynamicIncreaseOnCardWeight(layer_i, last_last_layer_i)
+        else:
+            self.load_layer_params_when_dynamicIncreaseOnCardWeight(layer_i, last_last_layer_i)
 
 
     # def init_param_loaders(self):
@@ -1165,6 +1298,11 @@ class LlamaForCausalLM(nn.Module):
         self.model.weight_cache = torch.empty(self.model.weight_cache_block_num * self.model.weight_num_per_layer,
                                        device=torch.cuda.current_device(),
                                        dtype=params_dtype)
+        
+        # store the weight_num_per_layer infor in the class KVBlkPerLayerWeight
+        from vllm.core.block_manager import KVBlkPerLayerWeight
+        KVBlkPerLayerWeight.layer_weight_size = self.model.weight_num_per_layer * self.model.weight_cache.element_size()
+        KVBlkPerLayerWeight.cached_layer_num = self.model.layer_num - self.model.weight_cache_block_num
 
         
         print(f"after allocate param cache: {torch.cuda.memory_allocated()/1024/1024/1024} GB")
@@ -1212,6 +1350,27 @@ class LlamaForCausalLM(nn.Module):
 
 
 
+
+
+    # <jingzhi>
+    # TODO (jingzhi): this function will be implemented after we change the layout of KV cache
+    def init_extra_weight_cache_in_KV_cache(self, kv_caches: List[KVCache]) -> None:
+        '''
+            prepare parameter data whose address is in the KV cache.
+        '''
+        # prepare buffer parameters in the extra cache from the KV cache
+        from vllm.core.block_manager import KVBlkPerLayerWeight
+        extra_weight_cache_blk_num = KVBlkPerLayerWeight.cached_layer_num
+        
+        cache_from_KV_cache = kv_caches
+        for weight_cache_block_idx in range(self.model.weight_cache_block_num, self.model.weight_cache_block_num+extra_weight_cache_blk_num):
+            self.model.buffer_params[weight_cache_block_idx] = list()
+            for rng_info in self.model.weight_range_in_blk:
+                param_data = torch.narrow(self.model.weight_cache, 
+                    0, 
+                    weight_cache_block_idx*self.model.weight_num_per_layer + rng_info[0], 
+                    rng_info[1]).view(rng_info[2])
+                self.model.buffer_params[weight_cache_block_idx].append(param_data)        
 
 
 
