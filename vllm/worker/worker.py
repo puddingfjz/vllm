@@ -177,6 +177,10 @@ class Worker:
         self.gpu_cache = self.cache_engine.gpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
+        # <jingzhi> support dynamically increasing on-card layer weights
+        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            self.model_runner.init_extra_weight_cache_from_KV_cache(self.gpu_cache)
+
     @torch.inference_mode()
     def execute_model(
         self,

@@ -11,6 +11,10 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 
 # <jingzhi>
 import os
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+    KVCache = torch.Tensor
+
 
 
 logger = init_logger(__name__)
@@ -42,6 +46,11 @@ class ModelRunner:
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
+
+
+    def init_extra_weight_cache_from_KV_cache(self, kv_caches: List[KVCache]) -> None:
+        self.model.init_extra_weight_cache_in_KV_cache(kv_caches)
+
 
     def _prepare_prompt(
         self,

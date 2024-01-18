@@ -451,6 +451,8 @@ class LlamaModel(nn.Module):
             # self.weight_cache_block_idx[ interval_i*self.pipeline_inteval] = 0
             self.weight_cache_block_idx[ interval_i*self.pipeline_inteval] = (interval_i % 2) * (self.weight_cache_block_num - 1)
 
+        print(f"self.weight_cache_block_idx: {self.weight_cache_block_idx}")
+
 
         self.buffer_params = dict() # stores the params in the weight cache blocks which we use to load weights during inference
 
@@ -884,7 +886,6 @@ class LlamaModel(nn.Module):
         # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
 
         dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
-        last_last_layer_weight_blk_idx = self.weight_cache_block_idx[last_last_layer_i]
 
         # we are trying to increase the on-card layer weights in this forward round
         # we need to first update para.data address
@@ -1432,25 +1433,40 @@ class LlamaForCausalLM(nn.Module):
 
 
 
-    # <jingzhi>
-    # TODO (jingzhi): this function will be implemented after we change the layout of KV cache
+    # <jingzhi> support dynamically increaing on-card layer weights
     def init_extra_weight_cache_in_KV_cache(self, kv_caches: List[KVCache]) -> None:
         '''
             prepare parameter data whose address is in the KV cache.
+            Only called after we change the KV cache layout and want to dynamically increase the on-card layer weights.
+
+            Initialize:  self.model.buffer_params, self.model.extra_weight_cache
         '''
         # prepare buffer parameters in the extra cache from the KV cache
         from vllm.core.block_manager import KVBlkPerLayerWeight
         extra_weight_cache_blk_num = KVBlkPerLayerWeight.cached_layer_num
-        
-        cache_from_KV_cache = kv_caches
+
+        cache = kv_caches[0].view(-1)
+        assert cache.element_size() == self.model.weight_cache.element_size(), "the KV cache dtype size and the weight cache dtype size are different"
+
         for weight_cache_block_idx in range(self.model.weight_cache_block_num, self.model.weight_cache_block_num+extra_weight_cache_blk_num):
+            # set self.model.extra_weight_cache
+            self.model.extra_weight_cache[weight_cache_block_idx] = torch.narrow(cache, 
+                    0, 
+                    len(cache) - (weight_cache_block_idx-self.model.weight_cache_block_num)*self.model.weight_num_per_layer,
+                    self.model.weight_num_per_layer)
+
+            # set self.model.buffer_params
             self.model.buffer_params[weight_cache_block_idx] = list()
             for rng_info in self.model.weight_range_in_blk:
-                param_data = torch.narrow(self.model.weight_cache, 
+                param_data = torch.narrow(self.model.extra_weight_cache[weight_cache_block_idx], 
                     0, 
-                    weight_cache_block_idx*self.model.weight_num_per_layer + rng_info[0], 
+                    rng_info[0], 
                     rng_info[1]).view(rng_info[2])
-                self.model.buffer_params[weight_cache_block_idx].append(param_data)        
+                self.model.buffer_params[weight_cache_block_idx].append(param_data)
+            
+            # change the view
+            self.model.extra_weight_cache[weight_cache_block_idx] = self.model.extra_weight_cache[weight_cache_block_idx].view(len(self.model.cache_device_ids), -1)
+
 
 
 

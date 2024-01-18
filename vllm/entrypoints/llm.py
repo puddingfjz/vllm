@@ -171,8 +171,10 @@ class LLM:
         outputs: List[RequestOutput] = []
 
         # <jingzhi> init KV_blk_per_layer_weights
+        import os
         from vllm.core.block_manager import KVBlkPerLayerWeight
-        assert (KVBlkPerLayerWeight.layer_weight_size>0) and (KVBlkPerLayerWeight.block_size>0)
+        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            assert (KVBlkPerLayerWeight.layer_weight_size>0) and (KVBlkPerLayerWeight.block_size>0)
         KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
         print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
 
@@ -212,7 +214,6 @@ class LLM:
         print(f"total steps: {step_i}")
         # <jingzhi> For layer-by-layer params loading------------------------------------------------
         from vllm._C import cache_ops
-        import os
         if os.environ['USE_VLLM']!='True':
             # for cache_device_i in self.llm_engine.workers[0].model_runner.model.model.cache_device_ids:
             #     cache_ops.disable_P2P_access(cache_device_i, 0, 0)
