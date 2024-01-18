@@ -1438,7 +1438,6 @@ class LlamaForCausalLM(nn.Module):
         '''
             prepare parameter data whose address is in the KV cache.
             Only called after we change the KV cache layout and want to dynamically increase the on-card layer weights.
-
             Initialize:  self.model.buffer_params, self.model.extra_weight_cache
         '''
         # prepare buffer parameters in the extra cache from the KV cache
