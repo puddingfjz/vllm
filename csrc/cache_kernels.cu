@@ -240,7 +240,7 @@ void copy_blocks(
 namespace vllm {
 
 template<typename scalar_t>
-__global__ void reshape_and_cache_kernel(
+__global__ void reshape_and_cache_kernel_vllm(
   const scalar_t* __restrict__ key,           // [num_tokens, num_heads, head_size]
   const scalar_t* __restrict__ value,         // [num_tokens, num_heads, head_size]
   scalar_t* __restrict__ key_cache,           // [num_blocks, num_heads, head_size/x, block_size, x]
@@ -286,9 +286,80 @@ __global__ void reshape_and_cache_kernel(
   }
 }
 
+
+
+
+
+template<typename scalar_t>
+__global__ void reshape_and_cache_kernel_layout_changed(
+  const scalar_t* __restrict__ key,           // [num_tokens, num_heads, head_size]
+  const scalar_t* __restrict__ value,         // [num_tokens, num_heads, head_size]
+  scalar_t* __restrict__ key_cache,           // [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]
+  scalar_t* __restrict__ value_cache,         // should be [num_blocks, num_layers, 2, num_heads, head_size, block_size]: the same tensor as key_cache
+  const int64_t* __restrict__ slot_mapping,   // [num_tokens]
+  const int key_stride,
+  const int value_stride,
+  const int num_heads,
+  const int head_size,
+  const int block_size,
+  const int x, 
+  // added parameters
+  const int layer_idx, 
+  const int num_layers) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    // Padding token that should be ignored.
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+
+  const int n = num_heads * head_size;
+
+  // comp some constants
+  const int64_t base_v = num_heads * (head_size / x) * block_size * x
+  const int64_t base_sum_key = base_v * 2 * (num_layers * block_idx + layer_idx)
+  const int64_t base_sum_value = base_sum_key + base_v
+
+
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int64_t src_key_idx = token_idx * key_stride + i;
+    const int64_t src_value_idx = token_idx * value_stride + i;
+
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const int x_idx = head_offset / x;
+    const int x_offset = head_offset % x;
+
+
+    // the KV cache layout is changed
+    // key_value layout [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]
+    const int64_t tgt_key_idx = base_sum_key
+                                + head_idx * (head_size / x) * block_size * x
+                                + x_idx * block_size * x
+                                + block_offset * x
+                                + x_offset;
+
+    // should be [num_blocks, num_layers, 2, num_heads, head_size, block_size]
+    const int64_t tgt_value_idx = base_sum_value
+                                  + head_idx * head_size * block_size
+                                  + head_offset * block_size
+                                  + block_offset;
+
+
+    key_cache[tgt_key_idx] = key[src_key_idx];
+    value_cache[tgt_value_idx] = value[src_value_idx];
+  }
+}
+
+
+
+
 } // namespace vllm
 
-void reshape_and_cache(
+void reshape_and_cache_vllm(
   torch::Tensor& key,           // [num_tokens, num_heads, head_size]
   torch::Tensor& value,         // [num_tokens, num_heads, head_size]
   torch::Tensor& key_cache,     // [num_blocks, num_heads, head_size/x, block_size, x]
@@ -309,9 +380,9 @@ void reshape_and_cache(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(
     key.scalar_type(),
-    "reshape_and_cache_kernel",
+    "reshape_and_cache_kernel_vllm",
     [&] {
-      vllm::reshape_and_cache_kernel<scalar_t><<<grid, block, 0, stream>>>(
+      vllm::reshape_and_cache_kernel_vllm<scalar_t><<<grid, block, 0, stream>>>(
         key.data_ptr<scalar_t>(),
         value.data_ptr<scalar_t>(),
         key_cache.data_ptr<scalar_t>(),
@@ -325,6 +396,85 @@ void reshape_and_cache(
         x);
     });
 }
+
+
+// <jingzhi> this version support the changed KV cache layout
+void reshape_and_cache_layout_changed(
+  torch::Tensor& key,           // [num_tokens, num_heads, head_size]
+  torch::Tensor& value,         // [num_tokens, num_heads, head_size]
+  torch::Tensor& key_cache,     // [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]
+  torch::Tensor& value_cache,   // should be [num_blocks, num_layers, 2, num_heads, head_size, block_size]: the same tensor as key_cache
+  torch::Tensor& slot_mapping,  // [num_tokens]
+  // added parameters
+  const int layer_idx)
+{
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(5);
+  int x = key_cache.size(6);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  // added variable
+  int num_layers = key_cache.size(1)
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+    key.scalar_type(),
+    "reshape_and_cache_kernel_layout_changed",
+    [&] {
+      vllm::reshape_and_cache_kernel_layout_changed<scalar_t><<<grid, block, 0, stream>>>(
+        key.data_ptr<scalar_t>(),
+        value.data_ptr<scalar_t>(),
+        key_cache.data_ptr<scalar_t>(),
+        value_cache.data_ptr<scalar_t>(),
+        slot_mapping.data_ptr<int64_t>(),
+        key_stride,
+        value_stride,
+        num_heads,
+        head_size,
+        block_size,
+        x,
+        // added parameters
+        layer_idx, 
+        num_layers,
+        );
+    });
+}
+
+
+
+
+
+// <jingzhi> this version support the changed KV cache layout
+void reshape_and_cache(
+  torch::Tensor& key,           // [num_tokens, num_heads, head_size]
+  torch::Tensor& value,         // [num_tokens, num_heads, head_size]
+  torch::Tensor& key_cache,     // [num_blocks, num_heads, head_size/x, block_size, x] or [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]
+  torch::Tensor& value_cache,   // [num_blocks, num_heads, head_size, block_size] or [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]: the same tensor as key_cache
+  torch::Tensor& slot_mapping,  // [num_tokens]
+  // added parameters
+  const int layer_idx)
+{
+  if (key_cache.sizes().size() > 5){
+    // the KV cache layout is changed
+    reshape_and_cache_layout_changed(key, value, key_cache, value_cache, slot_mapping, layer_idx);
+  }
+  else{
+    // the KV cache layout is the same as in vllm
+    reshape_and_cache_vllm(key, value, key_cache, value_cache, slot_mapping);
+  }
+}
+
+
+
+
+
+
 
 namespace vllm {
 

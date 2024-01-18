@@ -61,6 +61,8 @@ import os
 
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
+if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+    KVCache = torch.Tensor
 
 
 class LlamaMLP(nn.Module):
@@ -104,6 +106,8 @@ class LlamaAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         linear_method: Optional[LinearMethodBase] = None,
+        # added parameters
+        layer_i: int = -1
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -157,9 +161,16 @@ class LlamaAttention(nn.Module):
         self.attn = PagedAttention(self.num_heads,
                                    self.head_dim,
                                    self.scaling,
-                                   num_kv_heads=self.num_kv_heads)
+                                   num_kv_heads=self.num_kv_heads,
+                                   layer_i=layer_i)
+        
 
-    def forward(
+        # <jingzhi> support dynamically increasing the on-card layer weights
+        self.change_KV_layout = False
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            self.change_KV_layout = True
+
+    def forward_vllm(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -199,6 +210,59 @@ class LlamaAttention(nn.Module):
 
 
         return output
+    
+
+
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"qkv: {q, k, v}")
+
+
+
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_output = None
+        if self.change_KV_layout:
+            # the KV layout is changed to [# block, # layer, key or value, the space for (a layer of a block)]
+            attn_output = self.attn(q, k, v, kv_cache, kv_cache, input_metadata,
+                                    cache_event)
+        else:    
+            k_cache, v_cache = kv_cache
+            attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
+                                    cache_event)
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     # print(f"attn_output: {attn_output}")
+        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
+        #         f.write(f"attn_output: {attn_output}\n")
+
+        output, _ = self.o_proj(attn_output)
+
+
+        # <jingzhi>
+        # if int(os.getenv("LOCAL_RANK", "0")) == 1:
+        #     print(f"o_proj: {output}")
+            # print(f"o_proj weights: {self.o_proj.linear_weights}")
+        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
+        #         f.write(f"o_proj: {output}\n")
+
+
+        return output
+
+
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -207,6 +271,8 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        # added parameters
+        layer_i: int = -1
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -222,6 +288,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
+            layer_i=layer_i
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -299,10 +366,16 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        # self.layers = nn.ModuleList([
+        #     LlamaDecoderLayer(config, linear_method)
+        #     for _ in range(config.num_hidden_layers)
+        # ])
+        # store layer_i information in the layer
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, linear_method, layer_i)
+            for layer_i in range(config.num_hidden_layers)
         ])
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
@@ -357,6 +430,10 @@ class LlamaModel(nn.Module):
         self.new_pipeline_degree = None
         self.new_pipeline_inteval = None
         self.extra_weight_cache: Dict[int, torch.Tensor] = dict()
+
+        self.change_KV_layout = False
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            self.change_KV_layout = True
 
         # example: if totally 5 layers, the cache blk num is 3, then l0 -> blk0, l1 -> blk1, l2 -> blk2, l3->blk0, l4->blk1
         # self.weight_cache_block_idx: List[int] = list(range(self.weight_cache_block_num)) \
@@ -483,7 +560,7 @@ class LlamaModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches[i] if (not self.change_KV_layout) else kv_caches[0], # kv_caches[i],
                 input_metadata,
                 cache_event,
                 residual,
@@ -545,6 +622,9 @@ class LlamaModel(nn.Module):
         Changed:
             self.pipeline_degree, self.pipeline_inteval, self.new_pipeline_degree, self.new_pipeline_inteval
         '''
+        if self.new_pipeline_degree == None:
+            # this round does not increase the on-card layer weights, so nothing to update
+            return
         self.pipeline_degree = self.new_pipeline_degree
         self.pipeline_inteval = self.new_pipeline_inteval
         self.new_pipeline_degree = None
@@ -608,7 +688,7 @@ class LlamaModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches[i] if (not self.change_KV_layout) else kv_caches[0], # kv_caches[i]
                 input_metadata,
                 cache_event,
                 residual,

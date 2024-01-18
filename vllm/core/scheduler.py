@@ -13,6 +13,7 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
 
 # <jingzhi>
 from vllm.core.block_manager import KVBlkPerLayerWeight
+import os
 
 
 
@@ -95,6 +96,12 @@ class Scheduler:
 
         # <jingzhi> For DEBUG
         self.tot_preempt = 0
+        self.change_KV_layout = False
+        self.dynamic_increase_oncard_weights = False
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            self.change_KV_layout = True
+        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            self.dynamic_increase_oncard_weights = True
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
@@ -298,7 +305,8 @@ class Scheduler:
 
 
         # <jingzhi> support dynamically increasing on-card layer weights
-        self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_copy)
+        if self.dynamic_increase_oncard_weights and self.change_KV_layout:
+            self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_copy)
 
 
         # Create input data structures.

@@ -12,6 +12,12 @@ logger = init_logger(__name__)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+# <jingzhi>
+import os
+if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+    KVCache = torch.Tensor
+
+
 
 class CacheEngine:
     """Manages the KV cache.
@@ -90,8 +96,8 @@ class CacheEngine:
 
 
     # <jingzhi> we allocate a continuous memory for the KV cache. This will be ok for the 80G GPU memory (as the tensor index is in Long type)
-    # TODO (jingzhi): this function already allocates continuous memory for KV cache, we need to change the data layout of the KV cache again
-    def allocate_gpu_cache(self) -> List[KVCache]:
+    # this function already allocates continuous memory for KV cache, we need to change the data layout of the KV cache again
+    def allocate_gpu_cache_continuous(self) -> List[KVCache]:
         key_blk_size_per_layer = self.num_gpu_blocks
         for i in self.get_key_block_shape():
             key_blk_size_per_layer = key_blk_size_per_layer * i
@@ -126,6 +132,46 @@ class CacheEngine:
 
 
 
+
+    # <jingzhi> we allocate a continuous memory for the KV cache. This will be ok for the 80G GPU memory (as the tensor index is in Long type)
+    # the KV cache layout is also changed
+    def allocate_gpu_cache_layout_changed(self) -> List[KVCache]:
+        '''
+            The data layout of the whole cache space is [# block, # layer, key or value, the space for (a layer of a block)]
+        '''
+        total_size = self.num_gpu_blocks * self.num_layers
+        key_blk_size_per_layer_per_blk = 1
+        for i in self.get_key_block_shape():
+            key_blk_size_per_layer_per_blk = key_blk_size_per_layer_per_blk * i
+
+        value_blk_size_per_layer_per_blk = 1
+        for i in self.get_value_block_shape():
+            value_blk_size_per_layer_per_blk = value_blk_size_per_layer_per_blk * i
+
+        assert key_blk_size_per_layer_per_blk == value_blk_size_per_layer_per_blk, "The key space and the value space are different!"
+
+        total_size = total_size * (key_blk_size_per_layer_per_blk + value_blk_size_per_layer_per_blk)
+
+        # allocate a whole KV cache memory
+        whole_cache = torch.empty(
+                size=total_size,
+                dtype=self.dtype,
+                device="cuda",
+            ).view(self.num_gpu_blocks, self.num_layers, 2, *self.get_key_block_shape())
+        
+        return [whole_cache]
+
+
+
+    # <jingzhi> support all kinds of gpu cache allocation function
+    def allocate_gpu_cache(self) -> List[KVCache]:
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            return self.allocate_gpu_cache_layout_changed()
+        else:
+            return self.allocate_gpu_cache_vllm()
+
+
+
     def allocate_cpu_cache(self) -> List[KVCache]:
         cpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
@@ -150,6 +196,8 @@ class CacheEngine:
             cpu_cache.append((key_blocks, value_blocks))
         return cpu_cache
 
+
+    # TODO (jingzhi): modify this function as we change the layout of the KV cache
     def _swap(
         self,
         src: List[KVCache],
@@ -179,6 +227,7 @@ class CacheEngine:
         value_caches = [value_cache for _, value_cache in self.gpu_cache]
         # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
         cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+        # TODO (jingzhi): modify this function as we change the layout of the KV cache
 
     @staticmethod
     def get_cache_block_size(

@@ -12,6 +12,10 @@ from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.utils import is_hip
 
+# <jingzhi>
+import os
+
+
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
@@ -41,6 +45,8 @@ class PagedAttention(nn.Module):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        # added parameters
+        layer_i: int = -1
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -58,6 +64,15 @@ class PagedAttention(nn.Module):
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
             raise ValueError(f"head_size ({self.head_size}) is not supported. "
                              f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}.")
+        
+
+        # <jingzhi> support dynamically increasing the on-card layer weights
+        self.change_KV_layout = False
+        self.layer_i = -1
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            self.change_KV_layout = True
+            # we need the layer_i information only when KV layout is changed
+            self.layer_i = layer_i
 
     def forward(
         self,
@@ -105,6 +120,7 @@ class PagedAttention(nn.Module):
                 key_cache,
                 value_cache,
                 slot_mapping,
+                self.layer_i
             )
 
         if input_metadata.is_prompt:
@@ -172,6 +188,7 @@ class PagedAttention(nn.Module):
                 self.num_kv_heads,
                 self.scale,
                 self.alibi_slopes,
+                self.layer_i
             )
 
         # Reshape the output tensor.
@@ -217,10 +234,28 @@ def _paged_attention(
     num_kv_heads: int,
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
+    # added parameters
+    layer_i: int
 ) -> torch.Tensor:
+    """
+    Args:
+        key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
+            block_size, x]
+            or
+            [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x] if the KV cache layout is changed
+        value_cache: shape = [num_blocks, num_kv_heads, head_size,
+            block_size]
+            or 
+            [num_blocks, num_layers, 2, num_heads, head_size, block_size] if the KV cache layout is changed.
+            Note: in fact, key_cache and value_cache are the same tensor (the layout is as in key_cache), but we view them in different ways.
+    """
+    
     output = torch.empty_like(query)
 
-    block_size = value_cache.shape[3]
+    # block_size = value_cache.shape[3]
+    # this support both the original KV cache layout in vllm and the changed KV cache layout at the same time
+    block_size = key_cache.shape[-2]
+
     num_seqs, num_heads, head_size = query.shape
     max_num_partitions = (
         (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
@@ -248,6 +283,7 @@ def _paged_attention(
             block_size,
             input_metadata.max_context_len,
             alibi_slopes,
+            layer_i
         )
     else:
         # Run PagedAttention V2.
@@ -278,5 +314,6 @@ def _paged_attention(
             block_size,
             input_metadata.max_context_len,
             alibi_slopes,
+            layer_i
         )
     return output

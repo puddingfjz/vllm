@@ -5,6 +5,19 @@ os.environ['CUDA_VISIBLE_DEVICES']='2,3,1,0' # '2,3' # '3,0,1,2'
 os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
 os.environ['WEIGHT_LOAD_DEGREE'] = '20'
+os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed
+os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False' # whether we will dynamically increase the on-card layer weights
+
+assert (os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] ==)  (os.environ['CHANGE_KV_LAYOUT'] == 'True')
+
+
+def environs_are_correct():
+    if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+        assert (os.environ['CHANGE_KV_LAYOUT'] == 'True') and (os.environ['USE_VLLM'] == 'False')
+
+# we first check the os environ variables are correct
+environs_are_correct()
+    
 
 '''
 Command: 

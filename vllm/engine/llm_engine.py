@@ -216,6 +216,7 @@ class LLMEngine:
                               None,
                               # <jingzhi>
                               tot_ordered_gpus,
+                              os.environ['CHANGE_KV_LAYOUT'],
                           ))
         self._run_workers(
             "init_model",

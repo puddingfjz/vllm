@@ -34,6 +34,7 @@ class Worker:
         # <jingzhi>
         # tot_gpu_num: Optional[int] = None,
         tot_ordered_gpus: Optional[str] = 'None',
+        change_KV_layout: str = 'False',
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -55,6 +56,9 @@ class Worker:
         self.tot_ordered_gpus = tot_ordered_gpus
         os.environ['TOT_ORDERED_GPUS']=tot_ordered_gpus
         print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
+        self.change_KV_layout = change_KV_layout
+        os.environ['CHANGE_KV_LAYOUT'] = change_KV_layout
+        print(f"os.environ['CHANGE_KV_LAYOUT']: {os.environ['CHANGE_KV_LAYOUT']}")
 
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
