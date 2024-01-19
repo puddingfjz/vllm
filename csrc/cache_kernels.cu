@@ -152,7 +152,7 @@ namespace vllm {
 
 // Grid: (num_layers, num_pairs)
 template<typename scalar_t>
-__global__ void copy_blocks_kernel(
+__global__ void copy_blocks_kernel_vllm(
   int64_t* key_cache_ptrs,
   int64_t* value_cache_ptrs,
   const int64_t* __restrict__ block_mapping,
@@ -179,9 +179,48 @@ __global__ void copy_blocks_kernel(
   }
 }
 
+
+
+
+// Grid: (num_layers, num_pairs)
+// 
+// <jingzhi> used when we change the KV cache layout
+// the original data layout: 
+// key: [num_blocks, num_kv_heads, head_size/x, block_size, x] for each layer
+// value: [num_blocks, num_kv_heads, head_size, block_size] for each layer
+// kv_caches layout: [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]; it contains both keys and values
+// (for values: we can view kv_caches as [num_blocks, num_layers, 2, num_heads, head_size, block_size])
+template<typename scalar_t>
+__global__ void copy_blocks_kernel_layout_changed(
+  scalar_t* kv_cache_ptr,
+  const int64_t* __restrict__ block_mapping,
+  const int64_t kv_cache_stride0,
+  const int64_t kv_cache_stride2) {
+  const int layer_idx = blockIdx.x;
+  const int pair_idx = blockIdx.y;
+
+  int64_t src_block_number = block_mapping[2 * pair_idx];
+  int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
+
+  int64_t base_sum = kv_cache_stride2 * 2 * layer_idx;
+  scalar_t* key_cache_src = kv_cache_ptr + src_block_number * kv_cache_stride0 + base_sum;
+  scalar_t* value_cache_src = kv_cache_ptr + src_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
+  scalar_t* key_cache_dst = kv_cache_ptr + dst_block_number * kv_cache_stride0 + base_sum;
+  scalar_t* value_cache_dst = kv_cache_ptr + dst_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
+
+  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+    key_cache_dst[i] = key_cache_src[i];
+  }
+  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+    value_cache_dst[i] = value_cache_src[i];
+  }
+}
+
+
 } // namespace vllm
 
-void copy_blocks(
+// this is the original version function in vllm
+void copy_blocks_vllm(
   std::vector<torch::Tensor>& key_caches,
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping) {
@@ -228,14 +267,75 @@ void copy_blocks(
   dim3 block(std::min(1024, numel_per_block));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(
-    key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
-      vllm::copy_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
+    key_caches[0].scalar_type(), "copy_blocks_kernel_vllm", ([&] {
+      vllm::copy_blocks_kernel_vllm<scalar_t><<<grid, block, 0, stream>>>(
         key_cache_ptrs_tensor.data_ptr<int64_t>(),
         value_cache_ptrs_tensor.data_ptr<int64_t>(),
         block_mapping_tensor.data_ptr<int64_t>(),
         numel_per_block);
     }));
 }
+
+
+
+
+
+// <jingzhi> This is the version used when we change the KV cache layout
+// the original data layout: 
+// key: [num_blocks, num_kv_heads, head_size/x, block_size, x] for each layer
+// value: [num_blocks, num_kv_heads, head_size, block_size] for each layer
+// kv_caches layout: [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]; it contains both keys and values
+// (for values: we can view kv_caches as [num_blocks, num_layers, 2, num_heads, head_size, block_size])
+void copy_blocks_layout_changed(
+  torch::Tensor& kv_caches,
+  const std::map<int64_t, std::vector<int64_t>>& block_mapping) {
+  int num_layers = kv_caches.size(1);
+  // TORCH_CHECK(num_layers == value_caches.size());
+  if (num_layers == 0) {
+    return;
+  }
+  torch::Device cache_device = kv_caches.device();
+  TORCH_CHECK(cache_device.is_cuda());
+
+  T = kv_caches.scalar_type();
+  T* kv_cache_ptr = reinterpret_cast<T*>(kv_caches.data_ptr());
+
+  // Create block mapping array.
+  std::vector<int64_t> block_mapping_vec;
+  for (const auto& pair : block_mapping) {
+    int64_t src_block_number = pair.first;
+    for (int64_t dst_block_number : pair.second) {
+      block_mapping_vec.push_back(src_block_number);
+      block_mapping_vec.push_back(dst_block_number);
+    }
+  }
+  int64_t* block_mapping_array = block_mapping_vec.data();
+  int num_pairs = block_mapping_vec.size() / 2;
+
+  // Move the data structures to the GPU.
+  // NOTE: This synchronizes the CPU and GPU.
+  torch::Tensor block_mapping_tensor = torch::from_blob(
+    block_mapping_array, {2 * num_pairs}, torch::kInt64).to(cache_device);
+
+  // Launch the kernel.
+  // const int numel_per_block = kv_caches[0][0][0].numel();
+  const int64_t kv_cache_stride0 = kv_caches.stride(0);
+  const int64_t kv_cache_stride2 = kv_caches.stride(2);
+  dim3 grid(num_layers, num_pairs);
+  dim3 block(std::min(1024, kv_cache_stride2));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+    kv_caches.scalar_type(), "copy_blocks_kernel_layout_changed", ([&] {
+      vllm::copy_blocks_kernel_layout_changed<scalar_t><<<grid, block, 0, stream>>>(
+        kv_cache_ptr,
+        block_mapping_tensor.data_ptr<int64_t>(),
+        kv_cache_stride0,
+        kv_cache_stride2);
+    }));
+}
+
+
+
 
 namespace vllm {
 
@@ -319,9 +419,9 @@ __global__ void reshape_and_cache_kernel_layout_changed(
   const int n = num_heads * head_size;
 
   // comp some constants
-  const int64_t base_v = num_heads * (head_size / x) * block_size * x
-  const int64_t base_sum_key = base_v * 2 * (num_layers * block_idx + layer_idx)
-  const int64_t base_sum_value = base_sum_key + base_v
+  const int64_t base_v = num_heads * (head_size / x) * block_size * x;
+  const int64_t base_sum_key = base_v * 2 * (num_layers * block_idx + layer_idx);
+  const int64_t base_sum_value = base_sum_key + base_v;
 
 
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -418,7 +518,7 @@ void reshape_and_cache_layout_changed(
   int value_stride = value.stride(0);
 
   // added variable
-  int num_layers = key_cache.size(1)
+  int num_layers = key_cache.size(1);
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));

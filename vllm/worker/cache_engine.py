@@ -56,6 +56,11 @@ class CacheEngine:
         # Initialize the events for stream synchronization.
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
+        # <jingzhi> added parameters
+        self.change_KV_layout = False
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            self.change_KV_layout = True
+
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         x = 16 // element_size
@@ -222,12 +227,26 @@ class CacheEngine:
     def swap_out(self, src_to_dst: Dict[int, int]) -> None:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
-    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
+    
+    # this is the original function used in vllm
+    def copy_ori(self, src_to_dsts: Dict[int, List[int]]) -> None:
         key_caches = [key_cache for key_cache, _ in self.gpu_cache]
         value_caches = [value_cache for _, value_cache in self.gpu_cache]
         # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
         cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
-        # TODO (jingzhi): modify this function as we change the layout of the KV cache
+
+
+
+    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:       
+        if self.change_KV_layout:
+            kv_cache = self.gpu_cache[0]
+            cache_ops.copy_blocks_layout_changed(kv_cache, src_to_dsts)
+        else:
+            key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+            value_caches = [value_cache for _, value_cache in self.gpu_cache]
+            # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
+            cache_ops.copy_blocks_vllm(key_caches, value_caches, src_to_dsts)
+
 
     @staticmethod
     def get_cache_block_size(
