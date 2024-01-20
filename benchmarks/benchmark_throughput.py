@@ -2,7 +2,7 @@
 
 import os
 os.environ['CUDA_VISIBLE_DEVICES']='2,3,1,0' # '2,3' # '3,0,1,2'
-os.environ['USE_VLLM']='False'
+os.environ['USE_VLLM']='True'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
 os.environ['WEIGHT_LOAD_DEGREE'] = '20'
 os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed

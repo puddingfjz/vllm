@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <c10/util/Optional.h>
 
+
+// <jingzhi> we add a parameter to it: int layer_i
 void paged_attention_v1(
   torch::Tensor& out,
   torch::Tensor& query,
@@ -12,8 +14,11 @@ void paged_attention_v1(
   torch::Tensor& context_lens,
   int block_size,
   int max_context_len,
-  const c10::optional<torch::Tensor>& alibi_slopes);
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  int layer_i);
 
+
+// <jingzhi> we add a parameter to it: int layer_i
 void paged_attention_v2(
   torch::Tensor& out,
   torch::Tensor& exp_sums,
@@ -28,7 +33,8 @@ void paged_attention_v2(
   torch::Tensor& context_lens,
   int block_size,
   int max_context_len,
-  const c10::optional<torch::Tensor>& alibi_slopes);
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  int layer_i);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(

@@ -239,13 +239,13 @@ class CacheEngine:
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:       
         if self.change_KV_layout:
-            kv_cache = self.gpu_cache[0]
-            cache_ops.copy_blocks_layout_changed(kv_cache, src_to_dsts)
+            kv_cache = self.gpu_cache
+            cache_ops.copy_blocks(kv_cache, kv_cache, src_to_dsts)
         else:
             key_caches = [key_cache for key_cache, _ in self.gpu_cache]
             value_caches = [value_cache for _, value_cache in self.gpu_cache]
             # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
-            cache_ops.copy_blocks_vllm(key_caches, value_caches, src_to_dsts)
+            cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
 
     @staticmethod

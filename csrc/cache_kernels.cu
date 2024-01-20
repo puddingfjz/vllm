@@ -340,6 +340,30 @@ void copy_blocks_layout_changed(
 
 
 
+
+// this is the dispatch function
+// <jingzhi> used when we change the KV cache layout
+// the original data layout: 
+// key: [num_blocks, num_kv_heads, head_size/x, block_size, x] for each layer
+// value: [num_blocks, num_kv_heads, head_size, block_size] for each layer
+// kv_caches layout: [num_blocks, num_layers, 2, num_heads, head_size/x, block_size, x]; it contains both keys and values
+// (for values: we can view kv_caches as [num_blocks, num_layers, 2, num_heads, head_size, block_size])
+void copy_blocks(
+  std::vector<torch::Tensor>& key_caches,
+  std::vector<torch::Tensor>& value_caches,
+  const std::map<int64_t, std::vector<int64_t>>& block_mapping) {
+
+  if (key_caches[0].sizes().size() > 5) {
+    copy_blocks_layout_changed(key_caches[0], block_mapping);
+  } else {
+    copy_blocks_vllm(key_caches, value_caches, block_mapping);
+  }
+}
+
+
+
+
+
 namespace vllm {
 
 template<typename scalar_t>

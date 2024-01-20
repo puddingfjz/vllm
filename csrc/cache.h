@@ -37,12 +37,15 @@ void copy_blocks(
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping);
 
+
+// <jingzhi> we add a parameter to it
 void reshape_and_cache(
   torch::Tensor& key,
   torch::Tensor& value,
   torch::Tensor& key_cache,
   torch::Tensor& value_cache,
-  torch::Tensor& slot_mapping);
+  torch::Tensor& slot_mapping,
+  const int layer_idx);
 
 void gather_cached_kv(
   torch::Tensor& key,
