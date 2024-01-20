@@ -192,26 +192,28 @@ __global__ void copy_blocks_kernel_vllm(
 // (for values: we can view kv_caches as [num_blocks, num_layers, 2, num_heads, head_size, block_size])
 template<typename scalar_t>
 __global__ void copy_blocks_kernel_layout_changed(
-  scalar_t* kv_cache_ptr,
+  int64_t kv_cache_ptr,
   const int64_t* __restrict__ block_mapping,
   const int64_t kv_cache_stride0,
-  const int64_t kv_cache_stride2) {
+  const int kv_cache_stride2) {
   const int layer_idx = blockIdx.x;
   const int pair_idx = blockIdx.y;
 
   int64_t src_block_number = block_mapping[2 * pair_idx];
   int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
 
-  int64_t base_sum = kv_cache_stride2 * 2 * layer_idx;
-  scalar_t* key_cache_src = kv_cache_ptr + src_block_number * kv_cache_stride0 + base_sum;
-  scalar_t* value_cache_src = kv_cache_ptr + src_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
-  scalar_t* key_cache_dst = kv_cache_ptr + dst_block_number * kv_cache_stride0 + base_sum;
-  scalar_t* value_cache_dst = kv_cache_ptr + dst_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
+  scalar_t* kv_cache_pointer = reinterpret_cast<scalar_t*>(kv_cache_ptr);
 
-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+  int64_t base_sum = kv_cache_stride2 * 2 * layer_idx;
+  scalar_t* key_cache_src = kv_cache_pointer + src_block_number * kv_cache_stride0 + base_sum;
+  scalar_t* value_cache_src = kv_cache_pointer + src_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
+  scalar_t* key_cache_dst = kv_cache_pointer + dst_block_number * kv_cache_stride0 + base_sum;
+  scalar_t* value_cache_dst = kv_cache_pointer + dst_block_number * kv_cache_stride0 + base_sum + kv_cache_stride2;
+
+  for (int i = threadIdx.x; i < kv_cache_stride2; i += blockDim.x) {
     key_cache_dst[i] = key_cache_src[i];
   }
-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+  for (int i = threadIdx.x; i < kv_cache_stride2; i += blockDim.x) {
     value_cache_dst[i] = value_cache_src[i];
   }
 }
@@ -297,8 +299,9 @@ void copy_blocks_layout_changed(
   torch::Device cache_device = kv_caches.device();
   TORCH_CHECK(cache_device.is_cuda());
 
-  T = kv_caches.scalar_type();
-  T* kv_cache_ptr = reinterpret_cast<T*>(kv_caches.data_ptr());
+  // using T = typename kv_caches.scalar_type();
+  // T* kv_cache_ptr = reinterpret_cast<T*>(kv_caches.data_ptr());
+  int64_t kv_cache_ptr = reinterpret_cast<int64_t>(kv_caches.data_ptr());
 
   // Create block mapping array.
   std::vector<int64_t> block_mapping_vec;
@@ -320,7 +323,7 @@ void copy_blocks_layout_changed(
   // Launch the kernel.
   // const int numel_per_block = kv_caches[0][0][0].numel();
   const int64_t kv_cache_stride0 = kv_caches.stride(0);
-  const int64_t kv_cache_stride2 = kv_caches.stride(2);
+  const int kv_cache_stride2 = kv_caches.stride(2);
   dim3 grid(num_layers, num_pairs);
   dim3 block(std::min(1024, kv_cache_stride2));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -541,8 +544,7 @@ void reshape_and_cache_layout_changed(
         x,
         // added parameters
         layer_idx, 
-        num_layers,
-        );
+        num_layers);
     });
 }
 
