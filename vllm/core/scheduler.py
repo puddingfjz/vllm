@@ -467,8 +467,12 @@ class Scheduler:
             # when the free blocks is not enough to load all cached weights
             return
         
+
+        print(f"We now dynamically increase on-card layer weights!--------------------------------------------")
+
         # now we can load all cached weights
         fromblknum_to_blknum = self.block_manager.reorganize_gpu_blocks(KVBlkPerLayerWeight.cached_layer_num)
+        print(f"fromblknum_to_blknum: {fromblknum_to_blknum}")
         for from_blk_number, to_blk_number in fromblknum_to_blknum.items():
             if from_blk_number in blocks_to_copy:
                 blocks_to_copy[from_blk_number].append(to_blk_number)

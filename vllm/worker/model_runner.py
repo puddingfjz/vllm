@@ -339,6 +339,11 @@ class ModelRunner:
         # Run the model with the dummy inputs.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [(None, None)] * num_layers
+
+        # <jingzhi> support changed KV cache layout
+        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
+            kv_caches = [None]
+
         self.execute_model(seqs, kv_caches)
         return
 

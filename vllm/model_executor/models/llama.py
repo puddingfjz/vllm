@@ -419,8 +419,8 @@ class LlamaModel(nn.Module):
         # we set a parameter: pipeline degree to control weight_cache_block_num
         # self.pipeline_degree: int = 20 # 1 iter decoding time = pipeline_degree * 1 layer weight loading time
         self.pipeline_degree: int = int(os.environ['WEIGHT_LOAD_DEGREE'])
-        self.pipeline_inteval = (self.layer_num + self.pipeline_degree - 1) // self.pipeline_degree # get ceiling value to ensure enough pipeline interval
-        self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
+        self.pipeline_interval = (self.layer_num + self.pipeline_degree - 1) // self.pipeline_degree # get ceiling value to ensure enough pipeline interval
+        self.pipeline_degree = (self.layer_num + self.pipeline_interval - 1) // self.pipeline_interval # get the interval number
         self.weight_cache_block_num = self.layer_num - (self.pipeline_degree - 1) # assuming all layers involved in weight offloading will take the same weight cache block
         self.weight_cache_block_num += 1 # use another weight cache block so that we do not need to wait the current layer to finish
 
@@ -428,7 +428,7 @@ class LlamaModel(nn.Module):
         # support dynamically increasing the layer weights kept on the comp card
         # these first two variables are only used when we change the number of on-card layers in the current forward round
         self.new_pipeline_degree = None
-        self.new_pipeline_inteval = None
+        self.new_pipeline_interval = None
         self.extra_weight_cache: Dict[int, torch.Tensor] = dict()
 
         self.change_KV_layout = False
@@ -446,10 +446,10 @@ class LlamaModel(nn.Module):
         self.weight_cache_block_idx: List[int] = [0] * self.layer_num
         # example: layer_num=5 pipeline_degree=2 pipeline_interval=3 then weight_cache_block_idx=[0,1,2]+[0,3]
         for interval_i in range(self.pipeline_degree):
-            self.weight_cache_block_idx[ interval_i*self.pipeline_inteval:(interval_i+1)*self.pipeline_inteval ] =\
-                range(interval_i*self.pipeline_inteval - interval_i, (interval_i+1)*self.pipeline_inteval - interval_i)
+            self.weight_cache_block_idx[ interval_i*self.pipeline_interval:(interval_i+1)*self.pipeline_interval ] =\
+                range(interval_i*self.pipeline_interval - interval_i, (interval_i+1)*self.pipeline_interval - interval_i)
             # self.weight_cache_block_idx[ interval_i*self.pipeline_inteval] = 0
-            self.weight_cache_block_idx[ interval_i*self.pipeline_inteval] = (interval_i % 2) * (self.weight_cache_block_num - 1)
+            self.weight_cache_block_idx[ interval_i*self.pipeline_interval] = (interval_i % 2) * (self.weight_cache_block_num - 1)
 
         print(f"self.weight_cache_block_idx: {self.weight_cache_block_idx}")
 
@@ -468,7 +468,7 @@ class LlamaModel(nn.Module):
         # 好像只用不给event分layer也OK？因为cuda api的issue都是按顺序的，然后event record不会放到stream里面运行？就是issue的瞬间就record完了；等会试试
         self.synch_comp_events = [[torch.cuda.Event() for _ in self.layers] for _ in self.cache_device_ids]
         for device_events in self.synch_comp_events:
-            device_events[((-1)%self.pipeline_degree)*self.pipeline_inteval].record(stream=torch.cuda.current_stream())
+            device_events[((-1)%self.pipeline_degree)*self.pipeline_interval].record(stream=torch.cuda.current_stream())
 
         # ======================================================================
 
@@ -579,10 +579,13 @@ class LlamaModel(nn.Module):
         '''
         Change the related parameters when we want to increase on-card layers.
         Changed:
-            self.new_pipeline_degree, self.new_pipeline_inteval, self.weight_cache_block_idx
+            self.new_pipeline_degree, self.new_pipeline_interval, self.weight_cache_block_idx
         '''
         from vllm.core.block_manager import KVBlkPerLayerWeight
-        more_layer_num = self.layer_num - self.weight_cache_block_num - KVBlkPerLayerWeight.cached_layer_num
+        # KVBlkPerLayerWeight.cached_layer_num will remain 0 after we load all layers on card, so the code is wrong
+        # more_layer_num = self.layer_num - self.weight_cache_block_num - KVBlkPerLayerWeight.cached_layer_num
+        more_layer_num = KVBlkPerLayerWeight.load_more_layer_on_card_num
+
 
         if more_layer_num == 0:
             # we do not need to keep more layer weights on the comp card
@@ -591,46 +594,54 @@ class LlamaModel(nn.Module):
         # we first assume all the layers will be kept on card
         
         self.new_pipeline_degree = self.pipeline_degree - more_layer_num
-        self.new_pipeline_inteval = (self.layer_num + self.new_pipeline_degree - 1) // self.new_pipeline_degree # get ceiling value to ensure enough pipeline interval
+        self.new_pipeline_interval = (self.layer_num + self.new_pipeline_degree - 1) // self.new_pipeline_degree # get ceiling value to ensure enough pipeline interval
         # self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
-        
+
+        # <jingzhi> For DEBUG
+        print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}")
+
         # TODO (jingzhi): we currently assume layer_num % pipeline_degree == 0
         # 如果pipeline degree不整除layer_num的话，这里的写法太复杂了。暂时没想好应该怎么写。其实可以写成 pipeline_inteval = layer_num // pipeline_degree
         # 因为 无论如何 pipeline_inteval 对应的inteval的个数不能少于pipeline degree的值（所以只能取整了）
-        assert self.new_pipeline_degree == (self.layer_num + self.new_pipeline_inteval - 1) // self.new_pipeline_inteval # get the interval number
+        assert self.new_pipeline_degree == (self.layer_num + self.new_pipeline_interval - 1) // self.new_pipeline_interval # get the interval number
         
 
         # which layers will be on spare KV cache memory
         # TODO (jingzhi): we assume new pipeline_interval % ori_pipeline_interval == 0
         extra_i = self.weight_cache_block_num
         for interval_i in range(self.pipeline_degree):
-            layer_i = interval_i * self.pipeline_inteval
-            if layer_i % self.new_pipeline_inteval != 0:
+            layer_i = interval_i * self.pipeline_interval
+            if layer_i % self.new_pipeline_interval != 0:
                 # this layer will be stored on spare KV cache memory
                 self.weight_cache_block_idx[layer_i] = extra_i
                 extra_i += 1
             else:
                 # we do not want to change the weight cache block idx of layer 0
                 self.weight_cache_block_idx[layer_i] = self.weight_cache_block_idx[0] + \
-                        ((layer_i//self.new_pipeline_inteval)%2) * (self.weight_cache_block_num - 1)
+                        ((layer_i//self.new_pipeline_interval)%2) * (self.weight_cache_block_num - 1)
 
+        # <jingzhi> For DEBUG
+        print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
 
+        # update KVBlkPerLayerWeight.load_more_layer_on_card_num
+        KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
 
+        
 
     # <jingzhi> support dynamically increase the on-card layer weights when there are too few requests and enough space
     def post_increase_oncard_layers(self) -> None:
         '''
         Change the related parameters when we want to increase on-card layers.
         Changed:
-            self.pipeline_degree, self.pipeline_inteval, self.new_pipeline_degree, self.new_pipeline_inteval
+            self.pipeline_degree, self.pipeline_interval, self.new_pipeline_degree, self.new_pipeline_interval
         '''
         if self.new_pipeline_degree == None:
             # this round does not increase the on-card layer weights, so nothing to update
             return
         self.pipeline_degree = self.new_pipeline_degree
-        self.pipeline_inteval = self.new_pipeline_inteval
+        self.pipeline_interval = self.new_pipeline_interval
         self.new_pipeline_degree = None
-        self.new_pipeline_inteval = None
+        self.new_pipeline_interval = None
 
 
 
@@ -715,7 +726,7 @@ class LlamaModel(nn.Module):
 
 
             # record finish computation----------------------
-            if (i%self.pipeline_inteval) == 0:
+            if (i%self.pipeline_interval) == 0:
                 for device_events in self.synch_comp_events:
                     device_events[i].record(stream=torch.cuda.current_stream())
             # -----------------------------------------------
@@ -723,10 +734,10 @@ class LlamaModel(nn.Module):
 
 
             # we can directly load the next layer to be loaded directly without waiting after this layer finish its computation
-            if (i%self.pipeline_inteval) == 0:
+            if (i%self.pipeline_interval) == 0:
                 # self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
                 # supporse layer 0,2,4,6 particite the weight caching, after finish layer 0, we can load layer 4 (as layer 2 is already in memory)
-                to_load_layer_i = ((i//self.pipeline_inteval+2)%self.pipeline_degree)*self.pipeline_inteval
+                to_load_layer_i = ((i//self.pipeline_interval+2)%self.pipeline_degree)*self.pipeline_interval
                 if to_load_layer_i != i:
                     # the weights of a new layer need to be loaded
                     self.load_layer_params(to_load_layer_i, i)
@@ -808,7 +819,7 @@ class LlamaModel(nn.Module):
 
 
         # loading
-        last_last_layer_i = ((last_layer_i//self.pipeline_inteval-1)%self.pipeline_degree)*self.pipeline_inteval
+        last_last_layer_i = ((last_layer_i//self.pipeline_interval-1)%self.pipeline_degree)*self.pipeline_interval
         for part_i, cache_device_i in enumerate(self.cache_device_ids):
             param_event = self.load_param_events[part_i][layer_i]
             to_synch_comp_event = self.synch_comp_events[part_i][last_last_layer_i]
@@ -893,13 +904,13 @@ class LlamaModel(nn.Module):
             param.data = to_replace.data
         
         # compute the real last_last_layer_i
-        if layer_i//self.new_pipeline_inteval == 1:
+        if layer_i//self.new_pipeline_interval == 1:
             last_last_layer_i = self.pipeline_interval
         else:
-            last_last_layer_i = ((layer_i//self.new_pipeline_inteval-2)%self.new_pipeline_degree)*self.new_pipeline_inteval
+            last_last_layer_i = ((layer_i//self.new_pipeline_interval-2)%self.new_pipeline_degree)*self.new_pipeline_interval
 
         need_to_wait = False
-        if layer_i%self.new_pipeline_inteval == 0:
+        if layer_i%self.new_pipeline_interval == 0:
             need_to_wait = True
 
         # loading
@@ -1139,8 +1150,8 @@ class LlamaForCausalLM(nn.Module):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
                 # determine the condition automatically based on pipeline_interval
                 if ('model.layers.' not in name) or \
-                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_inteval]) or \
-                    ((self.get_layer_id_from_name(name)%self.model.pipeline_inteval)!=0):
+                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_interval]) or \
+                    ((self.get_layer_id_from_name(name)%self.model.pipeline_interval)!=0):
                     # if True:
                     # print('loading-----')
                     param = params_dict[name.replace(weight_name, param_name)]
@@ -1158,8 +1169,8 @@ class LlamaForCausalLM(nn.Module):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) < self.model.weight_cache_block_num):
                 # if ('model.layers.' not in name) or (self.get_layer_id_from_name(name) != ((self.model.layer_num + 1)//2)):
                 if ('model.layers.' not in name) or \
-                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_inteval]) or \
-                    ((self.get_layer_id_from_name(name)%self.model.pipeline_inteval)!=0):
+                    (self.get_layer_id_from_name(name) in [0, self.model.pipeline_interval]) or \
+                    ((self.get_layer_id_from_name(name)%self.model.pipeline_interval)!=0):
                     # if True:
                     # print('loading-----')
                     param = params_dict[name]
@@ -1358,9 +1369,9 @@ class LlamaForCausalLM(nn.Module):
             #     print(f"--layer_i-- {layer_i}, -- {layer_weights}")
             
             # NOTE: we do not need to store the parameter of every layer on the cache GPUs, because some layers are kept only on the compute GPUs.
-            if (layer_i % self.model.pipeline_inteval) != 0:
+            if (layer_i % self.model.pipeline_interval) != 0:
                 # this layer will not be cached on other GPUs.
-                print(f"layer_i: {layer_i} is not cached, pipeline_inteval: {self.model.pipeline_inteval}")
+                print(f"layer_i: {layer_i} is not cached, pipeline_interval: {self.model.pipeline_interval}")
                 continue
             for part_weights, cache_device_i in zip(layer_weights, self.model.cache_device_ids):
                 self.model.weight_cache_cpu[-1].append( part_weights.to(cache_device_i) )
@@ -1449,9 +1460,10 @@ class LlamaForCausalLM(nn.Module):
 
         for weight_cache_block_idx in range(self.model.weight_cache_block_num, self.model.weight_cache_block_num+extra_weight_cache_blk_num):
             # set self.model.extra_weight_cache
+            print(f"set extra_weight_cache[{weight_cache_block_idx}]")
             self.model.extra_weight_cache[weight_cache_block_idx] = torch.narrow(cache, 
                     0, 
-                    len(cache) - (weight_cache_block_idx-self.model.weight_cache_block_num)*self.model.weight_num_per_layer,
+                    len(cache) - (weight_cache_block_idx+1-self.model.weight_cache_block_num)*self.model.weight_num_per_layer,
                     self.model.weight_num_per_layer)
 
             # set self.model.buffer_params
@@ -1467,7 +1479,9 @@ class LlamaForCausalLM(nn.Module):
             self.model.extra_weight_cache[weight_cache_block_idx] = self.model.extra_weight_cache[weight_cache_block_idx].view(len(self.model.cache_device_ids), -1)
 
 
-
+        # for convenience, we also store the weight cache block 0 and (self.model.weight_cache_block_num - 1) in extra_weight_cache
+        self.model.extra_weight_cache[0] = self.model.weight_cache[0]
+        self.model.extra_weight_cache[self.model.weight_cache_block_num - 1] = self.model.weight_cache[self.model.weight_cache_block_num - 1]
 
 
 

@@ -141,6 +141,9 @@ class LLMEngine:
         assert self.parallel_config.world_size == 1, (
             "Ray is required if parallel_config.world_size > 1.")
 
+        # <jingzhi>
+        import os
+
         self.workers: List[Worker] = []
         worker = Worker(
             self.model_config,
@@ -148,6 +151,9 @@ class LLMEngine:
             self.scheduler_config,
             0,
             distributed_init_method,
+            # <jingzhi> added parameters
+            'None',
+            os.environ['CHANGE_KV_LAYOUT'],
         )
         self.workers.append(worker)
         self._run_workers(

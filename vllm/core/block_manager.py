@@ -55,10 +55,25 @@ class BlockAllocator:
     
 
     # <jingzhi>
-    def allocate_given_blk_idx_in_free_list(self, blk_idx: int, ref_count: int) -> PhysicalTokenBlock:
-        block = self.free_blocks.pop(blk_idx)
-        block.ref_count = ref_count
-        return block
+    # remove the parameter tmp_blk_idxs after we check the correctness
+    def allocate_given_blk_idxs_in_free_list(self, blk_idxs: List[int]) -> PhysicalTokenBlock:
+        # block = self.free_blocks.pop(blk_idx)
+        # block.ref_count = ref_count
+        # return block
+        new_free_blocks: BlockTable = []
+        blocks: BlockTable = []
+        for blk_i, block in enumerate(self.free_blocks):
+            if blk_i in blk_idxs:
+                blocks.append(block)
+                if block.ref_count == 0:
+                    block.ref_count = 1
+                    # assert blk_i in tmp_blk_idxs
+            else:
+                new_free_blocks.append(block)
+        self.free_blocks = new_free_blocks
+        return blocks
+
+
 
 
 class AllocStatus(enum.Enum):
@@ -319,6 +334,7 @@ class BlockSpaceManager:
         '''
         # update KVBlkPerLayerWeight.cached_layer_num
         KVBlkPerLayerWeight.cached_layer_num = KVBlkPerLayerWeight.cached_layer_num - num_layer_to_load
+        KVBlkPerLayerWeight.load_more_layer_on_card_num = num_layer_to_load
 
         num_blk_per_layer = KVBlkPerLayerWeight.blk_num_per_layer
         tot_blk_num = num_blk_per_layer * num_layer_to_load
@@ -351,8 +367,7 @@ class BlockSpaceManager:
         # also update the from_blk.ref_count to 1
         remove_mapping: Dict[int, Tuple[PhysicalTokenBlock, int]] = {from_blk_number: to_blk for from_blk_number, (_, to_blk) in zip(to_remove, blks_to_move_to)}
         for seq_i in self.block_tables:
-            for blk_i in self.block_tables[seq_i]:
-                from_blk = self.block_tables[seq_i][blk_i]
+            for blk_i, from_blk in enumerate(self.block_tables[seq_i]):
                 ori_blk_number = from_blk.block_number
                 if ori_blk_number in remove_mapping:
                     to_blk = remove_mapping[ori_blk_number]
@@ -361,10 +376,11 @@ class BlockSpaceManager:
                     self.block_tables[seq_i][blk_i] = to_blk
         
         # allocate blks we need
-        for blk_i in blk_to_allocate_index_in_freelist:
-            self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, 1)
-        for blk_i, blk in blks_to_move_to:
-            self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, blk.ref_count)
+        # for blk_i in blk_to_allocate_index_in_freelist:
+        #     self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, 1)
+        # for blk_i, blk in blks_to_move_to:
+        #     self.gpu_allocator.allocate_given_blk_idx_in_free_list(blk_i, blk.ref_count)
+        self.gpu_allocator.allocate_given_blk_idxs_in_free_list(blk_to_allocate_index_in_freelist + [blk_i for blk_i, _ in blks_to_move_to])
 
         # return the block number mapping information, so that we can do memory transfer
         ret: Dict[int, int] = {from_blk_number: to_blk.block_number for from_blk_number, (_, to_blk) in zip(to_remove, blks_to_move_to)}
@@ -387,5 +403,6 @@ class KVBlkPerLayerWeight:
     block_size: int = -1
     layer_weight_size: int = -1
     cached_layer_num: int = -1
+    load_more_layer_on_card_num: int = 0
 
 

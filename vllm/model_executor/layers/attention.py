@@ -191,6 +191,12 @@ class PagedAttention(nn.Module):
                 self.layer_i
             )
 
+
+        
+        # <jingzhi> For DEBUG
+        print(f"output.view(batch_size, seq_len, hidden_size): {output.view(batch_size, seq_len, hidden_size)}")
+
+
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
 

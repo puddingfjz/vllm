@@ -56,6 +56,7 @@ class Worker:
         self.tot_ordered_gpus = tot_ordered_gpus
         os.environ['TOT_ORDERED_GPUS']=tot_ordered_gpus
         print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
+        print(f"os.environ['CHANGE_KV_LAYOUT']: {os.environ['CHANGE_KV_LAYOUT']}")
         self.change_KV_layout = change_KV_layout
         os.environ['CHANGE_KV_LAYOUT'] = change_KV_layout
         print(f"os.environ['CHANGE_KV_LAYOUT']: {os.environ['CHANGE_KV_LAYOUT']}")

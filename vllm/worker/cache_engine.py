@@ -61,6 +61,8 @@ class CacheEngine:
         if os.environ['CHANGE_KV_LAYOUT'] == 'True':
             self.change_KV_layout = True
 
+        print(f"KV cache layout (when initialing it): {len(self.gpu_cache), len(self.gpu_cache[0]), len(self.gpu_cache[0][0])}")
+
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         x = 16 // element_size
@@ -158,8 +160,12 @@ class CacheEngine:
         total_size = total_size * (key_blk_size_per_layer_per_blk + value_blk_size_per_layer_per_blk)
 
         # allocate a whole KV cache memory
+
+        # <jingzhi> For DEBUG
+        print(f"when create KV cache: size:{total_size}, dtype:{self.dtype}")
+
         whole_cache = torch.empty(
-                size=total_size,
+                size=[total_size],
                 dtype=self.dtype,
                 device="cuda",
             ).view(self.num_gpu_blocks, self.num_layers, 2, *self.get_key_block_shape())
