@@ -26,6 +26,14 @@ if ray:
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
+
+
+# <jingzhi>
+from vllm.core.block_manager import KVBlkPerLayerWeight
+
+
+
+
 logger = init_logger(__name__)
 
 _LOGGING_INTERVAL_SEC = 5
@@ -249,6 +257,16 @@ class LLMEngine:
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
             cpu_swap_space=self.cache_config.swap_space_bytes,
         )
+
+        
+        
+        # <jingzhi> after updating KVBlkPerLayerWeight in each worker, we update KVBlkPerLayerWeight in the main process as well------
+        blk_num_per_layer, cached_layer_num = num_blocks[0][2]
+        for b in num_blocks[1:]:
+            assert b[2] == num_blocks[0][2]
+        KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num = blk_num_per_layer, cached_layer_num
+        # -----------------------------------------------------------------------------------------------------------------------------
+
 
         # Since we use a shared centralized controller, we take the minimum
         # number of blocks across all workers to make sure all the memory
@@ -626,7 +644,12 @@ class LLMEngine:
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            load_more_layer_on_card_num=KVBlkPerLayerWeight.load_more_layer_on_card_num,
         )
+
+
+        # <jingzhi> we need to reset KVBlkPerLayerWeight.load_more_layer_on_card_num after we use it
+        KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
 
         return self._process_model_outputs(output, scheduler_outputs)
 

@@ -16,6 +16,9 @@ from vllm.worker.model_runner import ModelRunner
 from vllm.utils import get_gpu_memory
 
 
+# <jingzhi>
+from vllm.core.block_manager import KVBlkPerLayerWeight
+
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
 
@@ -51,7 +54,8 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
 
-        # <jingzhi>
+        # <jingzhi> 
+        # TODO (jingzhi): seems the worker process can inherit the os environment variables from the main process, so we do not need to set "os.environ['CHANGE_KV_LAYOUT']" here
         # self.tot_gpu_num = tot_gpu_num
         self.tot_ordered_gpus = tot_ordered_gpus
         os.environ['TOT_ORDERED_GPUS']=tot_ordered_gpus
@@ -153,8 +157,13 @@ class Worker:
         
 
         # <jingzhi> store the information of cache_block_size in class 
-        from vllm.core.block_manager import KVBlkPerLayerWeight
         KVBlkPerLayerWeight.block_size = cache_block_size
+        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            assert KVBlkPerLayerWeight.layer_weight_size>0, KVBlkPerLayerWeight.layer_weight_size
+        KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
+
 
 
         num_gpu_blocks = int(
@@ -168,7 +177,12 @@ class Worker:
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
-        return num_gpu_blocks, num_cpu_blocks
+        
+        
+        # return num_gpu_blocks, num_cpu_blocks
+        # <jingzhi> also return the information of KVBlkPerLayerWeight
+        return num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         self.cache_config = cache_config
@@ -189,7 +203,13 @@ class Worker:
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
+        # <jingzhi> added parameter: support dynamically increasing on-card layer weights
+        load_more_layer_on_card_num: int,
     ) -> SamplerOutput:
+        
+        # <jingzhi> update KVBlkPerLayerWeight when there are multiple workers
+        KVBlkPerLayerWeight.load_more_layer_on_card_num = load_more_layer_on_card_num
+
         # Issue cache operations.
         issued_cache_op = False
         if blocks_to_swap_in:

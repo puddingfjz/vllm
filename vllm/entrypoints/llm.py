@@ -172,11 +172,11 @@ class LLM:
 
         # <jingzhi> init KV_blk_per_layer_weights
         import os
-        from vllm.core.block_manager import KVBlkPerLayerWeight
-        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
-            assert (KVBlkPerLayerWeight.layer_weight_size>0) and (KVBlkPerLayerWeight.block_size>0)
-        KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
-        print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
+        # from vllm.core.block_manager import KVBlkPerLayerWeight
+        # if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+        #     assert (KVBlkPerLayerWeight.layer_weight_size>0) and (KVBlkPerLayerWeight.block_size>0), f"{KVBlkPerLayerWeight.layer_weight_size, KVBlkPerLayerWeight.block_size}"
+        # KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
+        # print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
 
 
         # <jingzhi> For Profiling--------------------

@@ -598,7 +598,7 @@ class LlamaModel(nn.Module):
         # self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
 
         # <jingzhi> For DEBUG
-        print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}")
+        print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num Invalid:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}")
 
         # TODO (jingzhi): we currently assume layer_num % pipeline_degree == 0
         # 如果pipeline degree不整除layer_num的话，这里的写法太复杂了。暂时没想好应该怎么写。其实可以写成 pipeline_inteval = layer_num // pipeline_degree
@@ -623,8 +623,8 @@ class LlamaModel(nn.Module):
         # <jingzhi> For DEBUG
         print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
 
-        # update KVBlkPerLayerWeight.load_more_layer_on_card_num
-        KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
+        # update KVBlkPerLayerWeight.load_more_layer_on_card_num --> we will reset KVBlkPerLayerWeight.load_more_layer_on_card_num in llm_engine.step()
+        # KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
 
         
 
