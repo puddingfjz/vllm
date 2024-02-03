@@ -119,6 +119,14 @@ class ModelRunner:
                                              pad=_PAD_SLOT_ID,
                                              dtype=torch.long)
 
+
+        # <jingzhi> For DEBUG
+        # if torch.cuda.current_device() == 0:
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"prefilling: seq num: {len(prompt_lens)}, tot_tokens: {sum(prompt_lens),sum([_*_ for _ in prompt_lens])}")
+
+
+
         input_metadata = InputMetadata(
             prompt_lens=prompt_lens,
             slot_mapping=slot_mapping,

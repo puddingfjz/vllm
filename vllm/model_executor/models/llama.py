@@ -430,6 +430,7 @@ class LlamaModel(nn.Module):
         self.new_pipeline_degree = None
         self.new_pipeline_interval = None
         self.extra_weight_cache: Dict[int, torch.Tensor] = dict()
+        self.extra_weight_cache_blk_i = self.weight_cache_block_num
 
         self.change_KV_layout = False
         if os.environ['CHANGE_KV_LAYOUT'] == 'True':
@@ -538,6 +539,16 @@ class LlamaModel(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
+        
+        # # <jingzhi> For DEBUG
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     prefix = ''
+        #     # print(f"In _paged_attention: use_v1: {use_v1}, key_cache.size: {key_cache.size()}, layer_i: {layer_i}")
+        #     with open(f'blk_table_info_{prefix}2_model.log', 'a') as f:
+        #         if type(input_metadata.block_tables) != type(None):
+        #             f.write(f"{input_metadata.block_tables.tolist()}\n")
+
+
         if self.use_vllm:
             return self.forward_ori(input_ids, positions, kv_caches, input_metadata, cache_events)
         else:
@@ -585,7 +596,7 @@ class LlamaModel(nn.Module):
         # KVBlkPerLayerWeight.cached_layer_num will remain 0 after we load all layers on card, so the code is wrong
         # more_layer_num = self.layer_num - self.weight_cache_block_num - KVBlkPerLayerWeight.cached_layer_num
         more_layer_num = KVBlkPerLayerWeight.load_more_layer_on_card_num
-
+        KVBlkPerLayerWeight.cached_layer_num = KVBlkPerLayerWeight.cached_layer_num - more_layer_num
 
         if more_layer_num == 0:
             # we do not need to keep more layer weights on the comp card
@@ -598,7 +609,8 @@ class LlamaModel(nn.Module):
         # self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
 
         # <jingzhi> For DEBUG
-        print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num Invalid:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}")
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num Invalid:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}", flush=True)
 
         # TODO (jingzhi): we currently assume layer_num % pipeline_degree == 0
         # 如果pipeline degree不整除layer_num的话，这里的写法太复杂了。暂时没想好应该怎么写。其实可以写成 pipeline_inteval = layer_num // pipeline_degree
@@ -608,21 +620,39 @@ class LlamaModel(nn.Module):
 
         # which layers will be on spare KV cache memory
         # TODO (jingzhi): we assume new pipeline_interval % ori_pipeline_interval == 0
-        extra_i = self.weight_cache_block_num
-        for interval_i in range(self.pipeline_degree):
-            layer_i = interval_i * self.pipeline_interval
-            if layer_i % self.new_pipeline_interval != 0:
-                # this layer will be stored on spare KV cache memory
-                self.weight_cache_block_idx[layer_i] = extra_i
-                extra_i += 1
-            else:
-                # we do not want to change the weight cache block idx of layer 0
-                self.weight_cache_block_idx[layer_i] = self.weight_cache_block_idx[0] + \
-                        ((layer_i//self.new_pipeline_interval)%2) * (self.weight_cache_block_num - 1)
+        # extra_i = self.weight_cache_block_num
+        if self.new_pipeline_degree == 2:
+            # in this case, there will be no layer cached on other gpus, so we directly keep previous cached layer 0,1 in the same place
+            # and move other cached layers in KV cache memory.
+            for interval_i in range(self.pipeline_degree):
+                layer_i = interval_i * self.pipeline_interval
+                if interval_i >= 2:
+                    # this layer will be stored on spare KV cache memory
+                    self.weight_cache_block_idx[layer_i] = self.extra_weight_cache_blk_i
+                    self.extra_weight_cache_blk_i += 1
+                # else:
+                    # we do not want to change the weight cache block idx of layer 0
+                    # we also do not need to change the weight cache block idx of layer 1*pipeline_interval
+                    # self.weight_cache_block_idx[layer_i] = ((self.weight_cache_block_idx[0]//(self.weight_cache_block_num - 1)+interval_i)%2)\
+                    #      * (self.weight_cache_block_num - 1)
+        else:
+            for interval_i in range(self.pipeline_degree):
+                layer_i = interval_i * self.pipeline_interval
+                if layer_i % self.new_pipeline_interval != 0:
+                    # this layer will be stored on spare KV cache memory
+                    self.weight_cache_block_idx[layer_i] = self.extra_weight_cache_blk_i
+                    self.extra_weight_cache_blk_i += 1
+                else:
+                    # we do not want to change the weight cache block idx of layer 0
+                    self.weight_cache_block_idx[layer_i] = self.weight_cache_block_idx[0] + \
+                            ((layer_i//self.new_pipeline_interval)%2) * (self.weight_cache_block_num - 1)
 
         # <jingzhi> For DEBUG
-        print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
-
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, self.extra_weight_cache_blk_i:{self.extra_weight_cache_blk_i}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
+            print(max(self.weight_cache_block_idx), max(self.extra_weight_cache))
+        # if max(self.weight_cache_block_idx) > max(self.extra_weight_cache):
+        #     assert False
         # update KVBlkPerLayerWeight.load_more_layer_on_card_num --> we will reset KVBlkPerLayerWeight.load_more_layer_on_card_num in llm_engine.step()
         # KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
 
@@ -738,10 +768,13 @@ class LlamaModel(nn.Module):
                 # self.load_layer_params(((self.layer_num + 1)//2)-i, self.weight_cache_block_idx[i], i)
                 # supporse layer 0,2,4,6 particite the weight caching, after finish layer 0, we can load layer 4 (as layer 2 is already in memory)
                 to_load_layer_i = ((i//self.pipeline_interval+2)%self.pipeline_degree)*self.pipeline_interval
-                if to_load_layer_i != i:
-                    # the weights of a new layer need to be loaded
-                    self.load_layer_params(to_load_layer_i, i)
-                    self.layer_waiting_for_params[ to_load_layer_i ] = True
+
+                if not((self.new_pipeline_degree == 2) and (to_load_layer_i//self.pipeline_interval < 2)):
+                    # when trying load all cached layers on card and the layer to load is the first two cached layers, do not need to do the load
+                    if to_load_layer_i != i:
+                        # the weights of a new layer need to be loaded
+                        self.load_layer_params(to_load_layer_i, i)
+                        self.layer_waiting_for_params[ to_load_layer_i ] = True
 
 
 
@@ -910,7 +943,7 @@ class LlamaModel(nn.Module):
             last_last_layer_i = ((layer_i//self.new_pipeline_interval-2)%self.new_pipeline_degree)*self.new_pipeline_interval
 
         need_to_wait = False
-        if layer_i%self.new_pipeline_interval == 0:
+        if (layer_i%self.new_pipeline_interval == 0) and (self.new_pipeline_degree!=2): # when new pipe degree == 2, do not need to wait for computation to finish
             need_to_wait = True
 
         # loading
@@ -1023,7 +1056,7 @@ class LlamaForCausalLM(nn.Module):
         # in distributed inference, only the first worker will print information
         # if torch.cuda.current_device() == 0:
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"iter latency: {time2-time1}s")
+            print(f"iter latency: {time2-time1}s abs: {time2}s")
 
         return hidden_states
 
@@ -1087,6 +1120,11 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name.replace(weight_name, param_name)]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+
+                # <jingzhi> For DEBUG
+                if int(os.getenv("LOCAL_RANK", "0")) == 0:
+                    print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device}")
+
                 break
             else:
 
@@ -1096,6 +1134,10 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+                # <jingzhi> For DEBUG
+                if int(os.getenv("LOCAL_RANK", "0")) == 0:
+                    print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device}")
 
 
 
@@ -1161,6 +1203,12 @@ class LlamaForCausalLM(nn.Module):
                     # print(f"layerBylayer_param_tensor of {name}: {param.data}")
                     # print(f"{name}: {param.data.size(), param.data_ptr(), param.is_contiguous()}")
 
+                    # <jingzhi> For DEBUG
+                    if int(os.getenv("LOCAL_RANK", "0")) == 0:
+                        print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device} is contiguous: {param.is_contiguous()}")
+
+
+
                 break
             else:
 
@@ -1180,6 +1228,12 @@ class LlamaForCausalLM(nn.Module):
 
                     # print(f"layerBylayer_param_tensor of {name}: {param.data}")
                     # print(f"{name}: {param.data.size(), param.data_ptr(), param.is_contiguous()}")
+
+                    # <jingzhi> For DEBUG
+                    if int(os.getenv("LOCAL_RANK", "0")) == 0:
+                        print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device} is contiguous: {param.is_contiguous()} visible gpus: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+
 
         print(f"weight_cache_cpu shape: {len(self.model.weight_cache_cpu), len(self.model.weight_cache_cpu[0]), self.model.weight_cache_cpu[0][0].shape}")
 

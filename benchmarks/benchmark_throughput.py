@@ -1,12 +1,16 @@
 """Benchmark offline inference throughput."""
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='0,3,1,2' # '2,3' # '3,0,1,2'
-os.environ['USE_VLLM']='True'
+os.environ['CUDA_VISIBLE_DEVICES']='1,2,3,0' # '2,3' # '3,0,1,2'
+os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
-os.environ['WEIGHT_LOAD_DEGREE'] = '16'
-os.environ['CHANGE_KV_LAYOUT'] = 'False' # whether the KV layout is changed
-os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False' # whether we will dynamically increase the on-card layer weights
+os.environ['WEIGHT_LOAD_DEGREE'] = '20'
+os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed
+os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'True' # whether we will dynamically increase the on-card layer weights
+
+# about scheduling
+os.environ['SORT_REQS'] = 'True' # whether to sort the requests according to their output lengths, default is False
+
 
 def environs_are_correct():
     if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
@@ -29,6 +33,17 @@ try llama2
 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model NousResearch/Llama-2-13b-hf --num-prompts 100 > layerBylayer_llama2_1.log
 
 
+
+use this line to occupy memory
+import torch
+c = torch.empty(70*1024*1024*1024//4, device=torch.device('cuda:2'))
+d = torch.empty(70*1024*1024*1024//4, device=torch.device('cuda:3'))
+
+
+llama2:
+0.538 gpu: 5223 blocks PD=10
+0.537 gpu: 5210 blocks PD=10
+0.5372 gpu: 5213 blocks PD=10
 '''
 
 
@@ -95,6 +110,10 @@ def sample_requests(
 
     # Sample the requests.
     sampled_requests = random.sample(filtered_dataset, num_requests)
+
+    if os.environ['SORT_REQS'] == 'True':
+        sampled_requests = sorted(sampled_requests, key=lambda x: x[1], reverse=True)
+
     return sampled_requests
 
 
@@ -122,9 +141,10 @@ def run_vllm(
         dtype=dtype,
         max_model_len=max_model_len,
         # <jingzhi>
-        gpu_memory_utilization=0.3,
+        # gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
         # max_num_seqs=2048,
         max_num_seqs=512,
+        max_paddings=512,
     )
 
     # Add the requests to the engine.

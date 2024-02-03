@@ -194,8 +194,8 @@ class PagedAttention(nn.Module):
 
         
         # <jingzhi> For DEBUG
-        if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"output.view(batch_size, seq_len, hidden_size): {output.view(batch_size, seq_len, hidden_size)}")
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"output.view(batch_size, seq_len, hidden_size): {output.view(batch_size, seq_len, hidden_size)}")
 
 
         # Reshape the output tensor.

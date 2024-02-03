@@ -10,6 +10,11 @@ from vllm.utils import Device
 BlockTable = List[PhysicalTokenBlock]
 
 
+
+# <jingzhi>
+# prefix = ''
+
+
 class BlockAllocator:
     """Manages free physical token blocks for a device.
 
@@ -150,6 +155,10 @@ class BlockSpaceManager:
         # prompt.
         seq = seq_group.get_seqs()[0]
 
+        # # <jingzhi> For DEBUG
+        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+        #     f.write(f"alloc seq {seq_group.get_seqs()[0].seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
+
         # Allocate new physical token blocks that will store the prompt tokens.
         block_table: BlockTable = []
         for logical_idx in range(len(seq.logical_token_blocks)):
@@ -161,6 +170,12 @@ class BlockSpaceManager:
             # Set the reference counts of the token blocks.
             block.ref_count = seq_group.num_seqs()
             block_table.append(block)
+
+
+        # # <jingzhi> For DEBUG
+        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+        #     f.write(f"alloc seq {seq_group.get_seqs()[0].seq_id}: {[blk.block_number for blk in block_table]}\n")
+
 
         # Assign the block table for each sequence.
         for seq in seq_group.get_seqs():
@@ -185,10 +200,22 @@ class BlockSpaceManager:
                 block_table.append(block_table[len(block_table) %
                                                self.block_sliding_window])
             else:
+
+                # # <jingzhi> For DEBUG
+                # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+                #     f.write(f"append seq {seq.seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
+
+
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
                 block = self.gpu_allocator.allocate()
                 block_table.append(block)
+
+                # # <jingzhi> For DEBUG
+                # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+                #     f.write(f"append seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
+
+
                 return None
 
         # We want to append the token to the last physical block.
@@ -198,11 +225,23 @@ class BlockSpaceManager:
             # Not shared with other sequences. Appendable.
             return None
         else:
+
+            # # <jingzhi> For DEBUG
+            # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+            #     f.write(f"shared seq {seq.seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
+
+
             # The last block is shared with other sequences.
             # Copy on Write: Allocate a new block and copy the tokens.
             new_block = self.gpu_allocator.allocate()
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
+
+            # # <jingzhi> For DEBUG
+            # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+            #     f.write(f"shared seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
+
+
             return last_block.block_number, new_block.block_number
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
@@ -289,7 +328,9 @@ class BlockSpaceManager:
         return block_number_mapping
 
     def _free_block_table(self, block_table: BlockTable) -> None:
-        for block in set(block_table):
+        # for block in set(block_table):
+        # TODO (jingzhi): why there is a set here in the original vllm code????
+        for block in block_table:
             if block.device == Device.GPU:
                 self.gpu_allocator.free(block)
             else:
@@ -299,8 +340,18 @@ class BlockSpaceManager:
         if seq.seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
             return
+        
+        # # <jingzhi> For DEBUG
+        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+        #     f.write(f"free {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
+
         block_table = self.block_tables[seq.seq_id]
         self._free_block_table(block_table)
+
+        # # <jingzhi> For DEBUG
+        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
+        #     f.write(f"free seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
+
         del self.block_tables[seq.seq_id]
 
     def reset(self) -> None:

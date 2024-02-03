@@ -456,22 +456,57 @@ class Scheduler:
             # when all layer weights are already on card
             return
 
+        # <jingzhi> For DEBUG
+        # print(f"1-1")
+
         # first try a very simple strategy
         if len(self.waiting) > 0:
             # when there are still requests not started, we do not need to increase on-card layer weights
             return
 
-        # compute the number of cache blocks we need to load all cached layer weights
-        blk_num_required = KVBlkPerLayerWeight.blk_num_per_layer * KVBlkPerLayerWeight.cached_layer_num
-        if self.block_manager.gpu_allocator.get_num_free_blocks() < blk_num_required:
+
+        # <jingzhi> For DEBUG
+        # print(f"1-2")
+
+
+
+        # compute the number of layers to load
+        # num_layers_to_load = KVBlkPerLayerWeight.cached_layer_num # this is the naive policy
+        # TODO (jingzhi): we assume all the pipe_degree and pipeinteval can divide layer_num perfectly
+        # here "+2" because KVBlkPerLayerWeight.cached_layer_num is actually the wrong number 
+        new_cached_layer_num = (KVBlkPerLayerWeight.cached_layer_num + 2) // 2
+        num_layers_to_load = KVBlkPerLayerWeight.cached_layer_num + 2 - new_cached_layer_num
+        last_layers_to_load = None
+        while (self.block_manager.gpu_allocator.get_num_free_blocks() >= KVBlkPerLayerWeight.blk_num_per_layer * num_layers_to_load):
+            last_layers_to_load = num_layers_to_load
+            if KVBlkPerLayerWeight.cached_layer_num - num_layers_to_load <= 0:
+                break
+            new_cached_layer_num = new_cached_layer_num // 2
+            num_layers_to_load = KVBlkPerLayerWeight.cached_layer_num + 2 - new_cached_layer_num
+
+
+        # <jingzhi> For DEBUG
+        # print(f"1-3 last_layers_to_load: {last_layers_to_load}, num_layers_to_load: {num_layers_to_load, }")
+
+
+        num_layers_to_load = last_layers_to_load
+        if num_layers_to_load == None:
             # when the free blocks is not enough to load all cached weights
             return
+        
+
+
+        # # compute the number of cache blocks we need to load all cached layer weights
+        # blk_num_required = KVBlkPerLayerWeight.blk_num_per_layer * KVBlkPerLayerWeight.cached_layer_num
+        # if self.block_manager.gpu_allocator.get_num_free_blocks() < blk_num_required:
+        #     # when the free blocks is not enough to load all cached weights
+        #     return
         
 
         print(f"We now dynamically increase on-card layer weights!--------------------------------------------")
 
         # now we can load all cached weights
-        fromblknum_to_blknum = self.block_manager.reorganize_gpu_blocks(KVBlkPerLayerWeight.cached_layer_num)
+        fromblknum_to_blknum = self.block_manager.reorganize_gpu_blocks(num_layers_to_load)
         print(f"fromblknum_to_blknum: {fromblknum_to_blknum}")
         for from_blk_number, to_blk_number in fromblknum_to_blknum.items():
             if from_blk_number in blocks_to_copy:
