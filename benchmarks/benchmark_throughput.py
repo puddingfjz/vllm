@@ -1,11 +1,15 @@
 """Benchmark offline inference throughput."""
 
+
+
+
+
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='1,2,3,0' # '2,3' # '3,0,1,2'
+os.environ['CUDA_VISIBLE_DEVICES']='1,3,2,0' # '2,3' # '3,0,1,2'
 os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
-os.environ['WEIGHT_LOAD_DEGREE'] = '20'
-os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed
+os.environ['WEIGHT_LOAD_DEGREE'] = '16'
+# os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed
 os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'True' # whether we will dynamically increase the on-card layer weights
 
 # about scheduling
@@ -14,7 +18,7 @@ os.environ['SORT_REQS'] = 'True' # whether to sort the requests according to the
 
 def environs_are_correct():
     if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
-        assert (os.environ['CHANGE_KV_LAYOUT'] == 'True') and (os.environ['USE_VLLM'] == 'False')
+        assert (os.environ['USE_VLLM'] == 'False')
 
 # we first check the os environ variables are correct
 environs_are_correct()
@@ -22,15 +26,15 @@ environs_are_correct()
 
 '''
 Command: 
-python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 1000 > layerBylayer1.log
-/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --cudabacktrace=true -x true -o ./nsys_profile/my_profile1 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 > DEBUG.log
+python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 1000 --enforce-eager > layerBylayer1.log
+/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --cudabacktrace=true -x true -o ./nsys_profile/my_profile1 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 --enforce-eager > DEBUG.log
 
 # with record range
-/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --capture-range=cudaProfilerApi  --capture-range-end=stop-shutdown --kill=sigkill --cudabacktrace=true -x true -o ./nsys_profile/my_profile3 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 > DEBUG.lpg
+/ssddata/jingzhi/Nsight_Systems_2023_2_1/target-linux-x64/nsys profile -w true -t cuda,nvtx,osrt -s cpu  --capture-range=cudaProfilerApi  --capture-range-end=stop-shutdown --kill=sigkill --cudabacktrace=true -x true -o ./nsys_profile/my_profile3 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model huggyllama/llama-7b --num-prompts 100 --enforce-eager > DEBUG.lpg
 
 
 try llama2
-python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model NousResearch/Llama-2-13b-hf --num-prompts 100 > layerBylayer_llama2_1.log
+python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model NousResearch/Llama-2-13b-hf --num-prompts 100 --enforce-eager > layerBylayer_llama2_1.log
 
 
 
@@ -45,6 +49,11 @@ llama2:
 0.537 gpu: 5210 blocks PD=10
 0.5372 gpu: 5213 blocks PD=10
 '''
+
+
+
+
+
 
 
 
@@ -102,10 +111,6 @@ def sample_requests(
         if prompt_len > 1024 or prompt_len + output_len > 2048:
             # Prune too long sequences.
             continue
-        # <jingzhi>
-        # if output_len > 10:
-        #     continue
-
         filtered_dataset.append((prompt, prompt_len, output_len))
 
     # Sample the requests.
@@ -113,6 +118,7 @@ def sample_requests(
 
     if os.environ['SORT_REQS'] == 'True':
         sampled_requests = sorted(sampled_requests, key=lambda x: x[1], reverse=True)
+
 
     return sampled_requests
 
@@ -128,7 +134,10 @@ def run_vllm(
     use_beam_search: bool,
     trust_remote_code: bool,
     dtype: str,
-    max_model_len: Optional[int] = None,
+    max_model_len: Optional[int],
+    enforce_eager: bool,
+    kv_cache_dtype: str,
+    device: str,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -140,8 +149,11 @@ def run_vllm(
         trust_remote_code=trust_remote_code,
         dtype=dtype,
         max_model_len=max_model_len,
+        enforce_eager=enforce_eager,
+        kv_cache_dtype=kv_cache_dtype,
+        device=device,
         # <jingzhi>
-        # gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
+        gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
         # max_num_seqs=2048,
         max_num_seqs=512,
         max_paddings=512,
@@ -268,7 +280,8 @@ def main(args: argparse.Namespace):
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
-                                args.max_model_len)
+                                args.max_model_len, args.enforce_eager,
+                                args.kv_cache_dtype, args.device)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -308,7 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
-                        choices=['awq', 'squeezellm', None],
+                        choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--n",
@@ -343,6 +356,22 @@ if __name__ == "__main__":
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument("--enforce-eager",
+                        action="store_true",
+                        help="enforce eager execution")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=["auto", "fp8_e5m2"],
+        default="auto",
+        help=
+        'Data type for kv cache storage. If "auto", will use model data type.')
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda"],
+        help='device type for vLLM execution, supporting CUDA only currently.')
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

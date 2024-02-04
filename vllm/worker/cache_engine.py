@@ -6,17 +6,11 @@ import torch
 from vllm._C import cache_ops
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig
 from vllm.logger import init_logger
-from vllm.utils import in_wsl
+from vllm.utils import in_wsl, STR_DTYPE_TO_TORCH_DTYPE
 
 logger = init_logger(__name__)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-
-# <jingzhi>
-import os
-if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-    KVCache = torch.Tensor
-
 
 
 class CacheEngine:
@@ -40,11 +34,21 @@ class CacheEngine:
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
-        self.dtype = model_config.dtype
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
+
+        if cache_config.cache_dtype == "auto":
+            self.dtype = model_config.dtype
+        else:
+            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+
+        # <jingzhi>
+        self.continuous_gpu_cache = None
+        print(f"self.continuous_gpu_cache 1: {self.continuous_gpu_cache}")
+
 
         # Initialize the cache.
         self.gpu_cache = self.allocate_gpu_cache()
@@ -57,11 +61,8 @@ class CacheEngine:
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
         # <jingzhi> added parameters
-        self.change_KV_layout = False
-        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-            self.change_KV_layout = True
-
         print(f"KV cache layout (when initialing it): {len(self.gpu_cache), len(self.gpu_cache[0]), len(self.gpu_cache[0][0])}")
+
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
@@ -80,8 +81,6 @@ class CacheEngine:
             self.block_size,
         )
 
-
-    # this is the function in vllm
     def allocate_gpu_cache_vllm(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
@@ -99,7 +98,8 @@ class CacheEngine:
             )
             gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
-    
+
+
 
 
     # <jingzhi> we allocate a continuous memory for the KV cache. This will be ok for the 80G GPU memory (as the tensor index is in Long type)
@@ -115,10 +115,13 @@ class CacheEngine:
 
         # allocate a whole KV cache memory
         whole_cache = torch.empty(
-                size=self.num_layers*(key_blk_size_per_layer+value_blk_size_per_layer),
+                size=(self.num_layers*(key_blk_size_per_layer+value_blk_size_per_layer), ),
                 dtype=self.dtype,
                 device="cuda",
             )
+
+        self.continuous_gpu_cache = whole_cache
+        print(f"self.continuous_gpu_cache 2: {self.continuous_gpu_cache}")
 
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
@@ -139,47 +142,19 @@ class CacheEngine:
 
 
 
-
-    # <jingzhi> we allocate a continuous memory for the KV cache. This will be ok for the 80G GPU memory (as the tensor index is in Long type)
-    # the KV cache layout is also changed
-    def allocate_gpu_cache_layout_changed(self) -> List[KVCache]:
-        '''
-            The data layout of the whole cache space is [# block, # layer, key or value, the space for (a layer of a block)]
-        '''
-        total_size = self.num_gpu_blocks * self.num_layers
-        key_blk_size_per_layer_per_blk = 1
-        for i in self.get_key_block_shape():
-            key_blk_size_per_layer_per_blk = key_blk_size_per_layer_per_blk * i
-
-        value_blk_size_per_layer_per_blk = 1
-        for i in self.get_value_block_shape():
-            value_blk_size_per_layer_per_blk = value_blk_size_per_layer_per_blk * i
-
-        assert key_blk_size_per_layer_per_blk == value_blk_size_per_layer_per_blk, "The key space and the value space are different!"
-
-        total_size = total_size * (key_blk_size_per_layer_per_blk + value_blk_size_per_layer_per_blk)
-
-        # allocate a whole KV cache memory
-
-        # <jingzhi> For DEBUG
-        print(f"when create KV cache: size:{total_size}, dtype:{self.dtype}")
-
-        whole_cache = torch.empty(
-                size=[total_size],
-                dtype=self.dtype,
-                device="cuda",
-            ).view(self.num_gpu_blocks, self.num_layers, 2, *self.get_key_block_shape())
-        
-        return [whole_cache]
-
-
-
     # <jingzhi> support all kinds of gpu cache allocation function
     def allocate_gpu_cache(self) -> List[KVCache]:
-        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-            return self.allocate_gpu_cache_layout_changed()
+        # <jingzhi>
+        import os
+
+        print(f"os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']:{os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']}")
+
+        if (os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True'):
+            print(f"self.cache_engine.continuous_gpu_cache:{self.continuous_gpu_cache}")
+            return self.allocate_gpu_cache_continuous()
         else:
             return self.allocate_gpu_cache_vllm()
+
 
 
 
@@ -198,17 +173,17 @@ class CacheEngine:
                 size=(self.num_cpu_blocks, *key_block_shape),
                 dtype=self.dtype,
                 pin_memory=pin_memory,
+                device="cpu",
             )
             value_blocks = torch.empty(
                 size=(self.num_cpu_blocks, *value_block_shape),
                 dtype=self.dtype,
                 pin_memory=pin_memory,
+                device="cpu",
             )
             cpu_cache.append((key_blocks, value_blocks))
         return cpu_cache
 
-
-    # TODO (jingzhi): modify this function as we change the layout of the KV cache
     def _swap(
         self,
         src: List[KVCache],
@@ -233,9 +208,7 @@ class CacheEngine:
     def swap_out(self, src_to_dst: Dict[int, int]) -> None:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
-    
-    # this is the original function used in vllm
-    def copy_ori(self, src_to_dsts: Dict[int, List[int]]) -> None:
+    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
         key_caches = [key_cache for key_cache, _ in self.gpu_cache]
         value_caches = [value_cache for _, value_cache in self.gpu_cache]
         # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
@@ -243,20 +216,78 @@ class CacheEngine:
 
 
 
-    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:       
-        if self.change_KV_layout:
-            kv_cache = self.gpu_cache
-            cache_ops.copy_blocks(kv_cache, kv_cache, src_to_dsts)
-        else:
-            key_caches = [key_cache for key_cache, _ in self.gpu_cache]
-            value_caches = [value_cache for _, value_cache in self.gpu_cache]
-            # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
-            cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+
+
+    # <jingzhi> change the KV cache organization to make space for model weights
+    def update_KV_cache_organization(self, block_num_reduced: int) -> None:
+
+        new_block_num = self.num_gpu_blocks - block_num_reduced
+        whole_cache = self.continuous_gpu_cache.view(-1)
+        
+        key_blk_size_per_layer = new_block_num
+        for i in self.get_key_block_shape():
+            key_blk_size_per_layer = key_blk_size_per_layer * i
+
+        value_blk_size_per_layer = new_block_num
+        for i in self.get_value_block_shape():
+            value_blk_size_per_layer = value_blk_size_per_layer * i
+
+        gpu_cache: List[KVCache] = []
+        key_block_shape = self.get_key_block_shape()
+        value_block_shape = self.get_value_block_shape()
+
+        for layer_i in range(self.num_layers):
+            key_blocks = torch.narrow(whole_cache, 
+                    0, 
+                    layer_i*(key_blk_size_per_layer+value_blk_size_per_layer),
+                    key_blk_size_per_layer).view(new_block_num, *key_block_shape)
+            
+            value_blocks = torch.narrow(whole_cache, 
+                    0, 
+                    layer_i*(key_blk_size_per_layer+value_blk_size_per_layer)+key_blk_size_per_layer,
+                    value_blk_size_per_layer).view(new_block_num, *value_block_shape)
+
+            gpu_cache.append((key_blocks, value_blocks))
+
+        return gpu_cache
+
+
+    
+    
+    # <jingzhi> directly reorganize the KV cache blocks to make space for model weights
+    def reorganize_blocks(self, src_to_dsts: Dict[int, List[int]], block_num_reduced: int) -> None:      
+
+        # first update the KV cache organization to get gpu_cache_reorganized
+        gpu_cache_reorganized = self.update_KV_cache_organization(block_num_reduced)
+
+        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+        value_caches = [value_cache for _, value_cache in self.gpu_cache]
+        # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
+        new_key_caches = [key_cache for key_cache, _ in gpu_cache_reorganized]
+        new_value_caches = [value_cache for _, value_cache in gpu_cache_reorganized]
+
+        cache_ops.reorganize_blocks(key_caches, value_caches, src_to_dsts, new_key_caches, new_value_caches)
+        
+        # udpate gpu cache
+        self.gpu_cache = gpu_cache_reorganized
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     @staticmethod
     def get_cache_block_size(
         block_size: int,
+        cache_dtype: str,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
@@ -267,7 +298,11 @@ class CacheEngine:
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
-        dtype_size = _get_dtype_size(model_config.dtype)
+        if cache_dtype == "auto":
+            dtype = model_config.dtype
+        else:
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        dtype_size = _get_dtype_size(dtype)
         return dtype_size * total
 
 

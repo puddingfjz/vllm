@@ -1,18 +1,14 @@
 """Utilities for selecting and loading models."""
 import contextlib
-from typing import Type
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 
-from vllm.config import ModelConfig
-from vllm.model_executor.models import *
+from vllm.config import DeviceConfig, ModelConfig, LoRAConfig
+from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.weight_utils import (get_quant_config,
                                               initialize_dummy_weights)
-from vllm.utils import is_hip
-from vllm.logger import init_logger
-
 
 
 
@@ -25,49 +21,6 @@ import time
 
 
 
-logger = init_logger(__name__)
-
-# TODO(woosuk): Lazy-load the model classes.
-_MODEL_REGISTRY = {
-    "AquilaModel": AquilaForCausalLM,
-    "AquilaForCausalLM": AquilaForCausalLM,  # AquilaChat2
-    "BaiChuanForCausalLM": BaiChuanForCausalLM,  # baichuan-7b
-    "BaichuanForCausalLM": BaichuanForCausalLM,  # baichuan-13b
-    "BloomForCausalLM": BloomForCausalLM,
-    "ChatGLMModel": ChatGLMForCausalLM,
-    "ChatGLMForConditionalGeneration": ChatGLMForCausalLM,
-    "FalconForCausalLM": FalconForCausalLM,
-    "GPT2LMHeadModel": GPT2LMHeadModel,
-    "GPTBigCodeForCausalLM": GPTBigCodeForCausalLM,
-    "GPTJForCausalLM": GPTJForCausalLM,
-    "GPTNeoXForCausalLM": GPTNeoXForCausalLM,
-    "InternLMForCausalLM": InternLMForCausalLM,
-    "LlamaForCausalLM": LlamaForCausalLM,
-    "LLaMAForCausalLM": LlamaForCausalLM,  # For decapoda-research/llama-*
-    "MistralForCausalLM": MistralForCausalLM,
-    # transformers's mpt class has lower case
-    "MptForCausalLM": MPTForCausalLM,
-    "MPTForCausalLM": MPTForCausalLM,
-    "OPTForCausalLM": OPTForCausalLM,
-    "PhiForCausalLM": PhiForCausalLM,
-    "QWenLMHeadModel": QWenLMHeadModel,
-    "RWForCausalLM": FalconForCausalLM,
-    "YiForCausalLM": YiForCausalLM,
-}
-
-# Models to be disabled in ROCm
-_ROCM_UNSUPPORTED_MODELS = []
-if is_hip():
-    for rocm_model in _ROCM_UNSUPPORTED_MODELS:
-        del _MODEL_REGISTRY[rocm_model]
-
-# Models partially supported in ROCm
-_ROCM_PARTIALLY_SUPPORTED_MODELS = {
-    "MistralForCausalLM":
-    "Sliding window attention is not supported in ROCm's flash attention",
-}
-
-
 @contextlib.contextmanager
 def _set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
@@ -77,34 +30,32 @@ def _set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
-    architectures = getattr(config, "architectures", [])
+def _get_model_architecture(model_config: ModelConfig) -> Type[nn.Module]:
+    architectures = getattr(model_config.hf_config, "architectures", [])
+    # Special handling for quantized Mixtral.
+    # FIXME(woosuk): This is a temporary hack.
+    if (model_config.quantization is not None
+            and "MixtralForCausalLM" in architectures):
+        architectures = ["QuantMixtralForCausalLM"]
+
     for arch in architectures:
-        if arch in _MODEL_REGISTRY:
-            if is_hip() and arch in _ROCM_PARTIALLY_SUPPORTED_MODELS:
-                logger.warning(
-                    f"{arch} is not fully supported in ROCm. Reason: "
-                    f"{_ROCM_PARTIALLY_SUPPORTED_MODELS[arch]}")
-            return _MODEL_REGISTRY[arch]
-        elif arch in _ROCM_UNSUPPORTED_MODELS:
-            raise ValueError(
-                f"Model architecture {arch} is not supported by ROCm for now. \n"
-                f"Supported architectures {list(_MODEL_REGISTRY.keys())}")
+        model_cls = ModelRegistry.load_model_cls(arch)
+        if model_cls is not None:
+            return model_cls
     raise ValueError(
         f"Model architectures {architectures} are not supported for now. "
-        f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
+        f"Supported architectures: {ModelRegistry.get_supported_archs()}")
 
 
-def get_model(model_config: ModelConfig) -> nn.Module:
-    model_class = _get_model_architecture(model_config.hf_config)
+def get_model(model_config: ModelConfig,
+              device_config: DeviceConfig,
+              lora_config: Optional[LoRAConfig] = None) -> nn.Module:
+    model_class = _get_model_architecture(model_config)
 
     # Get the (maybe quantized) linear method.
     linear_method = None
     if model_config.quantization is not None:
-        quant_config = get_quant_config(model_config.quantization,
-                                        model_config.model,
-                                        model_config.hf_config,
-                                        model_config.download_dir)
+        quant_config = get_quant_config(model_config)
         capability = torch.cuda.get_device_capability()
         capability = capability[0] * 10 + capability[1]
         if capability < quant_config.get_min_capability():
@@ -124,8 +75,18 @@ def get_model(model_config: ModelConfig) -> nn.Module:
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        with torch.device("cuda"):
-            model = model_class(model_config.hf_config, linear_method)
+        with torch.device(device_config.device):
+            if getattr(model_class, "supports_lora", False):
+                model = model_class(model_config.hf_config, linear_method,
+                                    lora_config)
+            elif lora_config:
+                raise ValueError(
+                    f"Model {model_class.__name__} does not support LoRA, "
+                    "but LoRA is enabled. Support for this model may "
+                    "be added in the future. If this is important to you, "
+                    "please open an issue on github.")
+            else:
+                model = model_class(model_config.hf_config, linear_method)
         if model_config.load_format == "dummy":
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -134,9 +95,11 @@ def get_model(model_config: ModelConfig) -> nn.Module:
 
             # <jingzhi> Profiling
             print(model)
+            print(f"model weight device: {next(model.parameters()).device}")
             # model.cpu()
             torch.cuda.synchronize()
             time1 = time.perf_counter()
+
 
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
@@ -147,6 +110,7 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             torch.cuda.synchronize()
             params_device = next(model.parameters()).device
             time2 = time.perf_counter()
+
 
             # model.cuda()
             torch.cuda.synchronize()

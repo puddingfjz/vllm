@@ -3,8 +3,8 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig)
+from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
+                         ParallelConfig, SchedulerConfig, LoRAConfig)
 
 
 @dataclass
@@ -17,6 +17,7 @@ class EngineArgs:
     download_dir: Optional[str] = None
     load_format: str = 'auto'
     dtype: str = 'auto'
+    kv_cache_dtype: str = 'auto'
     seed: int = 0
     max_model_len: Optional[int] = None
     worker_use_ray: bool = False
@@ -33,6 +34,16 @@ class EngineArgs:
     revision: Optional[str] = None
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
+    enforce_eager: bool = False
+    max_context_len_to_capture: int = 8192
+    disable_custom_all_reduce: bool = False
+    enable_lora: bool = False
+    max_loras: int = 1
+    max_lora_rank: int = 16
+    lora_extra_vocab_size: int = 256
+    lora_dtype = 'auto'
+    max_cpu_loras: Optional[int] = None
+    device: str = 'cuda'
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -113,9 +124,17 @@ class EngineArgs:
             'The "auto" option will use FP16 precision '
             'for FP32 and FP16 models, and BF16 precision '
             'for BF16 models.')
+        parser.add_argument(
+            '--kv-cache-dtype',
+            type=str,
+            choices=['auto', 'fp8_e5m2'],
+            default=EngineArgs.kv_cache_dtype,
+            help='Data type for kv cache storage. If "auto", will use model '
+            'data type. Note FP8 is not supported when cuda version is '
+            'lower than 11.8.')
         parser.add_argument('--max-model-len',
                             type=int,
-                            default=None,
+                            default=EngineArgs.max_model_len,
                             help='model context length. If unspecified, '
                             'will be automatically derived from the model.')
         # Parallel arguments
@@ -136,6 +155,7 @@ class EngineArgs:
         parser.add_argument(
             '--max-parallel-loading-workers',
             type=int,
+            default=EngineArgs.max_parallel_loading_workers,
             help='load model sequentially in multiple batches, '
             'to avoid RAM OOM when using tensor '
             'parallel and large models')
@@ -154,11 +174,13 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.swap_space,
                             help='CPU swap space size (GiB) per GPU')
-        parser.add_argument('--gpu-memory-utilization',
-                            type=float,
-                            default=EngineArgs.gpu_memory_utilization,
-                            help='the percentage of GPU memory to be used for'
-                            'the model executor')
+        parser.add_argument(
+            '--gpu-memory-utilization',
+            type=float,
+            default=EngineArgs.gpu_memory_utilization,
+            help='the fraction of GPU memory to be used for '
+            'the model executor, which can range from 0 to 1.'
+            'If unspecified, will use the default value of 0.9.')
         parser.add_argument('--max-num-batched-tokens',
                             type=int,
                             default=EngineArgs.max_num_batched_tokens,
@@ -179,9 +201,69 @@ class EngineArgs:
         parser.add_argument('--quantization',
                             '-q',
                             type=str,
-                            choices=['awq', 'squeezellm', None],
-                            default=None,
-                            help='Method used to quantize the weights')
+                            choices=['awq', 'gptq', 'squeezellm', None],
+                            default=EngineArgs.quantization,
+                            help='Method used to quantize the weights. If '
+                            'None, we first check the `quantization_config` '
+                            'attribute in the model config file. If that is '
+                            'None, we assume the model weights are not '
+                            'quantized and use `dtype` to determine the data '
+                            'type of the weights.')
+        parser.add_argument('--enforce-eager',
+                            action='store_true',
+                            help='Always use eager-mode PyTorch. If False, '
+                            'will use eager mode and CUDA graph in hybrid '
+                            'for maximal performance and flexibility.')
+        parser.add_argument('--max-context-len-to-capture',
+                            type=int,
+                            default=EngineArgs.max_context_len_to_capture,
+                            help='maximum context length covered by CUDA '
+                            'graphs. When a sequence has context length '
+                            'larger than this, we fall back to eager mode.')
+        parser.add_argument('--disable-custom-all-reduce',
+                            action='store_true',
+                            default=EngineArgs.disable_custom_all_reduce,
+                            help='See ParallelConfig')
+        # LoRA related configs
+        parser.add_argument('--enable-lora',
+                            action='store_true',
+                            help='If True, enable handling of LoRA adapters.')
+        parser.add_argument('--max-loras',
+                            type=int,
+                            default=EngineArgs.max_loras,
+                            help='Max number of LoRAs in a single batch.')
+        parser.add_argument('--max-lora-rank',
+                            type=int,
+                            default=EngineArgs.max_lora_rank,
+                            help='Max LoRA rank.')
+        parser.add_argument(
+            '--lora-extra-vocab-size',
+            type=int,
+            default=EngineArgs.lora_extra_vocab_size,
+            help=('Maximum size of extra vocabulary that can be '
+                  'present in a LoRA adapter (added to the base '
+                  'model vocabulary).'))
+        parser.add_argument(
+            '--lora-dtype',
+            type=str,
+            default=EngineArgs.lora_dtype,
+            choices=['auto', 'float16', 'bfloat16', 'float32'],
+            help=('Data type for LoRA. If auto, will default to '
+                  'base model dtype.'))
+        parser.add_argument(
+            '--max-cpu-loras',
+            type=int,
+            default=EngineArgs.max_cpu_loras,
+            help=('Maximum number of LoRAs to store in CPU memory. '
+                  'Must be >= than max_num_seqs. '
+                  'Defaults to max_num_seqs.'))
+        parser.add_argument(
+            "--device",
+            type=str,
+            default=EngineArgs.device,
+            choices=["cuda"],
+            help=('Device type for vLLM execution. '
+                  'Currently, only CUDA-compatible devices are supported.'))
         return parser
 
     @classmethod
@@ -194,26 +276,38 @@ class EngineArgs:
 
     def create_engine_configs(
         self,
-    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig]:
+    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
+               DeviceConfig, Optional[LoRAConfig]]:
+        device_config = DeviceConfig(self.device)
         model_config = ModelConfig(self.model, self.tokenizer,
                                    self.tokenizer_mode, self.trust_remote_code,
                                    self.download_dir, self.load_format,
                                    self.dtype, self.seed, self.revision,
                                    self.tokenizer_revision, self.max_model_len,
-                                   self.quantization)
+                                   self.quantization, self.enforce_eager,
+                                   self.max_context_len_to_capture)
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
-                                   self.swap_space,
+                                   self.swap_space, self.kv_cache_dtype,
                                    model_config.get_sliding_window())
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
                                          self.worker_use_ray,
-                                         self.max_parallel_loading_workers)
+                                         self.max_parallel_loading_workers,
+                                         self.disable_custom_all_reduce)
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
                                            self.max_paddings)
-        return model_config, cache_config, parallel_config, scheduler_config
+        lora_config = LoRAConfig(
+            max_lora_rank=self.max_lora_rank,
+            max_loras=self.max_loras,
+            lora_extra_vocab_size=self.lora_extra_vocab_size,
+            lora_dtype=self.lora_dtype,
+            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
+            and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+        return (model_config, cache_config, parallel_config, scheduler_config,
+                device_config, lora_config)
 
 
 @dataclass

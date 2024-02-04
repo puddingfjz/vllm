@@ -2,17 +2,9 @@
 import enum
 from typing import Dict, List, Optional, Set, Tuple
 
-from vllm.block import PhysicalTokenBlock
+from vllm.block import BlockTable, PhysicalTokenBlock
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
-
-# Mapping: logical block number -> physical block.
-BlockTable = List[PhysicalTokenBlock]
-
-
-
-# <jingzhi>
-# prefix = ''
 
 
 class BlockAllocator:
@@ -57,7 +49,9 @@ class BlockAllocator:
 
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
-    
+
+
+
 
     # <jingzhi>
     # remove the parameter tmp_blk_idxs after we check the correctness
@@ -77,6 +71,8 @@ class BlockAllocator:
                 new_free_blocks.append(block)
         self.free_blocks = new_free_blocks
         return blocks
+
+
 
 
 
@@ -129,13 +125,17 @@ class BlockSpaceManager:
 
 
         # <jingzhi>
-        self.actual_gpu_blk_rng_end: int = self.num_total_gpu_blocks
+        self.actual_gpu_blk_rng_end: int = self.num_total_gpu_blocks        
 
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
-        seq = seq_group.get_seqs()[0]
+        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
         num_required_blocks = len(seq.logical_token_blocks)
+
+        if seq_group.prefix is not None and seq_group.prefix.allocated:
+            num_required_blocks -= seq_group.prefix.get_num_blocks()
+
         if self.block_sliding_window is not None:
             num_required_blocks = min(num_required_blocks,
                                       self.block_sliding_window)
@@ -153,15 +153,24 @@ class BlockSpaceManager:
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
-        seq = seq_group.get_seqs()[0]
-
-        # # <jingzhi> For DEBUG
-        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-        #     f.write(f"alloc seq {seq_group.get_seqs()[0].seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
+        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
 
         # Allocate new physical token blocks that will store the prompt tokens.
+        num_prompt_blocks = len(seq.logical_token_blocks)
+
         block_table: BlockTable = []
-        for logical_idx in range(len(seq.logical_token_blocks)):
+        prefix_block_table: BlockTable = []
+        num_prefix_blocks = 0
+
+        prefix = seq_group.prefix
+        if prefix is not None and prefix.allocated:
+            # Prefix has already been allocated. Use the existing block table.
+            num_prompt_blocks -= prefix.get_num_blocks()
+            for block in prefix.block_table:
+                block.ref_count += seq_group.num_seqs()
+                block_table.append(block)
+
+        for logical_idx in range(num_prompt_blocks):
             if (self.block_sliding_window is not None
                     and logical_idx >= self.block_sliding_window):
                 block = block_table[logical_idx % self.block_sliding_window]
@@ -171,14 +180,17 @@ class BlockSpaceManager:
             block.ref_count = seq_group.num_seqs()
             block_table.append(block)
 
-
-        # # <jingzhi> For DEBUG
-        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-        #     f.write(f"alloc seq {seq_group.get_seqs()[0].seq_id}: {[blk.block_number for blk in block_table]}\n")
-
+        if prefix is not None and not prefix.allocated:
+            # Allocate blocks for the prefix, we will compute the prefix's
+            # KV cache in this run.
+            num_prefix_blocks = prefix.get_num_blocks()
+            prefix_block_table = block_table[:num_prefix_blocks]
+            for block in prefix_block_table:
+                block.ref_count += 1
+            prefix.set_block_table(prefix_block_table)
 
         # Assign the block table for each sequence.
-        for seq in seq_group.get_seqs():
+        for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             self.block_tables[seq.seq_id] = block_table.copy()
 
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
@@ -200,22 +212,10 @@ class BlockSpaceManager:
                 block_table.append(block_table[len(block_table) %
                                                self.block_sliding_window])
             else:
-
-                # # <jingzhi> For DEBUG
-                # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-                #     f.write(f"append seq {seq.seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
-
-
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
                 block = self.gpu_allocator.allocate()
                 block_table.append(block)
-
-                # # <jingzhi> For DEBUG
-                # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-                #     f.write(f"append seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
-
-
                 return None
 
         # We want to append the token to the last physical block.
@@ -225,23 +225,11 @@ class BlockSpaceManager:
             # Not shared with other sequences. Appendable.
             return None
         else:
-
-            # # <jingzhi> For DEBUG
-            # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-            #     f.write(f"shared seq {seq.seq_id}: {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
-
-
             # The last block is shared with other sequences.
             # Copy on Write: Allocate a new block and copy the tokens.
             new_block = self.gpu_allocator.allocate()
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
-
-            # # <jingzhi> For DEBUG
-            # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-            #     f.write(f"shared seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
-
-
             return last_block.block_number, new_block.block_number
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
@@ -275,10 +263,18 @@ class BlockSpaceManager:
 
     def swap_in(self, seq_group: SequenceGroup) -> Dict[int, int]:
         # CPU block -> GPU block.
+        if seq_group.prefix is not None:
+            # make sure to swap in the prefix first
+            assert seq_group.prefix.allocated and seq_group.prefix.computed
+
         mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
         for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             new_block_table: BlockTable = []
             block_table = self.block_tables[seq.seq_id]
+            if seq_group.prefix is not None:
+                for block in seq_group.prefix.block_table:
+                    new_block_table.append(block)
+                    block.ref_count += 1
 
             for cpu_block in block_table:
                 if cpu_block in mapping:
@@ -310,6 +306,12 @@ class BlockSpaceManager:
             block_table = self.block_tables[seq.seq_id]
 
             for gpu_block in block_table:
+                if (seq_group.prefix is not None
+                        and gpu_block in seq_group.prefix.block_table):
+                    # NOTE: We do not swap out the prefix blocks for now.
+                    self.gpu_allocator.free(gpu_block)
+                    continue
+
                 if gpu_block in mapping:
                     cpu_block = mapping[gpu_block]
                     cpu_block.ref_count += 1
@@ -340,18 +342,8 @@ class BlockSpaceManager:
         if seq.seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
             return
-        
-        # # <jingzhi> For DEBUG
-        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-        #     f.write(f"free {[blk.block_number for blk in self.gpu_allocator.free_blocks[::-1]]}\n")
-
         block_table = self.block_tables[seq.seq_id]
         self._free_block_table(block_table)
-
-        # # <jingzhi> For DEBUG
-        # with open(f'blk_table_info_{prefix}2.log', 'a') as f:
-        #     f.write(f"free seq {seq.seq_id}: {[blk.block_number for blk in block_table]}\n")
-
         del self.block_tables[seq.seq_id]
 
     def reset(self) -> None:
@@ -370,8 +362,10 @@ class BlockSpaceManager:
         return self.cpu_allocator.get_num_free_blocks()
 
 
+
+
     # <jingzhi>
-    def reorganize_gpu_blocks(self, num_layer_to_load: int) -> Dict[int, int]:
+    def reorganize_gpu_blocks(self, num_layer_to_load: int) -> Tuple[Dict[int, int], List[int]]:
         '''
             Reorganize allocated GPU blocks to get enough continuous block ranges.
             This is used when the remaining requests is not enough to make the computation time 
@@ -400,12 +394,16 @@ class BlockSpaceManager:
         blk_is_free = [False] * self.num_total_gpu_blocks
         blks_to_move_to: List[Tuple[int, PhysicalTokenBlock]] = list()
         blk_to_allocate_index_in_freelist = []
+        blks_to_move_to_the_same_pos_in_new_KVcache: List[Tuple[int, int]] = list()
         for i, blk in enumerate(self.gpu_allocator.free_blocks):
             blk_is_free[blk.block_number]=True
             if blk.block_number < release_rng_start:
                 blks_to_move_to.append((i, blk))
             else:
                 blk_to_allocate_index_in_freelist.append(i)
+        for blk_i in range(release_rng_start):
+            if blk_is_free[blk_i] == False:
+                blks_to_move_to_the_same_pos_in_new_KVcache.append((blk_i, blk_i))
         for blk_i in range(release_rng_start, release_rng_end):
             if blk_is_free[blk_i] == False:
                 to_remove.append(blk_i)
@@ -435,6 +433,7 @@ class BlockSpaceManager:
 
         # return the block number mapping information, so that we can do memory transfer
         ret: Dict[int, int] = {from_blk_number: to_blk.block_number for from_blk_number, (_, to_blk) in zip(to_remove, blks_to_move_to)}
+        ret.update(blks_to_move_to_the_same_pos_in_new_KVcache)
         return ret
 
         

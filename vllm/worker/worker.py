@@ -1,23 +1,29 @@
 """A GPU worker class."""
+import gc
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Set, Optional
 
 import torch
 import torch.distributed
 
-from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig)
+from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
+                         ParallelConfig, SchedulerConfig, LoRAConfig)
 from vllm.model_executor import set_random_seed
+from vllm.model_executor.parallel_utils.communication_op import (
+    broadcast_tensor_dict)
+from vllm.model_executor.parallel_utils.custom_all_reduce import init_custom_ar
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel)
+    ensure_model_parallel_initialized)
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
-from vllm.utils import get_gpu_memory
+from vllm.lora.request import LoRARequest
 
 
 # <jingzhi>
 from vllm.core.block_manager import KVBlkPerLayerWeight
+
+
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -32,21 +38,33 @@ class Worker:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
-        rank: Optional[int] = None,
-        distributed_init_method: Optional[str] = None,
-        # <jingzhi>
-        # tot_gpu_num: Optional[int] = None,
-        tot_ordered_gpus: Optional[str] = 'None',
-        change_KV_layout: str = 'False',
+        device_config: DeviceConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        lora_config: Optional[LoRAConfig] = None,
+        kv_cache_dtype: Optional[str] = "auto",
+        is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
+        self.device_config = device_config
+        self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
+        self.lora_config = lora_config
+        self.is_driver_worker = is_driver_worker
+        if self.is_driver_worker:
+            assert self.rank == 0, "The driver worker must have rank 0."
 
-        self.model_runner = ModelRunner(model_config, parallel_config,
-                                        scheduler_config)
+        self.model_runner = ModelRunner(model_config,
+                                        parallel_config,
+                                        scheduler_config,
+                                        device_config,
+                                        lora_config=self.lora_config,
+                                        kv_cache_dtype=kv_cache_dtype,
+                                        is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # self.init_cache_engine().
         self.cache_config = None
@@ -57,66 +75,60 @@ class Worker:
         # <jingzhi> 
         # TODO (jingzhi): seems the worker process can inherit the os environment variables from the main process, so we do not need to set "os.environ['CHANGE_KV_LAYOUT']" here
         # self.tot_gpu_num = tot_gpu_num
-        self.tot_ordered_gpus = tot_ordered_gpus
-        os.environ['TOT_ORDERED_GPUS']=tot_ordered_gpus
-        print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
-        print(f"os.environ['CHANGE_KV_LAYOUT']: {os.environ['CHANGE_KV_LAYOUT']}")
-        self.change_KV_layout = change_KV_layout
-        os.environ['CHANGE_KV_LAYOUT'] = change_KV_layout
-        print(f"os.environ['CHANGE_KV_LAYOUT']: {os.environ['CHANGE_KV_LAYOUT']}")
-
-    def init_model(self):
-        # This env var set by Ray causes exceptions with graph building.
-        os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-        # Env vars will be set by Ray.
-        self.rank = self.rank if self.rank is not None else int(
-            os.getenv("RANK", "-1"))
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        os.environ['LOCAL_RANK'] = str(local_rank)
+        print(f"os.environ['CUDA_VISIBLE_DEVICES']:{os.environ['CUDA_VISIBLE_DEVICES']}, LOCAL_RANK: {os.environ['LOCAL_RANK']}")
+        self.tot_ordered_gpus = 'None' # os.environ['TOT_ORDERED_GPUS']
+        # print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
 
 
-        # <jingzhi> as the order in os.environ["CUDA_VISIBLE_DEVICES"] may be wrong due to Ray, we need to get the correct gpus
-        if self.tot_ordered_gpus != 'None':
-            ori_gpu_orders = self.tot_ordered_gpus.split(',')
-            curr_gpu_orders = os.environ["CUDA_VISIBLE_DEVICES"].split(',')
-            for i, gpu_i in enumerate(curr_gpu_orders):
-                if gpu_i == ori_gpu_orders[local_rank]:
-                    self.device = torch.device(f"cuda:{i}")
-                    print(f"After cuda remapping, torch.current_device set to {i}")
-                    break
+    def init_model(self) -> None:
+        if self.device_config.device.type == "cuda":
+            # torch.distributed.all_reduce does not free the input tensor until
+            # the synchronization point. This causes the memory usage to grow
+            # as the number of all_reduce calls increases. This env var disables
+            # this behavior.
+            # Related issue:
+            # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
+            os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+
+            # This env var set by Ray causes exceptions with graph building.
+            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+
+
+
+            # <jingzhi> as the order in os.environ["CUDA_VISIBLE_DEVICES"] may be wrong due to Ray, we need to get the correct gpus
+            # TODO (jingzhi): check the correctness of this part.
+            if self.tot_ordered_gpus != 'None':
+                ori_gpu_orders = self.tot_ordered_gpus.split(',')
+                curr_gpu_orders = os.environ["CUDA_VISIBLE_DEVICES"].split(',')
+                for i, gpu_i in enumerate(curr_gpu_orders):
+                    if gpu_i == ori_gpu_orders[self.local_rank]:
+                        self.device = torch.device(f"cuda:{i}")
+                        print(f"After cuda remapping, torch.current_device set to {i}")
+                        break
+            else:
+                self.device = torch.device(f"cuda:{self.local_rank}")
+
+
+
+            # self.device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(self.device)
+
+            # <jingzhi> For DEBUG
+            print(f'rank: {self.rank}, local_rank: {self.local_rank}, visible gpus: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+
+
+            _check_if_gpu_supports_dtype(self.model_config.dtype)
         else:
-            self.device = torch.device(f"cuda:{local_rank}")
-        # self.device = torch.device(f"cuda:{local_rank}")
-
-
-
-        if self.rank < 0:
-            raise ValueError("Invalid or unspecified rank.")
-        torch.cuda.set_device(self.device)
-
-        # <jingzhi> For DEBUG
-        print(f'rank: {self.rank}, local_rank: {local_rank}, visible gpus: {os.environ["CUDA_VISIBLE_DEVICES"]}')
-
-        _check_if_gpu_supports_dtype(self.model_config.dtype)
-
+            raise RuntimeError(
+                f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        _init_distributed_environment(self.parallel_config, self.rank,
-                                      self.distributed_init_method)
-
+        init_distributed_environment(self.parallel_config, self.rank,
+                                     self.distributed_init_method)
+        if not self.parallel_config.disable_custom_all_reduce:
+            init_custom_ar()
         # Initialize the model.
         set_random_seed(self.model_config.seed)
-
-        # <jinzhi> Support layer param cached in other GPUs----------------------------
-        # import ray
-        print(f'In init_model: os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}') #, ray.get_gpu_ids():{ray.get_gpu_ids()}')
-        # # remaining_gpus = [i for i in range(torch.cuda.device_count()) if str(i) not in os.environ["CUDA_VISIBLE_DEVICES"]]
-        # worker_num = self.parallel_config.world_size
-        # # set the visible devices to all the available gpus
-        # cache_gpu_num = (torch.cuda.device_count() - worker_num) // worker_num
-        # cache_gpus = remaining_gpus[cache_gpu_num*local_rank : cache_gpu_num*(local_rank+1)]
-        # print(f"remaining_gpus:{remaining_gpus}, cache_gpu_num:{cache_gpu_num}, cache_gpus:{cache_gpus}, local_rank:{local_rank}")
-        # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]+','+','.join(str(i) for i in cache_gpus)
-        # print(f'In init_model (end): os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}')
-        # -----------------------------------------------------------------------------
 
 
 
@@ -125,6 +137,8 @@ class Worker:
         from vllm._C import cache_ops
         for cache_device_i in self.model_runner.model.model.cache_device_ids:        
             cache_ops.disable_P2P_access(cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
+
+
 
 
 
@@ -137,11 +151,19 @@ class Worker:
         block_size: int,
         gpu_memory_utilization: float,
         cpu_swap_space: int,
+        cache_dtype: str,
     ) -> Tuple[int, int]:
+        """Profiles the peak memory usage of the model and returns the maximum
+        number of GPU and CPU cache blocks that can be allocated.
+
+        Args:
+            block_size: The size of the cache block.
+            gpu_memory_utilization: The fraction of the total GPU memory to use.
+            cpu_swap_space: The size of the CPU swap space in bytes.
+        """
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -150,11 +172,12 @@ class Worker:
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         torch.cuda.synchronize()
-        peak_memory = torch.cuda.max_memory_allocated()
-        total_gpu_memory = get_gpu_memory()
+        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        peak_memory = total_gpu_memory - free_gpu_memory
+
         cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, self.model_config, self.parallel_config)
-        
+            block_size, cache_dtype, self.model_config, self.parallel_config)
+
 
         # <jingzhi> store the information of cache_block_size in class 
         KVBlkPerLayerWeight.block_size = cache_block_size
@@ -172,16 +195,15 @@ class Worker:
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
+        if self.model_runner.lora_manager:
+            self.model_runner.remove_all_loras()
+        gc.collect()
         torch.cuda.empty_cache()
-
-        # Reset the seed to ensure that the random state is not affected by
-        # the model initialization and profiling.
-        set_random_seed(self.model_config.seed)
-        
-        
         # return num_gpu_blocks, num_cpu_blocks
+
         # <jingzhi> also return the information of KVBlkPerLayerWeight
         return num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+
 
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
@@ -193,23 +215,27 @@ class Worker:
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
         # <jingzhi> support dynamically increasing on-card layer weights
+        print(f"self.cache_engine.continuous_gpu_cache:{self.cache_engine.continuous_gpu_cache}")
         if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
-            self.model_runner.init_extra_weight_cache_from_KV_cache(self.gpu_cache)
+            self.model_runner.init_extra_weight_cache_from_KV_cache([self.cache_engine.continuous_gpu_cache])
 
-    @torch.inference_mode()
-    def execute_model(
+
+    def warm_up_model(self) -> None:
+        if not self.model_config.enforce_eager:
+            self.model_runner.capture_model(self.gpu_cache)
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+
+    def cache_swap(
         self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
-        # <jingzhi> added parameter: support dynamically increasing on-card layer weights
-        load_more_layer_on_card_num: int,
-    ) -> SamplerOutput:
-        
-        # <jingzhi> update KVBlkPerLayerWeight when there are multiple workers
-        KVBlkPerLayerWeight.load_more_layer_on_card_num = load_more_layer_on_card_num
-
+        # <jingzhi> added parameters
+        blocks_to_reorganize: Dict[int, List[int]],
+        blk_num_reduced: int,
+    ) -> None:
         # Issue cache operations.
         issued_cache_op = False
         if blocks_to_swap_in:
@@ -222,21 +248,90 @@ class Worker:
             self.cache_engine.copy(blocks_to_copy)
             issued_cache_op = True
 
+
+        # <jingzhi>
+        if blocks_to_reorganize:
+            self.cache_engine.reorganize_blocks(blocks_to_reorganize, blk_num_reduced)
+            issued_cache_op = True
+
+
         cache_events = self.cache_events if issued_cache_op else None
 
+        # Wait for cache operations to finish.
+        # TODO(woosuk): Profile swapping overhead and optimize if needed.
+        if cache_events is not None:
+            for event in cache_events:
+                event.wait()
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
+        blocks_to_swap_in: Optional[Dict[int, int]] = None,
+        blocks_to_swap_out: Optional[Dict[int, int]] = None,
+        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+
+        # <jingzhi> added parameter: support dynamically increasing on-card layer weights
+        load_more_layer_on_card_num: int = 0,
+        blocks_to_reorganize: Optional[Dict[int, List[int]]] = None,
+
+    ) -> Optional[SamplerOutput]:
+        if self.is_driver_worker:
+            assert seq_group_metadata_list is not None
+            num_seq_groups = len(seq_group_metadata_list)
+            assert blocks_to_swap_in is not None
+            assert blocks_to_swap_out is not None
+            assert blocks_to_copy is not None
+            assert blocks_to_reorganize is not None
+            data = {
+                "num_seq_groups": num_seq_groups,
+                "blocks_to_swap_in": blocks_to_swap_in,
+                "blocks_to_swap_out": blocks_to_swap_out,
+                "blocks_to_copy": blocks_to_copy,
+                # <jingzhi> added dict content
+                "blocks_to_reorganize": blocks_to_reorganize,
+                "load_more_layer_on_card_num": load_more_layer_on_card_num,
+            }
+            broadcast_tensor_dict(data, src=0)
+        else:
+            data = broadcast_tensor_dict(src=0)
+            num_seq_groups = data["num_seq_groups"]
+            blocks_to_swap_in = data["blocks_to_swap_in"]
+            blocks_to_swap_out = data["blocks_to_swap_out"]
+            blocks_to_copy = data["blocks_to_copy"]
+
+            # <jingzhi>
+            blocks_to_reorganize = data["blocks_to_reorganize"]
+            load_more_layer_on_card_num = data["load_more_layer_on_card_num"]
+
+
+        # TODO (jingzhi) check the correctness when there is driver worker
+        # <jingzhi> update KVBlkPerLayerWeight when there are multiple workers
+        KVBlkPerLayerWeight.load_more_layer_on_card_num = load_more_layer_on_card_num
+        blk_num_reduced = KVBlkPerLayerWeight.blk_num_per_layer * load_more_layer_on_card_num
+
+
+        self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy, blocks_to_reorganize, blk_num_reduced)
+
         # If there is no input, we don't need to execute the model.
-        if not seq_group_metadata_list:
-            if cache_events is not None:
-                for event in cache_events:
-                    event.wait()
+        if num_seq_groups == 0:
             return {}
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache, cache_events)
+                                                 self.gpu_cache)
         return output
 
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
 
-def _init_distributed_environment(
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)
+
+    def list_loras(self) -> Set[int]:
+        return self.model_runner.list_loras()
+
+
+def init_distributed_environment(
     parallel_config: ParallelConfig,
     rank: int,
     distributed_init_method: Optional[str] = None,
@@ -261,13 +356,10 @@ def _init_distributed_environment(
             init_method=distributed_init_method,
         )
 
-
-    print(f"world size: {parallel_config.world_size}, rank: {rank}, init_method: {distributed_init_method}")
-
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
-    initialize_model_parallel(parallel_config.tensor_parallel_size,
-                              parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
+                                      parallel_config.pipeline_parallel_size)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
@@ -279,4 +371,6 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
             raise ValueError(
                 "Bfloat16 is only supported on GPUs with compute capability "
                 f"of at least 8.0. Your {gpu_name} GPU has compute capability "
-                f"{compute_capability[0]}.{compute_capability[1]}.")
+                f"{compute_capability[0]}.{compute_capability[1]}. "
+                "You can use float16 instead by explicitly setting the"
+                "`dtype` flag in CLI, for example: --dtype=half.")

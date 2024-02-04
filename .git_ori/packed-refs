@@ -1,16 +1,21 @@
-# pack-refs with: peeled fully-peeled 
+# pack-refs with: peeled fully-peeled sorted 
 a44bcf5c66c27c9eb8e0037cee8d6d301369ec38 refs/remotes/origin/benchmark-mii
+7cba15443b6f7d5c4307a1daa213fd1905ed9b58 refs/remotes/origin/bump-up-version-030
 c2b7615f024f6f2a43c9c501516802d76adde3e8 refs/remotes/origin/cuda-graph
+9a561cc798b178e1dbf4f0cf9565dcc76126434f refs/remotes/origin/cutlass-moe
 5fa4e9986d39434a2646eb56dbe0172f71cc6cd6 refs/remotes/origin/fix-class-naming
 b60fd16791e8e27f13b8a53d9c45203dbff923f7 refs/remotes/origin/fix-main-format
-f1805b94df8899e10f5180c04fd958f5fa8caa5a refs/remotes/origin/graph
+c5e7e087d2895db4af801f4e3a38da0cc893c7a2 refs/remotes/origin/fix-nvcc-threads
 07e9197014ce0dbbbd7015fe765ab92159dee492 refs/remotes/origin/longchat-test
-2e8fc0d4c3bf8374f1f55569069e59ef45d4bc98 refs/remotes/origin/main
+4abf6336ec65c270343eb895e7b18786e9274176 refs/remotes/origin/main
 b9d785a66a9e88d38d80922526bc576766f54488 refs/remotes/origin/minimal-gptq
 ba5d161d185721b5fe91ff91e874850327b9d2ba refs/remotes/origin/pa-1d
 0407c1ba0097583e0e67c9b22ac6edbaa8386661 refs/remotes/origin/paged-attn
-ad470e56d5dcc3e9bed381b87935d4232ccb3422 refs/remotes/origin/qmm
+f0f8f669245f63be664d4384ffb23a5c771bb1f6 refs/remotes/origin/prefix-caching-old
+08e9f3ac910c7183c59ade07b9a777ee2a5ca668 refs/remotes/origin/qmm
+ddb07955419447d8b568dce6c3f6d7a0787e2f93 refs/remotes/origin/remove-serialization-overhead
 4124386cc9625e5f0e1e244ec2098c0c5aef64d7 refs/remotes/origin/rope-fp32
+665042be7ea6e5fc832ca572b56101e9e1e5c1c9 refs/remotes/origin/simplify-control-broadcast
 c149a9819c2f83c2b8850c79d54e014d4f27e836 refs/remotes/origin/test-acc
 f474b4bd22408ed625b6b3313b31d0dea60f2639 refs/remotes/origin/torch-compile
 a91a7a4adfab51b490325f7424f5550e3cb4c4ba refs/remotes/origin/torch-compile2
@@ -29,3 +34,8 @@ e2fb71ec9f2c3168ba8614408fa807a5f65707c5 refs/tags/v0.2.0
 3d40c834f020a0d180a0af49bf25ffa9b22fa84b refs/tags/v0.2.1.post1
 c5f7740d89737744438e08c26da1d4fbadcb3893 refs/tags/v0.2.2
 0f90effc660317070b88b860eda76bfb3b596701 refs/tags/v0.2.3
+4dd4b5c538dabcf2c822bc91b4f760364520e5af refs/tags/v0.2.4
+31c1f3255ee9771538da138396e1a50e369f8723 refs/tags/v0.2.5
+671af2b1c0b3ed6d856d37c21a561cc429a10701 refs/tags/v0.2.6
+2e0b6e775756345aa1d39f772c186e00f8c29e92 refs/tags/v0.2.7
+1af090b57d0e23d268e79941f8084bf0a8ad8621 refs/tags/v0.3.0

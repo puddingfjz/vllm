@@ -182,6 +182,10 @@ _build/
 *.hip
 *_hip*
 
+# Benchmark dataset
+*.json
+
+
 
 # dataset files
 /benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json
@@ -189,3 +193,4 @@ _build/
 
 # nsys profiling files
 /benchmarks/nsys_profile/
+/benchmarks/figures/

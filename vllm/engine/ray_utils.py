@@ -1,17 +1,15 @@
-import socket
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Optional, List, Tuple, TYPE_CHECKING
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
-from vllm.utils import is_hip
+from vllm.utils import is_hip, set_cuda_visible_devices, get_ip
 
 logger = init_logger(__name__)
 
 try:
     import ray
-    from ray.air.util.torch_dist import TorchDistributedWorker
 
-    class RayWorkerVllm(TorchDistributedWorker):
+    class RayWorkerVllm:
         """Ray wrapper for vllm.worker.Worker, allowing Worker to be
         lazliy initialized after Ray sets CUDA_VISIBLE_DEVICES."""
 
@@ -31,29 +29,33 @@ try:
             executor = getattr(self, method)
             return executor(*args, **kwargs)
 
+        def get_node_ip(self) -> str:
+            return get_ip()
+
+        def get_node_and_gpu_ids(self) -> Tuple[str, List[int]]:
+            node_id = ray.get_runtime_context().get_node_id()
+            gpu_ids = ray.get_gpu_ids()
+            return node_id, gpu_ids
+
+        def set_cuda_visible_devices(self, device_ids) -> None:
+            set_cuda_visible_devices(device_ids)
+
 except ImportError as e:
     logger.warning(f"Failed to import Ray with {e!r}. "
                    "For distributed inference, please install Ray with "
-                   "`pip install ray pandas pyarrow`.")
+                   "`pip install ray`.")
     ray = None
-    TorchDistributedWorker = None
     RayWorkerVllm = None
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
 
-def get_open_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def initialize_cluster(
     parallel_config: ParallelConfig,
     engine_use_ray: bool = False,
     ray_address: Optional[str] = None,
-) -> Tuple[str, Optional["PlacementGroup"]]:
+) -> Optional["PlacementGroup"]:
     """Initialize the distributed cluster probably with Ray.
 
     Args:
@@ -63,10 +65,9 @@ def initialize_cluster(
             the default Ray cluster address.
 
     Returns:
-        A tuple of (`distributed_init_method`, `placement_group`). The
-        `distributed_init_method` is the address for initializing the
-        distributed backend. `placement_group` includes the specification
-        of the resources for each distributed worker.
+        An optional `PlacementGroup`. It includes the specification
+        of the resources for each distributed worker. None if Ray is
+        not used.
     """
     if parallel_config.worker_use_ray or engine_use_ray:
         if ray is None:
@@ -78,34 +79,16 @@ def initialize_cluster(
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
                      num_gpus=parallel_config.world_size)
-
-            # <jingzhi>
-            print(f"is hip-------")
-
         else:
             ray.init(address=ray_address, ignore_reinit_error=True)
 
-
-            # <jingzhi>
-            print(f"not hip-------")
-
     if not parallel_config.worker_use_ray:
-        # Initialize cluster locally.
-        port = get_open_port()
-        # We need to setup the distributed init method to make sure
-        # the distributed megatron code (e.g., get world size) works correctly.
-        distributed_init_method = f"tcp://localhost:{port}"
-        return distributed_init_method, None
+        assert parallel_config.world_size == 1, (
+            "Ray is required if parallel_config.world_size > 1.")
+        return None
 
-
-    # <jingzhi>
-    print(f"parallel_config.worker_use_ray: {parallel_config.worker_use_ray}")
-
-
+    # Create placement group for worker processes
     current_placement_group = ray.util.get_current_placement_group()
-
-    print(f"current_placement_group: {current_placement_group}")
-
     if current_placement_group:
         # We are in a placement group
         bundles = current_placement_group.bundle_specs
@@ -125,10 +108,8 @@ def initialize_cluster(
     else:
         num_gpus_in_cluster = ray.cluster_resources().get("GPU", 0)
 
-
         # <jingzhi>
         print(f'num_gpus_in_cluster: {num_gpus_in_cluster}, parallel_config.world_size: {parallel_config.world_size}')
-
 
         if parallel_config.world_size > num_gpus_in_cluster:
             raise ValueError(
@@ -142,23 +123,29 @@ def initialize_cluster(
         # current_placement_group = ray.util.placement_group([{
         #     "GPU": gpu_num_per_worker # 1
         # }] * parallel_config.world_size)
-
-        current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster))
+        current_placement_group = None
+        import os
+        if os.environ['USE_VLLM']=='True':
+            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster))
         # ------------------------------------------------------------------------
+        else:
+            placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)
+            current_placement_group = ray.util.placement_group(
+                placement_group_specs)
 
-        # current_placement_group = ray.util.placement_group([{
-        #     "GPU": 1
-        # }] * parallel_config.world_size)
-        
+
+
+        # placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)
+        # current_placement_group = ray.util.placement_group(
+        #     placement_group_specs)
+
+
         # Wait until PG is ready - this will block until all
         # requested resources are available, and will timeout
         # if they cannot be provisioned.
         ray.get(current_placement_group.ready(), timeout=1800)
 
-    return None, current_placement_group
-
-
-
+    return current_placement_group
 
 
 

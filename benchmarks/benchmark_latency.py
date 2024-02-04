@@ -23,6 +23,9 @@ def main(args: argparse.Namespace):
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
         dtype=args.dtype,
+        enforce_eager=args.enforce_eager,
+        kv_cache_dtype=args.kv_cache_dtype,
+        device=args.device,
     )
 
     sampling_params = SamplingParams(
@@ -64,7 +67,9 @@ def main(args: argparse.Namespace):
     if args.profile:
         profile_dir = args.profile_result_dir
         if not profile_dir:
-            profile_dir = Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
+            profile_dir = Path(
+                "."
+            ) / "vllm_benchmark_result" / f"latency_result_{time.time()}"
         print(f"Profiling (results will be saved to '{profile_dir}')...")
         run_to_completion(profile_dir=args.profile_result_dir)
         return
@@ -72,7 +77,7 @@ def main(args: argparse.Namespace):
     # Benchmark.
     latencies = []
     for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
-        latencies.append(run_to_completion(profile=False))
+        latencies.append(run_to_completion(profile_dir=None))
     print(f'Avg latency: {np.mean(latencies)} seconds')
 
 
@@ -84,7 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--tokenizer', type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
-                        choices=['awq', 'squeezellm', None],
+                        choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
     parser.add_argument('--tensor-parallel-size', '-tp', type=int, default=1)
     parser.add_argument('--input-len', type=int, default=32)
@@ -111,6 +116,16 @@ if __name__ == '__main__':
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument('--enforce-eager',
+                        action='store_true',
+                        help='enforce eager mode and disable CUDA graph')
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=['auto', 'fp8_e5m2'],
+        default='auto',
+        help=
+        'Data type for kv cache storage. If "auto", will use model data type.')
     parser.add_argument(
         '--profile',
         action='store_true',
@@ -119,9 +134,13 @@ if __name__ == '__main__':
         '--profile-result-dir',
         type=str,
         default=None,
-        help=(
-            'path to save the pytorch profiler output. Can be visualized '
-            'with ui.perfetto.dev or Tensorboard.'
-        ))
+        help=('path to save the pytorch profiler output. Can be visualized '
+              'with ui.perfetto.dev or Tensorboard.'))
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda"],
+        help='device type for vLLM execution, supporting CUDA only currently.')
     args = parser.parse_args()
     main(args)

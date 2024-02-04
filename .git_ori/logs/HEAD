@@ -1,1 +1,2 @@
-0000000000000000000000000000000000000000 2e8fc0d4c3bf8374f1f55569069e59ef45d4bc98 FANG Jingzhi <jfangak@lccpu27.cse.ust.hk> 1702277622 +0800	clone: from https://github.com/vllm-project/vllm.git
+0000000000000000000000000000000000000000 4abf6336ec65c270343eb895e7b18786e9274176 FANG Jingzhi <jfangak@lccpu28.cse.ust.hk> 1706970384 +0800	clone: from https://github.com/vllm-project/vllm.git
+4abf6336ec65c270343eb895e7b18786e9274176 e86b7410d211259e5b53983cb7d89de2167bbbc6 FANG Jingzhi <jfangak@lccpu28.cse.ust.hk> 1707055777 +0800	commit: [New Code from vLLM] + [Reorganize KV Cache instead of changing KV layout to make space for model weights]

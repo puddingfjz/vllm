@@ -38,19 +38,15 @@ from vllm.model_executor.layers.linear import (LinearMethodBase,
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding, ParallelLMHead)
+    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+from vllm.config import LoRAConfig
 
-
-
-
-# import ray
-# import ray.util.collective as collective
 
 # <jingzhi>
 from vllm._C import cache_ops
@@ -58,11 +54,7 @@ import time
 import os
 
 
-
-
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-    KVCache = torch.Tensor
 
 
 class LlamaMLP(nn.Module):
@@ -106,16 +98,10 @@ class LlamaAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         linear_method: Optional[LinearMethodBase] = None,
-        # added parameters
-        layer_i: int = -1
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-
-
-        print(f"tp_size in LlamaAttention: {tp_size}")
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -161,58 +147,7 @@ class LlamaAttention(nn.Module):
         self.attn = PagedAttention(self.num_heads,
                                    self.head_dim,
                                    self.scaling,
-                                   num_kv_heads=self.num_kv_heads,
-                                   layer_i=layer_i)
-        
-
-        # <jingzhi> support dynamically increasing the on-card layer weights
-        self.change_KV_layout = False
-        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-            self.change_KV_layout = True
-
-    def forward_vllm(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     print(f"qkv: {q, k, v}")
-
-
-
-        q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
-                                cache_event)
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     # print(f"attn_output: {attn_output}")
-        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
-        #         f.write(f"attn_output: {attn_output}\n")
-
-        output, _ = self.o_proj(attn_output)
-
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 1:
-        #     print(f"o_proj: {output}")
-            # print(f"o_proj weights: {self.o_proj.linear_weights}")
-        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
-        #         f.write(f"o_proj: {output}\n")
-
-
-        return output
-    
-
-
+                                   num_kv_heads=self.num_kv_heads)
 
     def forward(
         self,
@@ -220,49 +155,14 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     print(f"qkv: {q, k, v}")
-
-
-
         q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = None
-        if self.change_KV_layout:
-            # the KV layout is changed to [# block, # layer, key or value, the space for (a layer of a block)]
-            attn_output = self.attn(q, k, v, kv_cache, kv_cache, input_metadata,
-                                    cache_event)
-        else:    
-            k_cache, v_cache = kv_cache
-            attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
-                                    cache_event)
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     # print(f"attn_output: {attn_output}")
-        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
-        #         f.write(f"attn_output: {attn_output}\n")
-
+        k_cache, v_cache = kv_cache
+        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.o_proj(attn_output)
-
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 1:
-        #     print(f"o_proj: {output}")
-            # print(f"o_proj weights: {self.o_proj.linear_weights}")
-        #     with open(f'outputtt_{int(os.getenv("LOCAL_RANK", "0"))}', 'a') as f:
-        #         f.write(f"o_proj: {output}\n")
-
-
         return output
-
-
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -271,8 +171,6 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        # added parameters
-        layer_i: int = -1
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -288,7 +186,6 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
-            layer_i=layer_i
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -307,7 +204,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -317,37 +213,17 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     print(f"hidden_states before attn: {hidden_states}, {residual}")
-
-
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             input_metadata=input_metadata,
-            cache_event=cache_event,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     print(f"hidden_states after attn: {hidden_states}, {residual}")
-
-
         hidden_states = self.mlp(hidden_states)
-
-
-        # <jingzhi>
-        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
-        #     print(f"hidden_states after mlp: {hidden_states}")
-
-
         return hidden_states, residual
 
 
@@ -357,26 +233,27 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        lora_vocab = (lora_config.lora_extra_vocab_size *
+                      (lora_config.max_loras or 1)) if lora_config else 0
+        self.vocab_size = config.vocab_size + lora_vocab
+        self.org_vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
+            self.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
         )
-        # self.layers = nn.ModuleList([
-        #     LlamaDecoderLayer(config, linear_method)
-        #     for _ in range(config.num_hidden_layers)
-        # ])
-        # store layer_i information in the layer
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method, layer_i)
-            for layer_i in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, linear_method)
+            for _ in range(config.num_hidden_layers)
         ])
-
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
 
 
 
@@ -391,7 +268,8 @@ class LlamaModel(nn.Module):
 
         self.set_cache_device_ids()
 
-        print(f'In model, os.environ["LOCAL_RANK"]:{os.getenv("LOCAL_RANK", "0")}, all card num: {torch.cuda.device_count()}, worker_num:{torch.distributed.get_world_size()}, os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}, os.environ["TOT_ORDERED_GPUS"]:{os.environ["TOT_ORDERED_GPUS"]}  current_device: {torch.cuda.current_device()}, self.cache_device_ids: {self.cache_device_ids}')
+        # print(f'In model, os.environ["LOCAL_RANK"]:{os.getenv("LOCAL_RANK", "0")}, all card num: {torch.cuda.device_count()}, worker_num:{torch.distributed.get_world_size()}, os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}, os.environ["TOT_ORDERED_GPUS"]:{os.environ["TOT_ORDERED_GPUS"]}  current_device: {torch.cuda.current_device()}, self.cache_device_ids: {self.cache_device_ids}')
+        print(f'In model, os.environ["LOCAL_RANK"]:{os.getenv("LOCAL_RANK", "0")}, all card num: {torch.cuda.device_count()}, worker_num:{torch.distributed.get_world_size()}, os.environ["CUDA_VISIBLE_DEVICES"]: {os.environ["CUDA_VISIBLE_DEVICES"]}, current_device: {torch.cuda.current_device()}, self.cache_device_ids: {self.cache_device_ids}')
 
         # Initialize the stream for loading parameters.
         # self.param_stream = torch.cuda.Stream()
@@ -432,9 +310,7 @@ class LlamaModel(nn.Module):
         self.extra_weight_cache: Dict[int, torch.Tensor] = dict()
         self.extra_weight_cache_blk_i = self.weight_cache_block_num
 
-        self.change_KV_layout = False
-        if os.environ['CHANGE_KV_LAYOUT'] == 'True':
-            self.change_KV_layout = True
+
 
         # example: if totally 5 layers, the cache blk num is 3, then l0 -> blk0, l1 -> blk1, l2 -> blk2, l3->blk0, l4->blk1
         # self.weight_cache_block_idx: List[int] = list(range(self.weight_cache_block_num)) \
@@ -474,34 +350,9 @@ class LlamaModel(nn.Module):
         # ======================================================================
 
 
-    # <jingzhi>
-    def set_cache_device_ids_old(self):
-        '''
-        Set the cache_device_ids automatically.
-        Policy: given all the visible GPUs, the first worker_num GPUs is for computation (each for a worker), 
-                while the remaining GPUs are split and assigned to the workers as cache.
-        '''
-        # consider when there are multiple workers due to parallelism
-        worker_num = torch.distributed.get_world_size()
-        cache_gpu_num = (torch.cuda.device_count() - worker_num) // worker_num
-        # we need do cuda order remapping because ray would mess it up
-        # self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
-        if worker_num == 1:
-            self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
-        else:
-            cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
-            cand_cache_device_ids = list()
-            current_device_names_ordered = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
-            for cuda_name in cand_cache_device_names:
-                for i, to_check in enumerate(current_device_names_ordered):
-                    if cuda_name == to_check:
-                        cand_cache_device_ids.append(i)
-                        break
-            self.cache_device_ids = cand_cache_device_ids[int(os.environ["LOCAL_RANK"])*cache_gpu_num:(int(os.environ["LOCAL_RANK"])+1)*cache_gpu_num]
-
 
     # <jingzhi>
-    def set_cache_device_ids(self):
+    def set_cache_device_ids(self) -> None:
         '''
         Set the cache_device_ids automatically.
         Policy: given all the visible GPUs, the first worker_num GPUs is for computation (each for a worker), 
@@ -516,6 +367,10 @@ class LlamaModel(nn.Module):
             # we deal with it seperately
             self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
         else:
+            # in the latest vllm code, we already make worker's visible gpus in the same order as in the main process
+            self.cache_device_ids = list(range(worker_num, worker_num+cache_gpu_num))
+            return
+            # 
             cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
             cand_cache_device_ids = list()
             current_device_names_ordered = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
@@ -528,16 +383,12 @@ class LlamaModel(nn.Module):
 
 
 
-
-
-
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         
         # # <jingzhi> For DEBUG
@@ -550,9 +401,9 @@ class LlamaModel(nn.Module):
 
 
         if self.use_vllm:
-            return self.forward_ori(input_ids, positions, kv_caches, input_metadata, cache_events)
+            return self.forward_ori(input_ids, positions, kv_caches, input_metadata)
         else:
-            return self.forward_ours(input_ids, positions, kv_caches, input_metadata, cache_events)
+            return self.forward_ours(input_ids, positions, kv_caches, input_metadata)
 
 
 
@@ -563,24 +414,20 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
-            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i] if (not self.change_KV_layout) else kv_caches[0], # kv_caches[i],
+                kv_caches[i],
                 input_metadata,
-                cache_event,
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
 
 
 
@@ -596,7 +443,8 @@ class LlamaModel(nn.Module):
         # KVBlkPerLayerWeight.cached_layer_num will remain 0 after we load all layers on card, so the code is wrong
         # more_layer_num = self.layer_num - self.weight_cache_block_num - KVBlkPerLayerWeight.cached_layer_num
         more_layer_num = KVBlkPerLayerWeight.load_more_layer_on_card_num
-        KVBlkPerLayerWeight.cached_layer_num = KVBlkPerLayerWeight.cached_layer_num - more_layer_num
+        # the driver worker should not update cached_layer_num again
+        # KVBlkPerLayerWeight.cached_layer_num = KVBlkPerLayerWeight.cached_layer_num - more_layer_num
 
         if more_layer_num == 0:
             # we do not need to keep more layer weights on the comp card
@@ -609,8 +457,8 @@ class LlamaModel(nn.Module):
         # self.pipeline_degree = (self.layer_num + self.pipeline_inteval - 1) // self.pipeline_inteval # get the interval number
 
         # <jingzhi> For DEBUG
-        if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num Invalid:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}", flush=True)
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        print(f"In pre_increase_oncard_layers: self.layer_num:{self.layer_num}, self.weight_cache_block_num:{self.weight_cache_block_num}, KVBlkPerLayerWeight.cached_layer_num Invalid:{KVBlkPerLayerWeight.cached_layer_num}, more_layer_num:{more_layer_num}, self.pipeline_degree:{self.pipeline_degree}, self.new_pipeline_degree:{self.new_pipeline_degree}, self.new_pipeline_interval:{self.new_pipeline_interval}", flush=True)
 
         # TODO (jingzhi): we currently assume layer_num % pipeline_degree == 0
         # 如果pipeline degree不整除layer_num的话，这里的写法太复杂了。暂时没想好应该怎么写。其实可以写成 pipeline_inteval = layer_num // pipeline_degree
@@ -648,9 +496,9 @@ class LlamaModel(nn.Module):
                             ((layer_i//self.new_pipeline_interval)%2) * (self.weight_cache_block_num - 1)
 
         # <jingzhi> For DEBUG
-        if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, self.extra_weight_cache_blk_i:{self.extra_weight_cache_blk_i}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
-            print(max(self.weight_cache_block_idx), max(self.extra_weight_cache))
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        print(f"self.weight_cache_block_num: {self.weight_cache_block_num}, self.extra_weight_cache_blk_i:{self.extra_weight_cache_blk_i}, In pre_increase_oncard_layers: {self.weight_cache_block_idx}")
+        print(max(self.weight_cache_block_idx), max(self.extra_weight_cache))
         # if max(self.weight_cache_block_idx) > max(self.extra_weight_cache):
         #     assert False
         # update KVBlkPerLayerWeight.load_more_layer_on_card_num --> we will reset KVBlkPerLayerWeight.load_more_layer_on_card_num in llm_engine.step()
@@ -682,7 +530,6 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -726,14 +573,12 @@ class LlamaModel(nn.Module):
             #     print(param)
 
 
-            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i] if (not self.change_KV_layout) else kv_caches[0], # kv_caches[i]
+                kv_caches[i],
                 input_metadata,
-                cache_event,
                 residual,
             )
 
@@ -784,96 +629,6 @@ class LlamaModel(nn.Module):
         self.post_increase_oncard_layers()
 
         return hidden_states
-
-
-
-
-    def load_layer_params_deprecated(self, layer_i:int, dst_weight_blk_idx:int, replace_layer_i:int):
-        # param_event = self.load_param_events[layer_i]
-
-        # # print(f"to load later {layer_i} into layer {replace_layer_i}, dst_weight_blk_idx: {dst_weight_blk_idx}")
-        # # print(self.weight_cache_cpu[layer_i])
-
-        # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
-
-        # with torch.cuda.stream(self.param_stream):
-        #     # self.weight_cache[dst_weight_blk_idx].copy_(self.weight_cache_cpu[layer_i], non_blocking=True)
-        #     # use nvlink to copy from another device
-        #     for part_i, cache_device_i in enumerate(self.cache_device_ids):
-        #         cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.weight_cache[dst_weight_blk_idx][part_i],
-        #             layer_i, cache_device_i, 0, 0)
-        #     param_event.record(stream=self.param_stream)
-
-        # consider we have multiple GPUs as cache============================================================
-        
-        # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
-
-        for part_i, cache_device_i in enumerate(self.cache_device_ids):
-            param_event = self.load_param_events[part_i][layer_i]
-            # use nvlink to copy from another device
-            with torch.cuda.stream(self.param_streams[part_i]):
-                cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.weight_cache[dst_weight_blk_idx][part_i],
-                    layer_i, cache_device_i, 0, 0)
-                param_event.record(stream=self.param_streams[part_i])
-
-
-        # if only allow one layer on CPU, no need to update the param tensor address
-        return
-
-        # update param tensor address if necessary
-        if self.layer_num % self.weight_cache_block_num == 0:
-            return
-
-        # change the param tensor address
-        self.weight_cache_block_idx[layer_i] = dst_weight_blk_idx
-        for param, to_replace in zip(self.layer_params[layer_i], self.layer_params[replace_layer_i]):
-            param.data = to_replace.data
-
-
-
-
-
-
-    def load_layer_params_given_last_layer(self, layer_i:int, last_layer_i:int):
-
-        # consider we have multiple GPUs as cache============================================================
-        
-        # print(f"loading layer weights: {self.weight_cache_cpu[layer_i][0].element_size(), self.weight_cache_cpu[layer_i][0].numel()}, {len(self.weight_cache_cpu), len(self.weight_cache_cpu[layer_i]), self.weight_cache_cpu[layer_i][0].shape, self.weight_cache_cpu[layer_i][0].dtype}")
-
-        dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
-        last_layer_weight_blk_idx = self.weight_cache_block_idx[last_layer_i]
-        if dst_weight_blk_idx == last_layer_weight_blk_idx:
-            # we need to load layer weight in another buffer
-            self.weight_cache_block_idx[layer_i] = self.weight_cache_block_num - 1 - dst_weight_blk_idx
-            dst_weight_blk_idx = self.weight_cache_block_idx[layer_i]
-
-            for param, to_replace in zip(self.layer_params[layer_i], self.buffer_params[dst_weight_blk_idx]):
-                param.data = to_replace.data
-
-
-        # loading
-        last_last_layer_i = ((last_layer_i//self.pipeline_interval-1)%self.pipeline_degree)*self.pipeline_interval
-        for part_i, cache_device_i in enumerate(self.cache_device_ids):
-            param_event = self.load_param_events[part_i][layer_i]
-            to_synch_comp_event = self.synch_comp_events[part_i][last_last_layer_i]
-
-            # use nvlink to copy from another device
-            with torch.cuda.stream(self.param_streams[part_i]):
-
-                # the loading stream should wait the comp to finish
-                to_synch_comp_event.wait()
-
-                # in distributed inference, the current device may not be cuda:0
-                cache_ops.load_layer_weights( self.weight_cache_cpu[layer_i][part_i], self.weight_cache[dst_weight_blk_idx][part_i],
-                    layer_i, cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
-                param_event.record(stream=self.param_streams[part_i])
-
-
-        return
-
-
-
-
 
 
 
@@ -978,61 +733,34 @@ class LlamaModel(nn.Module):
             self.load_layer_params_when_dynamicIncreaseOnCardWeight(layer_i, last_last_layer_i)
 
 
-    # def init_param_loaders(self):
-    #     # imperative
-    #     num_workers = 2
-    #     workers = []
-    #     init_rets = []
-
-    #     # maybe the first solution to do initialization?
-    #     # for i in range(num_workers):
-    #     #    w = ParamLoader.remote()
-    #     #    workers.append(w)
-    #     #    init_rets.append(w.setup.remote(num_workers, i))
-    #     # _ = ray.get(init_rets)
-
-
-    #     # maybe the second solution to do initialization?
-    #     workers = [0, 0]
-    #     for i in range(num_workers):
-    #         w = ParamLoader.remote([self.weight_cache, self.weight_cache_spare_gpu])
-    #         workers[w.gpu_i] = w
-    #     _options = {
-    #         "group_name": "param_loading",
-    #         "world_size": 2,
-    #         "ranks": [0, 1],
-    #         "backend": "nccl"
-    #     }
-    #     # Put A and B in a collective group
-    #     collective.create_collective_group(workers, **_options)
-
-    #     self.param_loaders = workers
-
-
-
-
-    # def load_layer_weights(self, layer_i:int):
-    #     # let A to send a message to B; a send/recv has to be specified once at each worker
-    #     res_ref = [self.param_loaders[0].load_weights_from_gpu.remote(layer_i, 0), self.param_loaders[1].store_weights_to_gpu.remote(src_rank=1)]
-    #     return res_ref
-
-
-
 
 
 class LlamaForCausalLM(nn.Module):
+    supports_lora = True
 
     def __init__(
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = LlamaModel(config, linear_method)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.sampler = Sampler(config.vocab_size)
+        self.model = LlamaModel(config, linear_method, lora_config=lora_config)
+        unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.lm_head = ParallelLMHead(
+            unpadded_vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            padding_size=DEFAULT_VOCAB_PADDING_SIZE
+            # We need bigger padding if using lora for kernel
+            # compatibility
+            if not lora_config else lora_config.lora_vocab_padding_size,
+        )
+        self.sampler = Sampler(unpadded_vocab_size, config.vocab_size)
 
     def forward(
         self,
@@ -1040,15 +768,16 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
+
 
         # <jingzhi> For profiling
         torch.cuda.synchronize()
         time1 = time.perf_counter()
 
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata, cache_events)
+                                   input_metadata)
+        
 
         # <jingzhi> For profiling
         torch.cuda.synchronize()
@@ -1058,13 +787,14 @@ class LlamaForCausalLM(nn.Module):
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
             print(f"iter latency: {time2-time1}s abs: {time2}s")
 
+
         return hidden_states
 
     def sample(
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> SamplerOutput:
+    ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(self.lm_head.weight, hidden_states,
                                    sampling_metadata)
         return next_tokens
@@ -1100,10 +830,6 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
-
-            # <jingzhi> For Profiling
-            # print(f"layer info: {name, loaded_weight.shape, loaded_weight.device}")
-
             if "rotary_emb.inv_freq" in name:
                 continue
             if ("rotary_emb.cos_cached" in name
@@ -1114,35 +840,22 @@ class LlamaForCausalLM(nn.Module):
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-
-                # <jingzhi> For Profiling
-                # print(f"specific weight loader: {name.replace(weight_name, param_name), loaded_weight.shape, loaded_weight.device}")
-                param = params_dict[name.replace(weight_name, param_name)]
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-
-                # <jingzhi> For DEBUG
-                if int(os.getenv("LOCAL_RANK", "0")) == 0:
-                    print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device}")
-
                 break
             else:
-
-                # <jingzhi> For Profiling
-                # print(f"other weight loader: {name, loaded_weight.shape, loaded_weight.device}")
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-                # <jingzhi> For DEBUG
-                if int(os.getenv("LOCAL_RANK", "0")) == 0:
-                    print(f"param.data.data_ptr() of {name}: {param.data.data_ptr()}, shape: {param.data.shape} device: {param.data.device}")
-
-
-
-
-
 
 
 
@@ -1196,7 +909,14 @@ class LlamaForCausalLM(nn.Module):
                     ((self.get_layer_id_from_name(name)%self.model.pipeline_interval)!=0):
                     # if True:
                     # print('loading-----')
-                    param = params_dict[name.replace(weight_name, param_name)]
+                    # param = params_dict[name.replace(weight_name, param_name)]
+
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
 
@@ -1221,7 +941,13 @@ class LlamaForCausalLM(nn.Module):
                     ((self.get_layer_id_from_name(name)%self.model.pipeline_interval)!=0):
                     # if True:
                     # print('loading-----')
+                    # param = params_dict[name]
+                    
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
                     param = params_dict[name]
+
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
@@ -1236,9 +962,6 @@ class LlamaForCausalLM(nn.Module):
 
 
         print(f"weight_cache_cpu shape: {len(self.model.weight_cache_cpu), len(self.model.weight_cache_cpu[0]), self.model.weight_cache_cpu[0][0].shape}")
-
-
-
 
 
 
@@ -1305,6 +1028,9 @@ class LlamaForCausalLM(nn.Module):
                 # print(f"specific weight loader: {name.replace(weight_name, param_name), loaded_weight.shape, loaded_weight.device}")
 
                 full_para_name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if full_para_name.endswith(".bias") and full_para_name not in params_dict:
+                    continue                
                 param = params_dict[full_para_name]
 
                 # to avoid OOM
@@ -1328,6 +1054,8 @@ class LlamaForCausalLM(nn.Module):
 
                 # <jingzhi> For Profiling
                 # print(f"other weight loader: {name, loaded_weight.shape, loaded_weight.device}")
+                if name.endswith(".bias") and name not in params_dict:
+                    continue  
                 param = params_dict[name]
 
                 # to avoid OOM
@@ -1536,29 +1264,5 @@ class LlamaForCausalLM(nn.Module):
         # for convenience, we also store the weight cache block 0 and (self.model.weight_cache_block_num - 1) in extra_weight_cache
         self.model.extra_weight_cache[0] = self.model.weight_cache[0]
         self.model.extra_weight_cache[self.model.weight_cache_block_num - 1] = self.model.weight_cache[self.model.weight_cache_block_num - 1]
-
-
-
-# # define worker to transfer data between GPU 
-# # try to use Ray first to see performance
-# @ray.remote(num_gpus=1)
-# class ParamLoader:
-#     def __init__(self, weights_gpus):
-#         self.gpu_i = ray.get_gpu_ids()
-#         self.weights_gpu = weights_gpus[self.gpu_i[0]]
-
-
-#     # def setup(self, world_size, rank):
-#     #     collective.init_collective_group(world_size, rank, "nccl", "param_loading")
-#     #     return True
-
-#     def load_weights_from_gpu(self, layer_i, tgt_rank):
-#         collective.send(self.weights_gpu2[layer_i], tgt_rank, group_name="param_loading" )
-
-#     def store_weights_to_gpu(self, layer_i, src_rank):
-#         collective.recv(self.weights_gpu2[layer_i], tgt_rank, group_name="param_loading" )
-
-
-
 
 

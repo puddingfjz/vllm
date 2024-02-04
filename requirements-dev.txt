@@ -1,5 +1,6 @@
 # formatting
 yapf==0.32.0
+toml==0.10.2
 ruff==0.1.5
 
 # type checking
@@ -12,4 +13,9 @@ types-setuptools
 pytest
 pytest-forked
 pytest-asyncio
-
+httpx
+einops # required for MPT
+flash_attn # required for HuggingFace's llama implementation
+openai
+requests
+ray
