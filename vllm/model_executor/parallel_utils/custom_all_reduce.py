@@ -67,6 +67,14 @@ def get_handle() -> Optional["CustomAllreduce"]:
     return _CA_HANDLE
 
 
+
+# <jingzhi> support multi-model inference
+def delete_handle() -> None:
+    global _CA_HANDLE
+    _CA_HANDLE = None
+
+
+
 @contextmanager
 def capture():
     try:

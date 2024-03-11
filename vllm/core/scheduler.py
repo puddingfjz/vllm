@@ -45,7 +45,7 @@ class SchedulerOutputs:
         blocks_to_copy: Dict[int, List[int]],
         ignored_seq_groups: List[SequenceGroup],
         # <jingzhi> to reorganize the KV cache blocks to make space for model weights 
-        blocks_to_reorganize: Dict[int, List[int]] = dict(),
+        blocks_to_reorganize: Dict[int, List[int]],
     ) -> None:
         self.scheduled_seq_groups = scheduled_seq_groups
         self.prompt_run = prompt_run
@@ -179,6 +179,34 @@ class Scheduler:
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
 
+
+
+    # <jingzhi> to support multi-model inference
+    def get_unfinished_seqs(self) -> Deque[SequenceGroup]:
+        print(f"get_unfinished_seqs 1", flush=True)
+        unfinished_seqs: Deque[SequenceGroup] = deque()
+        unfinished_seqs.extend(self.running)
+        unfinished_seqs.extend(self.waiting)
+        unfinished_seqs.extend(self.swapped)
+        print(f"get_unfinished_seqs 2", flush=True)
+        self.move_all_unfinished_seqs_to_waiting(unfinished_seqs)
+        return unfinished_seqs
+
+
+    # <jingzhi> to support multi-model inference
+    def move_all_unfinished_seqs_to_waiting(
+        self,
+        seq_groups: Deque[SequenceGroup],
+    ) -> None:
+        # print(f"move_all_unfinished_seqs_to_waiting 1", flush=True)
+        for seq_group in seq_groups:
+            # print(f"move_all_unfinished_seqs_to_waiting 2 {seq_group}", flush=True)
+            seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+            assert len(seqs) <= 1, f"len(seqs): {len(seqs)}"
+            for seq in seqs:
+                seq.status = SequenceStatus.WAITING
+
+
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swaped or copied before model execution.
         blocks_to_swap_in: Dict[int, int] = {}
@@ -211,7 +239,7 @@ class Scheduler:
                     status=SequenceStatus.WAITING)
                 assert len(waiting_seqs) == 1, (
                     "Waiting sequence group should have only one prompt "
-                    "sequence.")
+                    "sequence.", seq_group, waiting_seqs) # <jingzhi> For DEBUG
                 num_prompt_tokens = waiting_seqs[0].get_len()
                 if num_prompt_tokens > self.prompt_limit:
                     logger.warning(
@@ -287,6 +315,7 @@ class Scheduler:
                     blocks_to_swap_out=blocks_to_swap_out,
                     blocks_to_copy=blocks_to_copy,
                     ignored_seq_groups=ignored_seq_groups,
+                    blocks_to_reorganize=dict(),
                 )
                 return scheduler_outputs
 
@@ -379,21 +408,32 @@ class Scheduler:
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
             ignored_seq_groups=[],
+            blocks_to_reorganize=dict(),
         )
         return scheduler_outputs
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
+
+        # <jingzhi> try reorganize blocks before schedule 
+        # as after scheduler there will be some new blocks allocated but without valid values
+        blocks_to_reorganize = dict()
+        # <jingzhi> support dynamically increasing on-card layer weights
+        if self.dynamic_increase_oncard_weights:
+            # if self.change_KV_layout:
+            #     self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_copy)
+            # else:
+            self.increase_layer_weight_on_comp_gpu(blocks_to_reorganize)
+
+
+
+
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
         scheduler_outputs = self._schedule()
 
         # <jingzhi> support dynamically increasing on-card layer weights
-        if self.dynamic_increase_oncard_weights:
-            # if self.change_KV_layout:
-            #     self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_copy)
-            # else:
-            self.increase_layer_weight_on_comp_gpu(scheduler_outputs.blocks_to_reorganize)
+        scheduler_outputs.blocks_to_reorganize = blocks_to_reorganize
 
 
 
@@ -590,10 +630,14 @@ class Scheduler:
         # now we can load all cached weights
         fromblknum_to_blknum = self.block_manager.reorganize_gpu_blocks(num_layers_to_load)
         print(f"fromblknum_to_blknum: {fromblknum_to_blknum}")
-        for from_blk_number, to_blk_number in fromblknum_to_blknum.items():
-            if from_blk_number in blocks_to_copy:
-                blocks_to_copy[from_blk_number].append(to_blk_number)
-            else:
-                blocks_to_copy[from_blk_number] = [to_blk_number]
-    
+        # for from_blk_number, to_blk_number in fromblknum_to_blknum.items():
+        #     if from_blk_number in blocks_to_copy:
+        #         blocks_to_copy[from_blk_number].append(to_blk_number)
+        #     else:
+        #         blocks_to_copy[from_blk_number] = [to_blk_number]
+
+        # get the from_blknum_to_blknum in the whole gpu kv cache, i.e., blk idx is the global idx.
+        chains, chain_lens = self.block_manager.get_dependent_blk_moving_chains(fromblknum_to_blknum)
+        blocks_to_copy[0] = chains
+        blocks_to_copy[1] = chain_lens
 

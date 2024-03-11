@@ -56,6 +56,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                                        input_size_per_partition,
                                        dtype=params_dtype),
                            requires_grad=False)
+        
+        # <jingzhi> For Profiling
+        # print(f"the device of weight: {weight.device}")
+
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         return {"weight": weight}
 

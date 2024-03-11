@@ -252,7 +252,8 @@ class ModelRunner:
         # if torch.cuda.current_device() == 0:
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
             print(f"prefilling: seq num: {len(prompt_lens_tensor)}, tot_tokens: {sum(prompt_lens_tensor),sum([_*_ for _ in prompt_lens_tensor])}")
-
+            # print(f"block_tables: {block_tables}")
+            # print(f"slot_mapping: {slot_mapping.tolist()}")
 
 
         input_metadata = InputMetadata(
@@ -389,6 +390,8 @@ class ModelRunner:
         # if torch.cuda.current_device() == 0:
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
             print(f"decoding: seq num: {len(context_lens)}, tot_tokens: {sum(context_lens)}")
+            # print(f"block_tables: {block_tables}")
+            # print(f"slot_mapping: {slot_mapping.tolist()}")
 
 
         input_metadata = InputMetadata(

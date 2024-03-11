@@ -13,6 +13,12 @@ logger = init_logger(__name__)
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
+
+# <jingzhi> 
+import os
+
+
+
 class CacheEngine:
     """Manages the KV cache.
 
@@ -47,7 +53,9 @@ class CacheEngine:
 
         # <jingzhi>
         self.continuous_gpu_cache = None
-        print(f"self.continuous_gpu_cache 1: {self.continuous_gpu_cache}")
+
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"self.continuous_gpu_cache 1: {self.continuous_gpu_cache}")
 
 
         # Initialize the cache.
@@ -61,7 +69,8 @@ class CacheEngine:
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
         # <jingzhi> added parameters
-        print(f"KV cache layout (when initialing it): {len(self.gpu_cache), len(self.gpu_cache[0]), len(self.gpu_cache[0][0])}")
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"KV cache layout (when initialing it): {len(self.gpu_cache), len(self.gpu_cache[0]), len(self.gpu_cache[0][0])}")
 
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
@@ -121,7 +130,9 @@ class CacheEngine:
             )
 
         self.continuous_gpu_cache = whole_cache
-        print(f"self.continuous_gpu_cache 2: {self.continuous_gpu_cache}")
+        
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"self.continuous_gpu_cache 2: {self.continuous_gpu_cache.shape}")
 
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
@@ -145,12 +156,12 @@ class CacheEngine:
     # <jingzhi> support all kinds of gpu cache allocation function
     def allocate_gpu_cache(self) -> List[KVCache]:
         # <jingzhi>
-        import os
-
-        print(f"os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']:{os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']}")
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']:{os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS']}")
 
         if (os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True'):
-            print(f"self.cache_engine.continuous_gpu_cache:{self.continuous_gpu_cache}")
+            if int(os.getenv("LOCAL_RANK", "0")) == 0:
+                print(f"self.cache_engine.continuous_gpu_cache:{self.continuous_gpu_cache}")
             return self.allocate_gpu_cache_continuous()
         else:
             return self.allocate_gpu_cache_vllm()
@@ -221,8 +232,13 @@ class CacheEngine:
     # <jingzhi> change the KV cache organization to make space for model weights
     def update_KV_cache_organization(self, block_num_reduced: int) -> None:
 
-        new_block_num = self.num_gpu_blocks - block_num_reduced
+        # new_block_num = self.num_gpu_blocks - block_num_reduced
+        # Fix bug: the current block number is not self.num_gpu_blocks but len(self.gpu_cache[0][0])
+        # as there may already be some blocks reduced
+        new_block_num  = len(self.gpu_cache[0][0]) - block_num_reduced
         whole_cache = self.continuous_gpu_cache.view(-1)
+
+        print(f"block_num_reduced: {block_num_reduced}, new_block_num: {new_block_num}")
         
         key_blk_size_per_layer = new_block_num
         for i in self.get_key_block_shape():
@@ -249,13 +265,17 @@ class CacheEngine:
 
             gpu_cache.append((key_blocks, value_blocks))
 
+            
+            # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            #     print(f"layer_i {layer_i} key & value cache address: {key_blocks.data_ptr(), value_blocks.data_ptr()}")
+
         return gpu_cache
 
 
     
     
     # <jingzhi> directly reorganize the KV cache blocks to make space for model weights
-    def reorganize_blocks(self, src_to_dsts: Dict[int, List[int]], block_num_reduced: int) -> None:      
+    def reorganize_blocks_deprecated(self, src_to_dsts: Dict[int, List[int]], block_num_reduced: int) -> None:      
 
         # first update the KV cache organization to get gpu_cache_reorganized
         gpu_cache_reorganized = self.update_KV_cache_organization(block_num_reduced)
@@ -274,6 +294,19 @@ class CacheEngine:
 
 
 
+
+    
+    # <jingzhi> directly reorganize the KV cache blocks to make space for model weights
+    def reorganize_blocks(self, src_to_dsts: Dict[int, List[int]], block_num_reduced: int) -> None:      
+
+        # first update the KV cache organization to get gpu_cache_reorganized
+        gpu_cache_reorganized = self.update_KV_cache_organization(block_num_reduced)
+
+        # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
+        cache_ops.reorganize_blocks(self.continuous_gpu_cache, src_to_dsts[0], src_to_dsts[1], self.gpu_cache[0][0][0].numel())
+        
+        # udpate gpu cache
+        self.gpu_cache = gpu_cache_reorganized
 
 
 

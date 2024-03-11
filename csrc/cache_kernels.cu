@@ -213,15 +213,16 @@ __global__ void copy_blocks_kernel(
 // Grid: (num_layers, num_pairs)
 // <jingzhi> this function is used to reorganize KV cache blocks to make enough memory for model weights
 template<typename scalar_t>
-__global__ void reorganize_blocks_kernel(
+__global__ void reorganize_blocks_kernel_deprecated(
   int64_t* key_cache_ptrs,
   int64_t* value_cache_ptrs,
   const int64_t* __restrict__ block_mapping,
   const int numel_per_block,
   // added parameters
   int64_t* new_key_cache_ptrs,
-  int64_t* new_value_cache_ptrs) {
-  const int layer_idx = blockIdx.x;
+  int64_t* new_value_cache_ptrs,
+  const int layer_idx) {
+  // const int layer_idx = blockIdx.x;
   const int pair_idx = blockIdx.y;
 
   scalar_t* key_cache = reinterpret_cast<scalar_t*>(key_cache_ptrs[layer_idx]);
@@ -233,18 +234,24 @@ __global__ void reorganize_blocks_kernel(
   int64_t src_block_number = block_mapping[2 * pair_idx];
   int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
 
-  if ((src_block_number == dst_block_number) && (layer_idx == 0)){
-    return ;
-  }
+  // <jingzhi> this condition is wrong, as value cache and new value cache can never be at the same place
+  // if ((src_block_number == dst_block_number) && (layer_idx == 0)){
+  //   return ;
+  // }
 
   const int64_t src_block_offset = src_block_number * numel_per_block;
   const int64_t dst_block_offset = dst_block_number * numel_per_block;
-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
-    int64_t src_offset = src_block_offset + i;
-    int64_t dst_offset = dst_block_offset + i;
-    // key_cache[dst_offset] = key_cache[src_offset];
-    new_key_cache[dst_offset] = key_cache[src_offset];
+
+  if ((src_block_number != dst_block_number) || (new_key_cache != key_cache)){
+    for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+      int64_t src_offset = src_block_offset + i;
+      int64_t dst_offset = dst_block_offset + i;
+      // key_cache[dst_offset] = key_cache[src_offset];
+      new_key_cache[dst_offset] = key_cache[src_offset];
+    }
   }
+
+
   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
     int64_t src_offset = src_block_offset + i;
     int64_t dst_offset = dst_block_offset + i;
@@ -252,6 +259,55 @@ __global__ void reorganize_blocks_kernel(
     new_value_cache[dst_offset] = value_cache[src_offset];
   }
 }
+
+
+
+
+
+
+// Grid: (num_layers, num_pairs)
+// <jingzhi> this function is used to reorganize KV cache blocks to make enough memory for model weights
+template<typename scalar_t>
+__global__ void reorganize_blocks_kernel(
+  int64_t global_cache_ptr,
+  const int64_t* __restrict__ chains,
+  const int64_t* __restrict__ chain_lens,
+  const int numel_per_block) {
+  // const int layer_idx = blockIdx.x;
+  const int chain_idx = blockIdx.x;
+
+  scalar_t* global_cache = reinterpret_cast<scalar_t*>(global_cache_ptr);
+
+  for (int iter_i = chain_lens[chain_idx+1]-1; iter_i > chain_lens[chain_idx]; iter_i--) {
+    // iterate over each move step in this chain
+
+    int64_t src_block_number = chains[iter_i - 1];
+    int64_t dst_block_number = chains[iter_i];
+
+    const int64_t src_block_offset = src_block_number * numel_per_block;
+    const int64_t dst_block_offset = dst_block_number * numel_per_block;
+
+    for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+      int64_t src_offset = src_block_offset + i;
+      int64_t dst_offset = dst_block_offset + i;
+      // key_cache[dst_offset] = key_cache[src_offset];
+      global_cache[dst_offset] = global_cache[src_offset];
+    }
+
+
+    for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+      int64_t src_offset = src_block_offset + i;
+      int64_t dst_offset = dst_block_offset + i;
+      // value_cache[dst_offset] = value_cache[src_offset];
+      global_cache[dst_offset] = global_cache[src_offset];
+    }
+
+  }
+}
+
+
+
+
 
 
 
@@ -326,7 +382,7 @@ void copy_blocks(
 
 // <jingzhi>
 // this is used to reorganize the KV cache blocks to make enough space for model weights
-void reorganize_blocks(
+void reorganize_blocks_deprecated(
   std::vector<torch::Tensor>& key_caches,
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping, 
@@ -384,21 +440,107 @@ void reorganize_blocks(
 
   // Launch the kernel.
   const int numel_per_block = key_caches[0][0].numel();
-  dim3 grid(num_layers, num_pairs);
+  dim3 grid(1, num_pairs);
   dim3 block(std::min(1024, numel_per_block));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  VLLM_DISPATCH_FLOATING_TYPES(
-    key_caches[0].scalar_type(), "reorganize_blocks_kernel", ([&] {
-      vllm::reorganize_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        key_cache_ptrs_tensor.data_ptr<int64_t>(),
-        value_cache_ptrs_tensor.data_ptr<int64_t>(),
-        block_mapping_tensor.data_ptr<int64_t>(),
-        numel_per_block,
-        // added parameters
-        new_key_cache_ptrs_tensor.data_ptr<int64_t>(),
-        new_value_cache_ptrs_tensor.data_ptr<int64_t>());
-    }));
+
+  // do the copying in the order of layer as the new layer KV cache may overlap the old one
+  for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+    VLLM_DISPATCH_FLOATING_TYPES(
+      key_caches[0].scalar_type(), "reorganize_blocks_kernel_deprecated", ([&] {
+        vllm::reorganize_blocks_kernel_deprecated<scalar_t><<<grid, block, 0, stream>>>(
+          key_cache_ptrs_tensor.data_ptr<int64_t>(),
+          value_cache_ptrs_tensor.data_ptr<int64_t>(),
+          block_mapping_tensor.data_ptr<int64_t>(),
+          numel_per_block,
+          // added parameters
+          new_key_cache_ptrs_tensor.data_ptr<int64_t>(),
+          new_value_cache_ptrs_tensor.data_ptr<int64_t>(),
+          layer_idx);
+      }));
+  }
+
+  return ;
+
+  // the code below is deprecated
+
+
+  // // Launch the kernel.
+  // const int numel_per_block = key_caches[0][0].numel();
+  // dim3 grid(num_layers, num_pairs);
+  // dim3 block(std::min(1024, numel_per_block));
+  // const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  // VLLM_DISPATCH_FLOATING_TYPES(
+  //   key_caches[0].scalar_type(), "reorganize_blocks_kernel", ([&] {
+  //     vllm::reorganize_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
+  //       key_cache_ptrs_tensor.data_ptr<int64_t>(),
+  //       value_cache_ptrs_tensor.data_ptr<int64_t>(),
+  //       block_mapping_tensor.data_ptr<int64_t>(),
+  //       numel_per_block,
+  //       // added parameters
+  //       new_key_cache_ptrs_tensor.data_ptr<int64_t>(),
+  //       new_value_cache_ptrs_tensor.data_ptr<int64_t>());
+  //   }));
 }
+
+
+
+
+
+
+
+
+// <jingzhi>
+// this is used to reorganize the KV cache blocks to make enough space for model weights
+void reorganize_blocks(
+  torch::Tensor& global_cache,
+  std::vector<int64_t>& chains,
+  std::vector<int64_t>& chain_lens,
+  const int numel_per_block) {
+  torch::Device cache_device = global_cache.device();
+  TORCH_CHECK(cache_device.is_cuda());
+
+  // Create data structures for the kernel.
+  // Create pointer to the global key and value cache.
+  int64_t global_cache_ptr = reinterpret_cast<int64_t>(global_cache.data_ptr());
+
+  int chains_size = chains.size();
+  int num_chains = chain_lens.size() - 1;
+  int64_t* chains_array = chains.data();
+  int64_t* chain_lens_array = chain_lens.data();
+
+
+
+  // Move the data structures to the GPU.
+  // NOTE: This synchronizes the CPU and GPU.
+
+  torch::Tensor chains_tensor = torch::from_blob(
+    chains_array, {chains_size}, torch::kInt64).to(cache_device);
+  torch::Tensor chain_lens_tensor = torch::from_blob(
+    chain_lens_array, {num_chains + 1}, torch::kInt64).to(cache_device);
+
+
+
+  // Launch the kernel.
+  dim3 grid(num_chains);
+  dim3 block(std::min(1024, numel_per_block));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // do the copying in the order of layer as the new layer KV cache may overlap the old one
+  VLLM_DISPATCH_FLOATING_TYPES(
+    global_cache.scalar_type(), "reorganize_blocks_kernel", ([&] {
+      vllm::reorganize_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        global_cache_ptr,
+        chains_tensor.data_ptr<int64_t>(),
+        chain_lens_tensor.data_ptr<int64_t>(),
+        numel_per_block);
+    }));
+
+  return ;
+
+}
+
+
 
 
 

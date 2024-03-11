@@ -40,6 +40,28 @@ try:
         def set_cuda_visible_devices(self, device_ids) -> None:
             set_cuda_visible_devices(device_ids)
 
+
+        # <jingzhi> support release resources of worker by deleting it
+        def delete_worker(self) -> None:
+            # first destroy distributed process groups in torch
+            from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
+            import torch
+            from vllm.model_executor.parallel_utils.custom_all_reduce import delete_handle
+            delete_handle()
+            destroy_model_parallel()
+            torch.distributed.destroy_process_group()
+
+            import torch
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
+            ray.actor.exit_actor()
+            # del self.worker
+
+
+
 except ImportError as e:
     logger.warning(f"Failed to import Ray with {e!r}. "
                    "For distributed inference, please install Ray with "
@@ -74,6 +96,11 @@ def initialize_cluster(
             raise ImportError(
                 "Ray is not installed. Please install Ray to use distributed "
                 "serving.")
+        
+        # <jingzhi>
+        print(f'init ray--------------')
+
+
         # Connect to a ray cluster.
         if is_hip():
             ray.init(address=ray_address,
@@ -86,6 +113,13 @@ def initialize_cluster(
         assert parallel_config.world_size == 1, (
             "Ray is required if parallel_config.world_size > 1.")
         return None
+
+
+
+    # <jingzhi>
+    print(f'create placement group--------------')
+
+
 
     # Create placement group for worker processes
     current_placement_group = ray.util.get_current_placement_group()
@@ -125,13 +159,13 @@ def initialize_cluster(
         # }] * parallel_config.world_size)
         current_placement_group = None
         import os
-        if os.environ['USE_VLLM']=='True':
-            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster))
+        if os.environ['USE_VLLM']=='False':
+            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster), name='my_pg')
         # ------------------------------------------------------------------------
         else:
             placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)
             current_placement_group = ray.util.placement_group(
-                placement_group_specs)
+                placement_group_specs, name='vllm_pg')
 
 
 

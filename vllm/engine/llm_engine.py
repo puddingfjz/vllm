@@ -118,8 +118,19 @@ class LLMEngine:
         else:
             self._init_workers()
 
+
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
         # Profile the memory usage and initialize the cache.
         self._init_cache()
+
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray _init_cache time: {end_time - start_time}s")
+
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
@@ -175,6 +186,13 @@ class LLMEngine:
     # TODO (jingzhi): check what is driver worker and whether our code can still work
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
+        
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+
+
         if self.parallel_config.tensor_parallel_size == 1:
             num_gpus = self.cache_config.gpu_memory_utilization
         else:
@@ -204,6 +222,10 @@ class LLMEngine:
                 num_cpus=0,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
+                
+                # TODO <jingzhi> support changing env variables as we cannot init ray twice where the env variables in actors are initialized
+                runtime_env={"env_vars": dict(os.environ)},
+
                 **ray_remote_kwargs,
             )(RayWorkerVllm).remote(self.model_config.trust_remote_code)
 
@@ -322,12 +344,35 @@ class LLMEngine:
             is_driver_worker=True,
         )
 
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray init workers time: {end_time - start_time}s")
+
+
+
         self._run_workers("init_model")
+
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray init_model time: {end_time - start_time}s")
+
+
         self._run_workers(
             "load_model",
             max_concurrent_workers=self.parallel_config.
             max_parallel_loading_workers,
         )
+
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray load_model time: {end_time - start_time}s")
+
+
 
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -425,8 +470,17 @@ class LLMEngine:
         # Create the engine configs.
         engine_configs = engine_args.create_engine_configs()
         parallel_config = engine_configs[2]
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
         # Initialize the cluster.
         placement_group = initialize_cluster(parallel_config)
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"initialize_cluster time: {end_time - start_time}s")
+
         # Create the LLM engine.
         engine = cls(*engine_configs,
                      placement_group,
@@ -1063,3 +1117,37 @@ class LLMEngine:
             ray_worker_outputs = ray.get(ray_worker_outputs)
 
         return [driver_worker_output] + ray_worker_outputs
+
+
+
+
+
+    # <jingzhi> delete worker to release resources
+    def delete_workers(self) -> None:
+        ray_worker_outputs = [
+            worker.delete_worker.remote()
+            for worker in self.workers
+        ]
+
+        # Start the driver worker after all the ray workers.
+        del self.driver_worker
+        
+        import torch
+        import gc
+        # first destroy distributed process groups in torch
+        from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
+        from vllm.model_executor.parallel_utils.custom_all_reduce import delete_handle
+        delete_handle()
+        destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+        # Get the results of the ray workers.
+        if self.workers:
+            # ray_worker_outputs = ray.get(ray_worker_outputs)
+            # as we call actor exit inside the worker process, we should use ray.wait here
+            ray.wait(ray_worker_outputs, num_returns=len(self.workers))
+

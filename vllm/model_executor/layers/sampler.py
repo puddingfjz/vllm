@@ -54,11 +54,34 @@ class Sampler(nn.Module):
         sampling_metadata: SamplingMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> Optional[SamplerOutput]:
+
+        # <jingzhi> For DEBUG
+        # import os
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling hidden_states 0 shape: {hidden_states.shape}")
+        #     print(f"sampling hidden_states 0: {hidden_states[0][-1].tolist()}")
+            # print(f"last norm.weight: {self.norm.weight.tolist()}")
+            # print(f"last norm.weight address: {self.norm.weight.data_ptr()}")
+
+
         # Get the hidden states that we use for sampling.
         hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
 
+        # <jingzhi> For DEBUG
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling hidden_states 1 shape: {hidden_states.shape}")
+        #     print(f"sampling hidden_states 1: {hidden_states[0].tolist()}")
+
+
         # Get the logits for the next tokens.
         logits = self._get_logits(hidden_states, embedding, embedding_bias)
+
+
+        # <jingzhi> For DEBUG
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling logits 1 shape: {logits.shape}")
+        #     print(f"sampling logits 1: {logits[0].tolist()}")
+
 
         # Only perform sampling in the driver worker.
         # Note: `_get_logits` is still distributed across TP workers because
@@ -72,6 +95,13 @@ class Sampler(nn.Module):
 
         # Apply logits processors (if any).
         logits = _apply_logits_processors(logits, sampling_metadata)
+
+
+        # <jingzhi> For DEBUG
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling logits 2 shape: {logits.shape}")
+        #     print(f"sampling logits 2: {logits[0].tolist()}")
+
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
         (sampling_tensors, do_penalties, do_top_p_top_k,
@@ -90,6 +120,14 @@ class Sampler(nn.Module):
         # Use in-place division to avoid creating a new tensor.
         logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
 
+        
+        # <jingzhi> For DEBUG
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling logits 3 shape: {logits.shape}")
+        #     print(f"sampling logits 3: {logits[0].tolist()}")
+
+
+
         if do_top_p_top_k:
             logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
                                         sampling_tensors.top_ks)
@@ -104,9 +142,24 @@ class Sampler(nn.Module):
         # Use log_softmax to ensure numerical stability.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
 
+
+
+        # <jingzhi> For DEBUG
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling probs 1 shape: {probs.shape}")
+        #     print(f"sampling probs 1: {probs[0].tolist()}")
+
+
         # Sample the next tokens.
         sample_results = _sample(probs, logprobs, sampling_metadata)
         # Get the logprobs query results.
+
+
+        # <jingzhi> For DEBUG
+        # import os
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f"sampling sample_results: {sample_results}")
+
         prompt_logprobs, sample_logprobs = _get_logprobs(
             logprobs, sampling_metadata, sample_results)
         return _build_sampler_output(sample_results, sampling_metadata,
@@ -370,6 +423,15 @@ def _sample(
 
     sample_results_dict: Dict[int, Tuple[List[int], List[int]]] = {}
     sample_metadata = {}
+
+
+    # <jingzhi> For DEBUG
+    # import os
+    # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+    #     # print(f"sampling categorized_seq_group_ids: {categorized_seq_group_ids}")
+    #     # print(f"sampling categorized_sample_indices: {categorized_sample_indices}")
+    #     print(f"seq group ids: {[_[0] for _ in sampling_metadata.seq_groups]}")
+
 
     # Counterintiutively, having two loops here is actually faster.
     # The first loop can run without waiting on GPU<->CPU sync.

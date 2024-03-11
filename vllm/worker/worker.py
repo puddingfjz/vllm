@@ -126,8 +126,17 @@ class Worker:
         init_distributed_environment(self.parallel_config, self.rank,
                                      self.distributed_init_method)
         if not self.parallel_config.disable_custom_all_reduce:
+
+
+            # <jingzhi> For DEBUG
+            print(f"init_custom_ar -------------", flush=True)
+
             init_custom_ar()
         # Initialize the model.
+
+        # <jingzhi> For DEBUG
+        print(f"set_random_seed -------------", flush=True)
+
         set_random_seed(self.model_config.seed)
 
 
@@ -186,6 +195,7 @@ class Worker:
         KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
             print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
+            print(f"total_gpu_memory: {total_gpu_memory}, gpu_memory_utilization:{gpu_memory_utilization}, peak_memory:{peak_memory}, cache_block_size:{cache_block_size}")
 
 
 
@@ -215,8 +225,8 @@ class Worker:
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
         # <jingzhi> support dynamically increasing on-card layer weights
-        print(f"self.cache_engine.continuous_gpu_cache:{self.cache_engine.continuous_gpu_cache}")
         if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            print(f"self.cache_engine.continuous_gpu_cache:{self.cache_engine.continuous_gpu_cache.shape}")
             self.model_runner.init_extra_weight_cache_from_KV_cache([self.cache_engine.continuous_gpu_cache])
 
 
@@ -252,6 +262,8 @@ class Worker:
         # <jingzhi>
         if blocks_to_reorganize:
             self.cache_engine.reorganize_blocks(blocks_to_reorganize, blk_num_reduced)
+            # update gpu cache
+            self.gpu_cache = self.cache_engine.gpu_cache
             issued_cache_op = True
 
 
@@ -338,6 +350,10 @@ def init_distributed_environment(
 ) -> None:
     """Initialize the distributed environment."""
     if torch.distributed.is_initialized():
+
+        # <jingzhi> For DEBUG
+        print(f"init_distributed_environment 1-------------")
+
         torch_world_size = torch.distributed.get_world_size()
         if torch_world_size != parallel_config.world_size:
             raise RuntimeError(
@@ -349,6 +365,11 @@ def init_distributed_environment(
             "distributed_init_method must be set if torch.distributed "
             "is not already initialized")
     else:
+
+        # <jingzhi> For DEBUG
+        print(f"init_distributed_environment 3-------------")
+
+
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=parallel_config.world_size,
@@ -360,6 +381,10 @@ def init_distributed_environment(
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    
+
+    # <jingzhi> For DEBUG
+    print(f"finish init model-------------", flush=True)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

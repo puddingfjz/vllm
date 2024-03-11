@@ -27,7 +27,8 @@ class BlockAllocator:
 
         # Initialize the free blocks.
         self.free_blocks: BlockTable = []
-        for i in range(num_blocks):
+        # for i in range(num_blocks):
+        for i in range(num_blocks-1, -1, -1):
             block = PhysicalTokenBlock(device=device,
                                        block_number=i,
                                        block_size=block_size)
@@ -365,7 +366,7 @@ class BlockSpaceManager:
 
 
     # <jingzhi>
-    def reorganize_gpu_blocks(self, num_layer_to_load: int) -> Tuple[Dict[int, int], List[int]]:
+    def reorganize_gpu_blocks(self, num_layer_to_load: int) -> Dict[int, int]:
         '''
             Reorganize allocated GPU blocks to get enough continuous block ranges.
             This is used when the remaining requests is not enough to make the computation time 
@@ -441,6 +442,72 @@ class BlockSpaceManager:
 
 
 
+
+    # <jingzhi>
+    def get_dependent_blk_moving_chains(self, fromblknum_to_blknum: Dict[int, int]) -> Tuple[List[int], List[int]]:
+        '''
+            NOTE: this function is called after reorganize_gpu_blocks.
+            Get the blk moving chains where there is dependency.
+            E.g., (1) move blk 3 to blk 1, (2) blk 5 to blk 3. then we cannot do (1)&(2) together, and (1) and (2) form a chain.
+            Input:
+                fromblknum_to_blknum: Dict[int, int]. 
+            Output:
+                (the chains connected together, the length of each chain): Tuple[List[Tuple[int, int]], List[int]].
+        '''
+        print(f"KVBlkPerLayerWeight.layer_num: {KVBlkPerLayerWeight.layer_num}")
+        layer_num = KVBlkPerLayerWeight.layer_num
+        
+        curr_tot_gpu_blk_num = self.actual_gpu_blk_rng_end
+        ori_tot_gpu_blk_num = curr_tot_gpu_blk_num + \
+            KVBlkPerLayerWeight.load_more_layer_on_card_num * KVBlkPerLayerWeight.blk_num_per_layer
+
+        print(f"curr_tot_gpu_blk_num: {curr_tot_gpu_blk_num}, ori_tot_gpu_blk_num: {ori_tot_gpu_blk_num}, load_more_layer_on_card_num: {KVBlkPerLayerWeight.load_more_layer_on_card_num}, blk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}")
+        
+        mapping_dict = fromblknum_to_blknum.copy()
+        # get block mapping in the whole gpu cache
+        for layer_i in range(1, 2*layer_num):
+            # deal with key cache and value cache in every layer (except key cache in layer 0)
+            mapping_dict.update([(k + ori_tot_gpu_blk_num * layer_i, v + curr_tot_gpu_blk_num * layer_i) \
+                                 for k, v in fromblknum_to_blknum.items()])
+
+        # print(f"mapping_dict: {mapping_dict}")
+        
+        # get dependent block mapping chains
+        from_blk_gids = sorted(mapping_dict.keys())
+        visited: Dict[int, int] = {gid: False for gid in from_blk_gids}
+        chains: List[int] = list()
+        chain_lens: List[int] = [0]
+        for i in range(len(from_blk_gids)-1, -1, -1):
+            src_gid = from_blk_gids[i]
+            if visited[src_gid]:
+                continue
+            if mapping_dict[src_gid] == src_gid:
+                visited[src_gid] = True
+                continue
+            chains.append(src_gid)
+            while(src_gid in mapping_dict):
+                visited[src_gid] = True
+                src_gid = mapping_dict[src_gid]
+                chains.append(src_gid)
+
+            chain_lens.append(len(chains))
+
+        # print(f"chains: {chains}")
+        # print(f"chain_lens: {chain_lens}")
+
+        return chains, chain_lens
+
+
+
+
+
+
+
+
+
+
+
+
 class KVBlkPerLayerWeight:
     """
     Store the number of KV cache blocks to release if we want to store the weights of a layer in an LLM.
@@ -448,11 +515,31 @@ class KVBlkPerLayerWeight:
     block_size: int = -1 (in bytes)
     layer_weight_size: int = -1 (in bytes) 
     cached_layer_num: int = -1
+    layer_num: int = -1 (the number of layers in the model)
     """
     blk_num_per_layer: int = -1
     block_size: int = -1
     layer_weight_size: int = -1
     cached_layer_num: int = -1
     load_more_layer_on_card_num: int = 0
+    layer_num: int = -1
 
+    @classmethod
+    def reset(cls):
+        cls.blk_num_per_layer: int = -1
+        cls.block_size: int = -1
+        cls.layer_weight_size: int = -1
+        cls.cached_layer_num: int = -1
+        cls.load_more_layer_on_card_num: int = 0
+        cls.layer_num: int = -1    
 
+    @classmethod
+    def print_info(cls):
+        print(f"blk_num_per_layer={cls.blk_num_per_layer}, "
+              f"block_size={cls.block_size}, "
+              f"layer_weight_size={cls.layer_weight_size}, "
+              f"cached_layer_num={cls.cached_layer_num}, "
+              f"load_more_layer_on_card_num={cls.load_more_layer_on_card_num}, "
+              f"layer_num={cls.layer_num}, ",
+              flush=True
+              )

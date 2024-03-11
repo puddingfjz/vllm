@@ -5,13 +5,15 @@
 
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='1,3,2,0' # '2,3' # '3,0,1,2'
+os.environ['CUDA_VISIBLE_DEVICES']='2,1,3,0' # '2,3' # '3,0,1,2' # should be set before initialize cuda in torch
 os.environ['USE_VLLM']='False'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
-os.environ['WEIGHT_LOAD_DEGREE'] = '16'
+# os.environ['WEIGHT_LOAD_DEGREE'] = '16' # now will set it in command
 # os.environ['CHANGE_KV_LAYOUT'] = 'True' # whether the KV layout is changed
 os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'True' # whether we will dynamically increase the on-card layer weights
 
+
+os.environ['RUN_MULTI_MODEL'] = 'False' # whether this model is running in a multi-model environment
 # about scheduling
 os.environ['SORT_REQS'] = 'True' # whether to sort the requests according to their output lengths, default is False
 
@@ -36,7 +38,7 @@ python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.j
 try llama2
 python3 benchmark_throughput.py --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model NousResearch/Llama-2-13b-hf --num-prompts 100 --enforce-eager > layerBylayer_llama2_1.log
 
-
+NousResearch/Llama-2-70b-hf
 
 use this line to occupy memory
 import torch
@@ -69,6 +71,16 @@ import torch
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 from tqdm import tqdm
+
+
+# <jingzhi>
+import gc
+from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
+
+
+print(f'executing benchmark_throughput.py')
+
+
 
 
 def sample_requests(
@@ -123,7 +135,9 @@ def sample_requests(
     return sampled_requests
 
 
-def run_vllm(
+
+# the original version of run_vllm
+def run_vllm_ori(
     requests: List[Tuple[str, int, int]],
     model: str,
     tokenizer: str,
@@ -138,6 +152,9 @@ def run_vllm(
     enforce_eager: bool,
     kv_cache_dtype: str,
     device: str,
+    
+    # <jingzhi>
+    gpu_memory_utilization: float,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -153,8 +170,9 @@ def run_vllm(
         kv_cache_dtype=kv_cache_dtype,
         device=device,
         # <jingzhi>
-        gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
+        # gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
         # max_num_seqs=2048,
+        gpu_memory_utilization=gpu_memory_utilization,
         max_num_seqs=512,
         max_paddings=512,
     )
@@ -163,7 +181,8 @@ def run_vllm(
     for prompt, _, output_len in requests:
         sampling_params = SamplingParams(
             n=n,
-            temperature=0.0 if use_beam_search else 1.0,
+            # <jingzhi> change to greedy sampling to check correctness.
+            temperature=0.0 if use_beam_search else 1e-6, #1.0
             top_p=1.0,
             use_beam_search=use_beam_search,
             ignore_eos=True,
@@ -178,8 +197,167 @@ def run_vllm(
 
     start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
+    outputs = llm._run_engine(use_tqdm=True)
     end = time.perf_counter()
+    
+    print(f"outputs:\n")
+    for req_output in outputs:
+        for completion_output in req_output.outputs:
+            print(req_output.request_id, req_output.prompt_token_ids[:10], completion_output.token_ids)
+
+    return end - start
+
+
+
+
+
+
+
+
+
+
+
+# <jingzhi> run_vllm_with_preemption
+def run_vllm(
+    requests: List[Tuple[str, int, int]],
+    model: str,
+    tokenizer: str,
+    quantization: Optional[str],
+    tensor_parallel_size: int,
+    seed: int,
+    n: int,
+    use_beam_search: bool,
+    trust_remote_code: bool,
+    dtype: str,
+    max_model_len: Optional[int],
+    enforce_eager: bool,
+    kv_cache_dtype: str,
+    device: str,
+    
+    # <jingzhi>
+    gpu_memory_utilization: float,
+) -> float:
+    
+    # <jingzhi> test shared array
+    from vllm.core.multimodel_scheduler import SHARED_CONTECT
+    # SHARED_CONTECT.test_and_print()
+    # SHARED_CONTECT.test_task()
+     
+
+    from vllm import LLM, SamplingParams
+
+    start = None
+    rescheduled_iter_num = -1 # how many times this model has been rescheduled on the machine
+    llm = None
+    while (not SHARED_CONTECT.is_finished()):
+
+        rescheduled_iter_num += 1
+
+        # <jingzhi> For Profiling
+        start_before_prepare_model = time.perf_counter()
+
+
+        print(f"waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+
+        if rescheduled_iter_num > 0:
+            # need wait for the signal to start model loading
+            SHARED_CONTECT.sync_before_loading_model()
+
+        print(f"finish waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        
+        # update the execution plan
+        tensor_parallel_size, gpu_memory_utilization = SHARED_CONTECT.update_execution_plan(
+            tensor_parallel_size, gpu_memory_utilization)
+
+
+        print(f"loading LLM  tensor_parallel_size {tensor_parallel_size} gpu_memory_utilization {gpu_memory_utilization}----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+
+
+        # <jingzhi> For Profiling
+        start_prepare_model = time.perf_counter()
+        print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
+
+
+        llm = LLM(
+            model=model,
+            tokenizer=tokenizer,
+            quantization=quantization,
+            tensor_parallel_size=tensor_parallel_size,
+            seed=seed,
+            trust_remote_code=trust_remote_code,
+            dtype=dtype,
+            max_model_len=max_model_len,
+            enforce_eager=enforce_eager,
+            kv_cache_dtype=kv_cache_dtype,
+            device=device,
+            # <jingzhi>
+            # gpu_memory_utilization=0.5, #0.5689, #0.5, # 0.5373
+            # max_num_seqs=2048,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_num_seqs=512,
+            max_paddings=512,
+        )
+
+
+        if rescheduled_iter_num == 0:
+            # Add the requests to the engine.
+            for prompt, _, output_len in requests:
+                sampling_params = SamplingParams(
+                    n=n,
+                    # <jingzhi> change to greedy sampling to check correctness.
+                    temperature=0.0 if use_beam_search else 1e-6, #1.0
+                    top_p=1.0,
+                    use_beam_search=use_beam_search,
+                    ignore_eos=True,
+                    max_tokens=output_len,
+                )
+                # FIXME(woosuk): Do not use internal method.
+                llm._add_request(
+                    prompt=prompt,
+                    prompt_token_ids=None,
+                    sampling_params=sampling_params,
+                )
+        else:
+            # directly set the remaining requests to the scheduler waiting list
+            print(f"directly using unfinished requests!")
+            llm.llm_engine.scheduler.waiting = SHARED_CONTECT.remaining_requests
+
+
+        # <jingzhi> For Profiling
+        end_prepare_model = time.perf_counter()
+        print(f"total time to prepare model: {end_prepare_model-start_prepare_model}s ---abs {end_prepare_model}")
+
+
+        
+        # TODO (jingzhi) because we allow model preemption here, we may adjust this later
+        if start == None:
+            start = time.perf_counter()
+
+        tmp_start = time.perf_counter()
+
+        # FIXME(woosuk): Do not use internal method.
+        outputs = llm._run_engine(use_tqdm=True)
+        end = time.perf_counter()
+        
+
+        print(f"this execution plan running time: {end - tmp_start}s ---abs {end}")
+        print(f"outputs:\n")
+        # for req_output in outputs:
+        #     for completion_output in req_output.outputs:
+        #         print(req_output.request_id, req_output.prompt_token_ids[:10], completion_output.token_ids)
+
+
+
+        # TODO (jingzhi) release the resources of the current execution plan
+        print(f"deleting LLM-----------------", flush=True)
+        # destroy_model_parallel()
+        # del llm
+        # gc.collect()
+        # torch.cuda.empty_cache()
+
+        print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
+
+
     return end - start
 
 
@@ -261,11 +439,25 @@ def run_mii(
 
 def main(args: argparse.Namespace):
     print(args)
+
+    # <jingzhi> For Profiling
+    start_main = time.perf_counter()
+
+
+    # <jingzhi> deal with extra parameters
+    os.environ['WEIGHT_LOAD_DEGREE'] = args.weight_load_degree
+
+
+
     random.seed(args.seed)
 
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
+
+    # <jingzhi> For Profiling
+    print(f"finish get tokenizer ---abs: {time.perf_counter()}")
+
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
         prompt = "hi" * (args.input_len - 1)
@@ -275,13 +467,21 @@ def main(args: argparse.Namespace):
         requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
                                    args.output_len)
 
+
+    # <jingzhi> For Profiling
+    print(f"finish request sampling ---abs: {time.perf_counter()}")
+
+
     if args.backend == "vllm":
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
                                 args.max_model_len, args.enforce_eager,
-                                args.kv_cache_dtype, args.device)
+                                args.kv_cache_dtype, args.device,
+                                # <jingzhi> add more control
+                                args.gpu_use_ratio
+                                )
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -295,7 +495,13 @@ def main(args: argparse.Namespace):
     total_num_tokens = sum(prompt_len + output_len
                            for _, prompt_len, output_len in requests)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
-          f"{total_num_tokens / elapsed_time:.2f} tokens/s")
+          f"{total_num_tokens / elapsed_time:.2f} tokens/s",
+        # <jingzhi> flush print
+          flush=True)
+    
+    # <jingzhi> For Profiling
+    end_main = time.perf_counter()
+    print(f"TOT TIME TO RUN MAIN(): {end_main - start_main}s")
 
 
 if __name__ == "__main__":
@@ -372,6 +578,27 @@ if __name__ == "__main__":
         default="cuda",
         choices=["cuda"],
         help='device type for vLLM execution, supporting CUDA only currently.')
+    
+
+
+    # <jingzhi> deal with extra parameters
+    parser.add_argument(
+        "--weight-load-degree", "-wldegree", 
+        type=str,
+        default="16",
+        help='weight load degree when cache model weights on other gpus.')
+
+
+    parser.add_argument(
+        "--gpu-use-ratio", "-gpuratio", 
+        type=float,
+        default="0.9",
+        help='gpu utilization ratio.')    
+
+
+
+
+
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

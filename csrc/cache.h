@@ -38,13 +38,21 @@ void copy_blocks(
   const std::map<int64_t, std::vector<int64_t>>& block_mapping);
 
 
-
-void reorganize_blocks(
+// <jingzhi>
+void reorganize_blocks_deprecated(
   std::vector<torch::Tensor>& key_caches,
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping, 
   std::vector<torch::Tensor>& new_key_caches,
   std::vector<torch::Tensor>& new_value_caches);
+
+
+// <jingzhi>
+void reorganize_blocks(
+  torch::Tensor& global_cache,
+  std::vector<int64_t>& chains,
+  std::vector<int64_t>& chain_lens,
+  const int numel_per_block);
 
 
 void reshape_and_cache(

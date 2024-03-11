@@ -87,6 +87,11 @@ class PagedAttention(nn.Module):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
+        # import os
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"key[-1] this layer: {key[-1].tolist()}")
+
+
         # Reshape the keys and values and store them in the cache.
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
@@ -236,6 +241,15 @@ def _paged_attention(
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
 ) -> torch.Tensor:
+
+    # import os
+    # torch.cuda.synchronize()
+    # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+    #     # print(f"key_cache[4]: {key_cache[4].tolist()}")
+    #     for blk_i in input_metadata.block_tables[-1]:
+    #         print(f"key_cache[{blk_i}]: {key_cache[blk_i].tolist()}")
+
+
     output = torch.empty_like(query)
 
     block_size = value_cache.shape[3]
