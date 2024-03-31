@@ -194,3 +194,4 @@ _build/
 # nsys profiling files
 /benchmarks/nsys_profile/
 /benchmarks/figures/
+/benchmarks/cost_model/figures/

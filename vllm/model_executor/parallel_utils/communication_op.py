@@ -31,8 +31,24 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     out = custom_all_reduce(input_)
     if out is not None:
         return out
+    
+    # <jingzhi> For profiling
+    # import time
+    # import os
+    # torch.cuda.synchronize()
+    # time1 = time.perf_counter()
+
+
     torch.distributed.all_reduce(input_,
                                  group=get_tensor_model_parallel_group())
+    
+    # <jingzhi> For profiling
+    # torch.cuda.synchronize()
+    # time2 = time.perf_counter()
+    # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+    #     print(f"torch.distributed.all_reduce latency: {time2-time1}s abs: {time2}s")   
+
+
     return input_
 
 

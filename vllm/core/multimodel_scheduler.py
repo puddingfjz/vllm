@@ -25,6 +25,7 @@ class SHARED_CONTECT():
     # should be 2+#model events, the first two events set by main process (stop all models, start all models), 
     # the other events set by the model processes.
     events: List[Event] = None
+    started_status: List[Event] = None
     gened_outputs = deque()
     remaining_requests = deque()
     shared_finish_status = [False] # store whether each model is finished
@@ -61,11 +62,13 @@ class SHARED_CONTECT():
         print(f"event list status in prepare--model {cls.shared_id} 2", flush=True)
 
         # release occupied resources
-        llm_engine.delete_workers()
+        exit_actor = (os.environ['SOFT_RESCHEDULE'] == 'False')
+        llm_engine.delete_workers(exit_actor)
 
         print(f"event list status in prepare--model {cls.shared_id} 3", flush=True)
 
-        if llm_engine.parallel_config.world_size > 1:
+        # we delete the placement group when we are doing hard reschedule
+        if (os.environ['SOFT_RESCHEDULE'] == 'False') and (llm_engine.parallel_config.world_size > 1):
             # do not need to remove placement group if there is only one worker
             pg_info = list(placement_group_table().values())[0]
             pg = get_placement_group(pg_info['name'])
@@ -198,6 +201,34 @@ class SHARED_CONTECT():
         cls.events[1].set()
 
         print(f"event list status in restart--model {cls.shared_id}: {[event.is_set() for event in cls.events[2:]]}")
+
+
+
+    @classmethod
+    def start_specific_models(cls, model_ids) -> None:
+        assert os.environ['RUN_MULTI_MODEL'] == 'True'
+        # if model event is set, this model will not be started
+        for model_id in model_ids:
+            cls.started_status[model_id].set()
+
+        print(f"event list status in start_specific_models--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
+
+
+
+    @classmethod
+    def wait_to_be_started(cls) -> None:
+        if os.environ['RUN_MULTI_MODEL'] != 'True':
+            return
+        cls.started_status[cls.shared_id].wait()
+
+        print(f"event list status in start_specific_models--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
+
+
+
+    @classmethod
+    def query_finish_status(cls, model_id) -> None:
+        assert os.environ['RUN_MULTI_MODEL'] == 'True'
+        return cls.shared_finish_status[model_id]
 
 
 

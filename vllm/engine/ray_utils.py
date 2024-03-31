@@ -4,6 +4,10 @@ from vllm.config import ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils import is_hip, set_cuda_visible_devices, get_ip
 
+
+# <jingzhi>
+import os
+
 logger = init_logger(__name__)
 
 try:
@@ -42,7 +46,10 @@ try:
 
 
         # <jingzhi> support release resources of worker by deleting it
-        def delete_worker(self) -> None:
+        def delete_worker(self, exit_actor=True) -> None:
+            '''
+                Input: exit_actor determines whether to kill this actor process or not
+            '''
             # first destroy distributed process groups in torch
             from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
             import torch
@@ -51,14 +58,31 @@ try:
             destroy_model_parallel()
             torch.distributed.destroy_process_group()
 
+            if exit_actor:
+                ray.actor.exit_actor()
+            else:
+                # need to release gpu resources
+                # should release model, cache engine
+                # but try to keep them while chaning some setting of them directly
+                # temporary delete self.worker directly
+                del self.worker 
+            # del self.worker
+
             import torch
             import gc
             gc.collect()
             torch.cuda.empty_cache()
 
 
-            ray.actor.exit_actor()
-            # del self.worker
+        # <jingzhi> support release resources of worker by deleting it
+        def update_envs(self, new_envs) -> None:
+            # not sure whether this will be slow (sending environ variables to each actor)
+            os.environ = new_envs
+
+
+
+
+
 
 
 
@@ -158,9 +182,8 @@ def initialize_cluster(
         #     "GPU": gpu_num_per_worker # 1
         # }] * parallel_config.world_size)
         current_placement_group = None
-        import os
         if os.environ['USE_VLLM']=='False':
-            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, num_gpus_in_cluster), name='my_pg')
+            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, int(num_gpus_in_cluster)), name='my_pg')
         # ------------------------------------------------------------------------
         else:
             placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)
@@ -194,6 +217,10 @@ def get_gpu_assignment(worker_num: int, tot_gpu_num: int):
     # gpu_num_per_worker = tot_gpu_num//worker_num
     # plan = [{"GPU": gpu_num_per_worker}] * worker_num
     # --------------------------------------------------------
+
+    if os.environ['SOFT_RESCHEDULE'] == 'True':
+        plan = [{"GPU": 1}] * tot_gpu_num
+        return plan
 
 
     # an example of the policy below: there are 4 GPUs, but 3 workers, will generate an assignment plan as {GPU:1, GPU:1, GPU:2}

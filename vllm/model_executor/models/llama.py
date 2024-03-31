@@ -666,8 +666,20 @@ class LlamaModel(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+        
+        # <jingzhi> For profiling
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+
+
+        # <jingzhi> For profiling
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     print(f"embed_tokens latency: {time2-time1}s abs: {time2}s")         
 
 
         # <jingzhi> For DEBUG
@@ -932,6 +944,9 @@ class LlamaForCausalLM(nn.Module):
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
+        
+        print(f"LlamaForCausalLM LlamaConfig: {config}")
+
         self.config = config
         self.linear_method = linear_method
         self.model = LlamaModel(config, linear_method, lora_config=lora_config)
@@ -972,7 +987,7 @@ class LlamaForCausalLM(nn.Module):
         # in distributed inference, only the first worker will print information
         # if torch.cuda.current_device() == 0:
         if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"iter latency: {time2-time1}s abs: {time2}s")
+            print(f"iter latency: {time2-time1}s abs: {time1, time2}s")
 
 
 
@@ -995,6 +1010,21 @@ class LlamaForCausalLM(nn.Module):
 
 
 
+
+    # <jingzhi> this function prints the parameter shape of the model
+    def print_param_shapes(self):
+        params_dict = dict(self.named_parameters())
+        for name, param in params_dict.items():
+            print(f"name: {name}, param: {param.shape}")
+
+
+
+
+
+
+
+
+
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
@@ -1005,6 +1035,11 @@ class LlamaForCausalLM(nn.Module):
         else:
             # self.load_weights_ours(model_name_or_path, cache_dir, load_format, revision)
             self.preprocess_for_offloading_weights_fast(model_name_or_path, cache_dir, load_format, revision)
+
+
+
+        # <jingzhi> print the parameter shapes of the model
+        self.print_param_shapes()
 
 
 
@@ -1817,7 +1852,7 @@ class LlamaForCausalLM(nn.Module):
                     cache_ops.load_layer_weights(self.model.weight_cache_cpu[layer_i][part_i], self.model.weight_cache[weight_cache_block_idx][part_i],
                         layer_i, cache_device_i, torch.cuda.current_device(), torch.cuda.current_device())
 
-
+        # torch.cuda.empty_cache()
 
         # for layer_i in range(self.model.layer_num):
         #     for param in self.model.layer_params[layer_i]:

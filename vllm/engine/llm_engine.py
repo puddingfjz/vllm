@@ -109,6 +109,15 @@ class LLMEngine:
         self.seq_counter = Counter()
 
         # Create the parallel GPU workers.
+
+        # <jingzhi> Support backup workers to avoid re-launch ray actors
+        self.backup_workers = list()
+        self.backup_worker_node_and_gpu_ids = list()
+        self.backup_node_workers = defaultdict(list)
+        self.backup_distributed_init_method = None
+        self.backup_driver_node_id = None
+
+
         if self.parallel_config.worker_use_ray:
             # Disable Ray usage stats collection.
             ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
@@ -183,8 +192,25 @@ class LLMEngine:
 
 
 
+
     # TODO (jingzhi): check what is driver worker and whether our code can still work
     def _init_workers_ray(self, placement_group: "PlacementGroup",
+                          **ray_remote_kwargs):
+        if (os.environ['USE_VLLM'] == 'True') or (os.environ['SOFT_RESCHEDULE'] == 'False'):
+            self._init_workers_ray_ori(placement_group, **ray_remote_kwargs)
+        else:
+            if len(self.backup_workers) > 0:
+                # we already have backup workers
+                self._init_workers_ray_no_actor_init()
+            else:
+                self._init_workers_ray_init_actor(placement_group, **ray_remote_kwargs)
+
+
+
+
+
+    # TODO (jingzhi): check what is driver worker and whether our code can still work
+    def _init_workers_ray_ori(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
         
 
@@ -313,6 +339,9 @@ class LLMEngine:
         # print(f"BEFORE init workers: os.environ['CUDA_VISIBLE_DEVICES']: {os.environ['CUDA_VISIBLE_DEVICES']}, tot_ordered_gpus: {tot_ordered_gpus}")
 
 
+        # <jingzhi> For Profiling
+        start_create_Worker = time.perf_counter()    
+
 
         for rank, (worker, (node_id, _)) in enumerate(zip(self.workers, worker_node_and_gpu_ids), start=1):
             local_rank = node_workers[node_id].index(rank)
@@ -347,6 +376,7 @@ class LLMEngine:
 
         # <jingzhi> For Profiling
         end_time = time.perf_counter()
+        print(f"_init_workers_ray only create Worker instances time: {end_time - start_create_Worker}")
         print(f"_init_workers_ray init workers time: {end_time - start_time}s")
 
 
@@ -374,6 +404,245 @@ class LLMEngine:
 
 
 
+
+
+
+
+
+
+
+    # TODO (jingzhi): check what is driver worker and whether our code can still work
+    # NOTE: the function below will not init new ray workers
+    def _init_workers_ray_no_actor_init(self):
+        
+
+        # directly get the workers we need in this round of inference
+        # num_actors should exclude the driver worker
+        num_actors = self.parallel_config.tensor_parallel_size - 1
+        print(f"in _init_workers_ray_no_actor_init, num_actors: {num_actors}")
+        self.workers = self.backup_workers[:num_actors]
+        print(f"in _init_workers_ray_no_actor_init, self.workers: {self.workers}")
+        worker_node_and_gpu_ids = self.backup_worker_node_and_gpu_ids[:num_actors]
+        node_workers = self.backup_node_workers
+        distributed_init_method = self.backup_distributed_init_method
+        driver_node_id = self.backup_driver_node_id
+
+
+        for worker in self.workers:
+            worker.update_envs.remote(dict(os.environ))
+
+
+        # Lazy import the Worker to avoid importing torch.cuda/xformers
+        # before CUDA_VISIBLE_DEVICES is set in the Worker
+        from vllm.worker.worker import Worker
+
+        # Initialize torch distributed process group for the workers.
+        model_config = copy.deepcopy(self.model_config)
+        parallel_config = copy.deepcopy(self.parallel_config)
+        scheduler_config = copy.deepcopy(self.scheduler_config)
+        device_config = copy.deepcopy(self.device_config)
+
+
+        # <jingzhi> For Profiling
+        start_create_Worker = time.perf_counter()    
+
+
+        for rank, (worker, (node_id, _)) in enumerate(zip(self.workers, worker_node_and_gpu_ids), start=1):
+            local_rank = node_workers[node_id].index(rank)
+            worker.init_worker.remote(
+                lambda rank=rank, local_rank=local_rank: Worker(
+                    model_config,
+                    parallel_config,
+                    scheduler_config,
+                    device_config,
+                    local_rank,
+                    rank,
+                    distributed_init_method,
+                    lora_config=self.lora_config,
+                    kv_cache_dtype=self.cache_config.cache_dtype,
+                ))
+
+        driver_rank = 0
+        driver_local_rank = node_workers[driver_node_id].index(driver_rank)
+        self.driver_worker = Worker(
+            model_config,
+            parallel_config,
+            scheduler_config,
+            device_config,
+            driver_local_rank,
+            driver_rank,
+            distributed_init_method,
+            lora_config=self.lora_config,
+            kv_cache_dtype=self.cache_config.cache_dtype,
+            is_driver_worker=True,
+        )
+
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray only create Worker instances time: {end_time - start_create_Worker}")
+        # print(f"_init_workers_ray init workers time: {end_time - start_time}s")
+
+
+
+        self._run_workers("init_model")
+
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray init_model time: {end_time - start_time}s")
+
+
+        self._run_workers(
+            "load_model",
+            max_concurrent_workers=self.parallel_config.
+            max_parallel_loading_workers,
+        )
+
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray load_model time: {end_time - start_time}s")
+
+
+
+
+
+
+    # TODO (jingzhi): check what is driver worker and whether our code can still work
+    # NOTE: the function below will init new ray workers, it is called when the model inference is started (not at rescheduled time)
+    def _init_workers_ray_init_actor(self, placement_group: "PlacementGroup",
+                          **ray_remote_kwargs):
+        
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+        if self.parallel_config.tensor_parallel_size == 1:
+            num_gpus = self.cache_config.gpu_memory_utilization
+        else:
+            num_gpus = 1
+
+        self.driver_dummy_worker: RayWorkerVllm = None
+        self.workers: List[RayWorkerVllm] = []
+
+        driver_ip = get_ip()
+        for bundle_id, bundle in enumerate(placement_group.bundle_specs):
+
+            # <jingzhi>
+            print(f"bundle: {bundle}")
+
+            if not bundle.get("GPU", 0):
+                continue
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=placement_group,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=bundle_id,
+            )
+
+            # <jingzhi> consider the cache gpus
+            num_gpus = bundle['GPU']
+
+            worker = ray.remote(
+                num_cpus=0,
+                num_gpus=num_gpus,
+                scheduling_strategy=scheduling_strategy,
+                
+                # TODO <jingzhi> support changing env variables as we cannot init ray twice where the env variables in actors are initialized
+                runtime_env={"env_vars": dict(os.environ)},
+
+                **ray_remote_kwargs,
+            )(RayWorkerVllm).remote(self.model_config.trust_remote_code)
+
+            worker_ip = ray.get(worker.get_node_ip.remote())
+            if worker_ip == driver_ip and self.driver_dummy_worker is None:
+                # If the worker is on the same node as the driver, we use it
+                # as the resource holder for the driver process.
+                self.driver_dummy_worker = worker
+            else:
+                self.workers.append(worker)
+
+
+
+        if self.driver_dummy_worker is None:
+            raise ValueError(
+                "Ray does not allocate any GPUs on the driver node. Consider "
+                "adjusting the Ray placement group or running the driver on a "
+                "GPU node.")
+
+        driver_node_id, driver_gpu_ids = ray.get(
+            self.driver_dummy_worker.get_node_and_gpu_ids.remote())
+
+        # <jingzhi> For DEBUG
+        print(f"driver_node_id, driver_gpu_ids: {driver_node_id, driver_gpu_ids}")
+        print(f"self.workers: {self.workers}")
+
+        worker_node_and_gpu_ids = ray.get(
+            [worker.get_node_and_gpu_ids.remote() for worker in self.workers])
+
+        node_workers = defaultdict(list)
+        node_gpus = defaultdict(list)
+
+        node_workers[driver_node_id].append(0)
+        node_gpus[driver_node_id].extend(driver_gpu_ids)
+        for i, (node_id, gpu_ids) in enumerate(worker_node_and_gpu_ids,
+                                               start=1):
+            node_workers[node_id].append(i)
+            node_gpus[node_id].extend(gpu_ids)
+
+        # <jingzhi> For DEBUG
+        print(f"node_workers: {node_workers} node_gpus: {node_gpus}")
+
+
+        for node_id, gpu_ids in node_gpus.items():
+            # <jingzhi> we keep the visible gpus in the same order as we specify them
+            if os.environ['USE_VLLM'] == 'False':
+                if node_id == driver_node_id:
+                    node_gpus[node_id] = [int(gpu_i) for gpu_i in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
+                    continue
+
+            node_gpus[node_id] = sorted(gpu_ids)
+
+        # <jingzhi> For DEBUG
+        print(f"node_workers: {node_workers} node_gpus: {node_gpus}")
+
+
+        # Set CUDA_VISIBLE_DEVICES for the driver.
+        # <jingzhi>
+        print(f"in main process os.environ['CUDA_VISIBLE_DEVICES']:{os.environ['CUDA_VISIBLE_DEVICES']}")
+
+        set_cuda_visible_devices(node_gpus[driver_node_id])
+
+        # <jingzhi>
+        print(f"in main process os.environ['CUDA_VISIBLE_DEVICES']:{os.environ['CUDA_VISIBLE_DEVICES']}")
+
+
+        for worker, (node_id, _) in zip(self.workers, worker_node_and_gpu_ids):
+            worker.set_cuda_visible_devices.remote(node_gpus[node_id])
+
+        distributed_init_method = get_distributed_init_method(
+            driver_ip, get_open_port())
+        
+
+        # get backup variables so that we do not need to init ray actors again
+        self.backup_workers = self.workers
+        self.backup_worker_node_and_gpu_ids = worker_node_and_gpu_ids
+        self.backup_node_workers = node_workers
+        self.backup_distributed_init_method = distributed_init_method
+        self.backup_driver_node_id = driver_node_id
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray init ray actors time: {end_time - start_time}s")
+
+        self._init_workers_ray_no_actor_init()
+
+
+
+
+
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -382,7 +651,7 @@ class LLMEngine:
             self.lora_config.verify_with_scheduler_config(
                 self.scheduler_config)
 
-    def _init_cache(self) -> None:
+    def _init_cache_ori(self) -> None:
         """Profiles the memory usage and initializes the KV cache.
 
         The engine will first conduct a profiling of the existing memory usage.
@@ -404,6 +673,11 @@ class LLMEngine:
             by adjusting the `gpu_memory_utilization` parameters.
         """
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+  
+        
         num_blocks = self._run_workers(
             "profile_num_available_blocks",
             block_size=self.cache_config.block_size,
@@ -411,6 +685,11 @@ class LLMEngine:
             cpu_swap_space=self.cache_config.swap_space_bytes,
             cache_dtype=self.cache_config.cache_dtype,
         )
+
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_cache profile_num_available_blocks time: {end_time - start_time}")
 
 
         # <jingzhi> after updating KVBlkPerLayerWeight in each worker, we update KVBlkPerLayerWeight in the main process as well------
@@ -449,11 +728,195 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+
         self._run_workers("init_cache_engine", cache_config=self.cache_config)
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_cache init_cache_engine time: {end_time - start_time}")     
+
+
         # Warm up the model. This includes capturing the model into CUDA graph
         # if enforce_eager is False.
         # TODO (jingzhi) check this code
         self._run_workers("warm_up_model")
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_cache warm_up_model time: {end_time - start_time}")  
+
+
+
+    # <jingzhi> this function gets the reused cache profiling results from our profiling database
+    def get_reused_cache_profile_result(self) -> Tuple[int, int, Tuple[int, int]]:
+        '''
+            The content of each profiling result record.
+            num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+        '''
+        num_workers = self.parallel_config.world_size
+        model_name = self.model_config.model
+        cached_layer_num = KVBlkPerLayerWeight.cached_layer_num
+        blk_num_per_layer = KVBlkPerLayerWeight.blk_num_per_layer
+        # this dictionary returns the result when gpu utilization ratio = 0.9
+        # TODO (jingzhi) need to update the database
+        data_base = {('NousResearch/Llama-2-70b-hf', 2): (2057, 1638), 
+                     ('NousResearch/Llama-2-70b-hf', 4): (29278, 3276),
+                     ('NousResearch/Llama-2-13b-hf', 1): (3727, 327),
+                     ('NousResearch/Llama-2-13b-hf', 2): (9369, 655),
+                     ('NousResearch/Llama-2-13b-hf', 4): (20319, 1310),
+                     ('huggyllama/llama-7b', 1): (7348, 512),
+                     ('huggyllama/llama-7b', 2): (16209, 1024),
+                     ('huggyllama/llama-7b', 4): (33287, 2048)}
+        num_gpu_blocks, num_cpu_blocks = data_base[(model_name, num_workers)]
+        print(f"in get_reused_cache_profile_result: num_gpu_blocks, num_cpu_blocks, cached_layer_num, blk_num_per_layer: {num_gpu_blocks, num_cpu_blocks, cached_layer_num, blk_num_per_layer}")
+        # need consider gpu utilization ratio
+        reduced_tot_mem = KVBlkPerLayerWeight.tot_gpu_mem*(0.9-self.cache_config.gpu_memory_utilization)
+        num_gpu_blocks = num_gpu_blocks - \
+            (reduced_tot_mem+KVBlkPerLayerWeight.block_size-1)//KVBlkPerLayerWeight.block_size
+        print(f"in get_reused_cache_profile_result: after consider gpu_memory_utilization: num_gpu_blocks: {num_gpu_blocks}")
+        num_gpu_blocks = num_gpu_blocks + cached_layer_num * blk_num_per_layer
+        return int(num_gpu_blocks), int(num_cpu_blocks), (blk_num_per_layer, cached_layer_num)
+    
+
+
+
+    # <jingzhi> this function init the KV cache by reusing previous profiling result
+    def _init_cache_no_profile(self) -> None:
+        """Profiles the memory usage and initializes the KV cache.
+
+        The engine will first conduct a profiling of the existing memory usage.
+        Then, it calculate the maximum possible number of GPU and CPU blocks
+        that can be allocated with the remaining free memory.
+        More details can be found in the
+        :meth:`~vllm.worker.worker.Worker.profile_num_available_blocks` method
+        from class :class:`~vllm.worker.Worker`.
+
+        Afterwards, as there may be multiple workers,
+        we take the minimum number of blocks across all workers
+        to ensure this can be applied to all of them.
+
+        Finally, the engine will initialize the KV cache
+        with the calculated number of blocks.
+
+        .. tip::
+            You may limit the usage of GPU memory
+            by adjusting the `gpu_memory_utilization` parameters.
+        """
+        # Get the maximum number of blocks that can be allocated on GPU and CPU.
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+        # fake_profile_num_available_blocks will update KVBlkPerLayerWeight in each worker
+        self._run_workers(
+            "fake_profile_num_available_blocks",
+            block_size=self.cache_config.block_size,
+            gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+            cpu_swap_space=self.cache_config.swap_space_bytes,
+            cache_dtype=self.cache_config.cache_dtype,
+        )
+
+        
+        num_blocks = self.get_reused_cache_profile_result()
+
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_cache profile_num_available_blocks time: {end_time - start_time}")      
+
+
+        # <jingzhi> after updating KVBlkPerLayerWeight in each worker, we update KVBlkPerLayerWeight in the main process as well------
+        # blk_num_per_layer, cached_layer_num = num_blocks[0][2]
+        # for b in num_blocks[1:]:
+        #     assert b[2] == num_blocks[0][2]
+        # KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num = blk_num_per_layer, cached_layer_num
+        print(f"in init_cache: num_blocks: {num_blocks}")
+        # -----------------------------------------------------------------------------------------------------------------------------
+
+
+
+        # Since we use a shared centralized controller, we take the minimum
+        # number of blocks across all workers to make sure all the memory
+        # operators can be applied to all workers.
+        num_gpu_blocks = num_blocks[0]
+        num_cpu_blocks = num_blocks[1]
+
+        # FIXME(woosuk): Change to debug log.
+        logger.info(f"# GPU blocks: {num_gpu_blocks}, "
+                    f"# CPU blocks: {num_cpu_blocks}")
+
+        if num_gpu_blocks <= 0:
+            raise ValueError("No available memory for the cache blocks. "
+                             "Try increasing `gpu_memory_utilization` when "
+                             "initializing the engine.")
+        max_seq_len = self.cache_config.block_size * num_gpu_blocks
+        if self.model_config.max_model_len > max_seq_len:
+            raise ValueError(
+                f"The model's max seq len ({self.model_config.max_model_len}) "
+                "is larger than the maximum number of tokens that can be "
+                f"stored in KV cache ({max_seq_len}). Try increasing "
+                "`gpu_memory_utilization` or decreasing `max_model_len` when "
+                "initializing the engine.")
+
+        self.cache_config.num_gpu_blocks = num_gpu_blocks
+        self.cache_config.num_cpu_blocks = num_cpu_blocks
+
+        # Initialize the cache.
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+
+        self._run_workers("init_cache_engine", cache_config=self.cache_config)
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_cache init_cache_engine time: {end_time - start_time}")     
+
+
+        # Warm up the model. This includes capturing the model into CUDA graph
+        # if enforce_eager is False.
+        # TODO (jingzhi) check this code
+        self._run_workers("warm_up_model")
+
+        # <jingzhi> For Profiling
+        start_time = end_time
+        end_time = time.perf_counter()
+        print(f"_init_cache warm_up_model time: {end_time - start_time}")  
+
+
+
+    def _init_cache(self) -> None:
+        """Profiles the memory usage and initializes the KV cache.
+
+        The engine will first conduct a profiling of the existing memory usage.
+        Then, it calculate the maximum possible number of GPU and CPU blocks
+        that can be allocated with the remaining free memory.
+        More details can be found in the
+        :meth:`~vllm.worker.worker.Worker.profile_num_available_blocks` method
+        from class :class:`~vllm.worker.Worker`.
+
+        Afterwards, as there may be multiple workers,
+        we take the minimum number of blocks across all workers
+        to ensure this can be applied to all of them.
+
+        Finally, the engine will initialize the KV cache
+        with the calculated number of blocks.
+
+        .. tip::
+            You may limit the usage of GPU memory
+            by adjusting the `gpu_memory_utilization` parameters.
+        """
+        if (os.environ['USE_VLLM'] == 'True') or (os.environ['SOFT_RESCHEDULE'] == 'False'):
+            self._init_cache_ori()
+        else:
+            self._init_cache_no_profile()
+
 
 
     # <jingzhi>
@@ -486,6 +949,116 @@ class LLMEngine:
                      placement_group,
                      log_stats=not engine_args.disable_log_stats)
         return engine
+    
+
+    # <jingzhi> support soft reschedule
+    def update_from_engine_args(self, engine_args: EngineArgs) -> None:
+        ''' Update an LLM engine from the engine arguments. '''
+        # Create the engine configs.
+        engine_configs = engine_args.create_engine_configs()
+        parallel_config = engine_configs[2]
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+        # Initialize the cluster.
+        # placement_group = initialize_cluster(parallel_config)
+        placement_group = None # we do not need placement group when rescheduling models
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"initialize_cluster time: {end_time - start_time}s")
+
+        # Create the LLM engine.
+        self.update_engine(*engine_configs,
+                     placement_group,
+                     log_stats=not engine_args.disable_log_stats)
+
+
+
+    # <jingzhi> support soft reschedule
+    def update_engine(
+        self,
+        model_config: ModelConfig,
+        cache_config: CacheConfig,
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        device_config: DeviceConfig,
+        lora_config: Optional[LoRAConfig],
+        placement_group: Optional["PlacementGroup"],
+        log_stats: bool,
+    ) -> None:
+        logger.info(
+            "Initializing an LLM engine with config: "
+            f"model={model_config.model!r}, "
+            f"tokenizer={model_config.tokenizer!r}, "
+            f"tokenizer_mode={model_config.tokenizer_mode}, "
+            f"revision={model_config.revision}, "
+            f"tokenizer_revision={model_config.tokenizer_revision}, "
+            f"trust_remote_code={model_config.trust_remote_code}, "
+            f"dtype={model_config.dtype}, "
+            f"max_seq_len={model_config.max_model_len}, "
+            f"download_dir={model_config.download_dir!r}, "
+            f"load_format={model_config.load_format}, "
+            f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
+            f"disable_custom_all_reduce={parallel_config.disable_custom_all_reduce}, "
+            f"quantization={model_config.quantization}, "
+            f"enforce_eager={model_config.enforce_eager}, "
+            f"kv_cache_dtype={cache_config.cache_dtype}, "
+            f"device_config={device_config.device}, "
+            f"seed={model_config.seed})")
+        # TODO(woosuk): Print more configs in debug mode.
+
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.lora_config = lora_config
+        self.parallel_config = parallel_config
+        self.scheduler_config = scheduler_config
+        self.device_config = device_config
+        self.log_stats = log_stats
+        self._verify_args()
+
+        self._init_tokenizer()
+        # self.seq_counter = Counter() # <jingzhi>
+
+        # Create the parallel GPU workers.
+        if self.parallel_config.worker_use_ray:
+            # Disable Ray usage stats collection.
+            ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
+            if ray_usage != "1":
+                os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+            self._init_workers_ray(placement_group)
+        else:
+            self._init_workers()
+
+
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+
+        # Profile the memory usage and initialize the cache.
+        self._init_cache()
+
+
+        # <jingzhi> For Profiling
+        end_time = time.perf_counter()
+        print(f"_init_workers_ray _init_cache time: {end_time - start_time}s")
+
+
+        # Create the scheduler.
+        # TODO (jingzhi) need to update scheduler instead of reinitialize it if we want to reuse KV cache
+        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+
+        # Metric Logging.
+        if self.log_stats:
+            self.stat_logger = StatLogger(
+                local_interval=_LOCAL_LOGGING_INTERVAL_SEC)
+
+
+
+
+
+
 
     def encode_request(
         self,
@@ -1123,9 +1696,12 @@ class LLMEngine:
 
 
     # <jingzhi> delete worker to release resources
-    def delete_workers(self) -> None:
+    def delete_workers(self, exit_actor=True) -> None:
+        '''
+            Input: exit_actor determines whether to kill the actor processes or not
+        '''
         ray_worker_outputs = [
-            worker.delete_worker.remote()
+            worker.delete_worker.remote(exit_actor)
             for worker in self.workers
         ]
 

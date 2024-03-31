@@ -516,6 +516,7 @@ class KVBlkPerLayerWeight:
     layer_weight_size: int = -1 (in bytes) 
     cached_layer_num: int = -1
     layer_num: int = -1 (the number of layers in the model)
+    tot_gpu_mem: int = -1 (in bytes) total gpu memory of the card (regardless of the gpu utilization ratio)
     """
     blk_num_per_layer: int = -1
     block_size: int = -1
@@ -523,6 +524,7 @@ class KVBlkPerLayerWeight:
     cached_layer_num: int = -1
     load_more_layer_on_card_num: int = 0
     layer_num: int = -1
+    tot_gpu_mem: int = -1
 
     @classmethod
     def reset(cls):
@@ -532,6 +534,7 @@ class KVBlkPerLayerWeight:
         cls.cached_layer_num: int = -1
         cls.load_more_layer_on_card_num: int = 0
         cls.layer_num: int = -1    
+        cls.tot_gpu_mem: int = -1
 
     @classmethod
     def print_info(cls):
@@ -540,6 +543,7 @@ class KVBlkPerLayerWeight:
               f"layer_weight_size={cls.layer_weight_size}, "
               f"cached_layer_num={cls.cached_layer_num}, "
               f"load_more_layer_on_card_num={cls.load_more_layer_on_card_num}, "
-              f"layer_num={cls.layer_num}, ",
+              f"layer_num={cls.layer_num}, "
+              f"tot_gpu_mem={cls.tot_gpu_mem}",
               flush=True
               )

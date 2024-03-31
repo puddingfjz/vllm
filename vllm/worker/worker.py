@@ -123,15 +123,28 @@ class Worker:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
+
+        # <jingzhi> For Profiling
+        import time
+        start = time.perf_counter()
+
         init_distributed_environment(self.parallel_config, self.rank,
                                      self.distributed_init_method)
+        
+        end = time.perf_counter()
+        print(f"init_distributed_environment time: {end - start}s")
+
         if not self.parallel_config.disable_custom_all_reduce:
 
 
             # <jingzhi> For DEBUG
             print(f"init_custom_ar -------------", flush=True)
+            start = time.perf_counter()
 
             init_custom_ar()
+            
+            end = time.perf_counter()
+            print(f"init_custom_ar time: {end - start}s")
         # Initialize the model.
 
         # <jingzhi> For DEBUG
@@ -213,6 +226,45 @@ class Worker:
 
         # <jingzhi> also return the information of KVBlkPerLayerWeight
         return num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+    
+
+
+    # <jingzhi> fake profiling 
+    def fake_profile_num_available_blocks(
+        self,
+        block_size: int,
+        gpu_memory_utilization: float,
+        cpu_swap_space: int,
+        cache_dtype: str,
+    ) -> None:
+        """Profiles the peak memory usage of the model and returns the maximum
+        number of GPU and CPU cache blocks that can be allocated.
+
+        Args:
+            block_size: The size of the cache block.
+            gpu_memory_utilization: The fraction of the total GPU memory to use.
+            cpu_swap_space: The size of the CPU swap space in bytes.
+        """
+        cache_block_size = CacheEngine.get_cache_block_size(
+            block_size, cache_dtype, self.model_config, self.parallel_config)
+
+        # store total gpu memory and KV cache dtype
+        _, total_gpu_memory = torch.cuda.mem_get_info()
+        KVBlkPerLayerWeight.tot_gpu_mem = total_gpu_memory
+
+        # <jingzhi> store the information of cache_block_size in class 
+        KVBlkPerLayerWeight.block_size = cache_block_size
+        if os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] == 'True':
+            assert KVBlkPerLayerWeight.layer_weight_size>0, KVBlkPerLayerWeight.layer_weight_size
+        KVBlkPerLayerWeight.blk_num_per_layer = (KVBlkPerLayerWeight.layer_weight_size + KVBlkPerLayerWeight.block_size - 1) // KVBlkPerLayerWeight.block_size
+        if int(os.getenv("LOCAL_RANK", "0")) == 0:
+            print(f"\n\nblk_num_per_layer: {KVBlkPerLayerWeight.blk_num_per_layer}\n\n")
+            print(f"gpu_memory_utilization:{gpu_memory_utilization}, cache_block_size:{cache_block_size}")
+
+        # <jingzhi> also return the information of KVBlkPerLayerWeight ==> do not need to return KVBlkPerLayerWeight
+        # return num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+
+
 
 
 

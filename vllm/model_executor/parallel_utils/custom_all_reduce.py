@@ -89,6 +89,10 @@ def capture():
 
 def custom_all_reduce(input: torch.Tensor) -> Optional[torch.Tensor]:
     ca_handle = get_handle()
+
+    # <jingzhi> For debug
+    # print(f"ca_handle: {ca_handle}", flush=True)
+
     # when custom allreduce is disabled, this will be None
     if ca_handle is None:
         return
@@ -106,7 +110,15 @@ def custom_all_reduce(input: torch.Tensor) -> Optional[torch.Tensor]:
         # custom allreduce incurs a cost of cudaMemcpy, which should
         # be small(<=1% of overall latency) compared to the performance
         # gains of using custom kernels
+
+        # <jingzhi> For debug
+        # print(f"custom_all_reduce 1", flush=True)
+
         if ca_handle.should_custom_ar(input):
+
+            # <jingzhi> For debug
+            # print(f"custom_all_reduce 2", flush=True)
+
             return ca_handle.all_reduce_unreg(input)
 
 

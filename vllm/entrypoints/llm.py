@@ -109,6 +109,52 @@ class LLM:
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
 
+
+
+    def update_llm_engine(        
+        self,
+        model: str,
+        tokenizer: Optional[str] = None,
+        tokenizer_mode: str = "auto",
+        trust_remote_code: bool = False,
+        tensor_parallel_size: int = 1,
+        dtype: str = "auto",
+        quantization: Optional[str] = None,
+        revision: Optional[str] = None,
+        tokenizer_revision: Optional[str] = None,
+        seed: int = 0,
+        gpu_memory_utilization: float = 0.9,
+        swap_space: int = 4,
+        enforce_eager: bool = False,
+        max_context_len_to_capture: int = 8192,
+        disable_custom_all_reduce: bool = False,
+        **kwargs,
+    ) -> None:
+        if "disable_log_stats" not in kwargs:
+            kwargs["disable_log_stats"] = True
+        engine_args = EngineArgs(
+            model=model,
+            tokenizer=tokenizer,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tensor_parallel_size=tensor_parallel_size,
+            dtype=dtype,
+            quantization=quantization,
+            revision=revision,
+            tokenizer_revision=tokenizer_revision,
+            seed=seed,
+            gpu_memory_utilization=gpu_memory_utilization,
+            swap_space=swap_space,
+            enforce_eager=enforce_eager,
+            max_context_len_to_capture=max_context_len_to_capture,
+            disable_custom_all_reduce=disable_custom_all_reduce,
+            **kwargs,
+        )
+        self.llm_engine.update_from_engine_args(engine_args)
+
+
+
+
     def get_tokenizer(
             self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
         return self.llm_engine.tokenizer
@@ -247,7 +293,7 @@ class LLM:
 
 
             # <jingzhi> to support multi-model scheduling
-            if SHARED_CONTECT.should_reschedule():
+            if SHARED_CONTECT.should_reschedule() and (os.environ['NO_PREEMPT'] == 'False'):
                 # remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
                 # SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests)
                 # # now we are ready to reload the model according to the new execution plan and restart the inference
@@ -293,3 +339,114 @@ class LLM:
         # its previous requests.
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
         return outputs
+    
+
+
+
+
+
+
+
+
+
+
+
+    # TODO (jingzhi) this function is used for DEBUG
+    def _run_engine_for_debug(self, use_tqdm: bool) -> List[RequestOutput]:
+        # Initialize tqdm.
+        if use_tqdm:
+            num_requests = self.llm_engine.get_num_unfinished_requests()
+            pbar = tqdm(total=num_requests, desc="Processed prompts")
+        # Run the engine.
+        outputs: List[RequestOutput] = []
+
+        # <jingzhi> init KV_blk_per_layer_weights
+        import os
+
+        # <jingzhi> support multimodel scheduling
+        from vllm.core.multimodel_scheduler import SHARED_CONTECT
+
+
+        # <jingzhi> For Profiling--------------------
+        import torch
+        step_i = 0
+        # -------------------------------------------
+
+
+        while self.llm_engine.has_unfinished_requests():
+
+            # <jingzhi> For Profiling-----------------
+            step_i+=1
+            print(f"step i: {step_i}", flush=True)
+
+
+            # <jingzhi> For DEBUG
+            # stop_step = 155
+            # if os.environ['USE_VLLM']=='False':
+            #     stop_step = 128
+            # if step_i > stop_step: # 155 vllm  128 ours
+            #     break
+
+
+            if (step_i == 1) and (self.llm_engine.parallel_config.world_size==4): #140):
+                # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+                print(f"step_i: {step_i}")
+                torch.cuda.cudart().cudaProfilerStart()
+            elif (step_i == 3) and (self.llm_engine.parallel_config.world_size==4): #200):
+                # elif (step_i == step_end) and (run_profile):
+                # print(f"step_i: {step_i}, step_start: {step_start}, step_end:{step_end}")
+                print(f"step_i: {step_i}")
+                torch.cuda.cudart().cudaProfilerStop()
+            # ---------------------------------------- 
+
+
+
+            # <jingzhi> to support multi-model scheduling
+            # if SHARED_CONTECT.should_reschedule():
+            if (step_i>3):
+                # remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
+                # SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests)
+                # # now we are ready to reload the model according to the new execution plan and restart the inference
+                break
+
+
+
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                if output.finished:
+                    outputs.append(output)
+                    if use_tqdm:
+                        pbar.update(1)
+        if use_tqdm:
+            pbar.close()
+
+        print(f"total steps: {step_i}")
+        # <jingzhi> For layer-by-layer params loading------------------------------------------------
+        from vllm._C import cache_ops
+        if os.environ['USE_VLLM']!='True':
+            # for cache_device_i in self.llm_engine.workers[0].model_runner.model.model.cache_device_ids:
+            #     cache_ops.disable_P2P_access(cache_device_i, 0, 0)
+            # in distributed inference, the current device for this worker may not be cuda:0
+            self.llm_engine.disable_P2P_access()
+        # -------------------------------------------------------------------------------------------
+
+
+
+        # <jingzhi> support multi-model inference
+        SHARED_CONTECT.set_finished(not self.llm_engine.scheduler.has_unfinished_seqs())
+        if not SHARED_CONTECT.is_finished():
+            remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
+            SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
+            # now we are ready to reload the model according to the new execution plan and restart the inference
+
+
+        print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
+
+
+
+        # Sort the outputs by request ID.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        outputs = sorted(outputs, key=lambda x: int(x.request_id))
+        return outputs
+
