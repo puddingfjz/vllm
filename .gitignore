@@ -195,3 +195,17 @@ _build/
 /benchmarks/nsys_profile/
 /benchmarks/figures/
 /benchmarks/cost_model/figures/
+
+
+# figures
+*.pdf
+*.png
+
+
+# logs and scripts
+*.err
+My_README.md
+ENV_SCRIPTS_complete_version.md
+env_command.md
+
+

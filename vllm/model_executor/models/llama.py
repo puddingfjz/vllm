@@ -89,6 +89,10 @@ class LlamaMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
 
 
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'gate_up_proj: {x.shape} -> {gate_up.shape}')
+
+
         # <jingzhi> For DEBUG
         # self.infer_count += 1
         # if (int(os.getenv("LOCAL_RANK", "0")) == 1):
@@ -113,6 +117,9 @@ class LlamaMLP(nn.Module):
 
         x = self.act_fn(gate_up)
 
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'act_fn: {gate_up.shape} -> {x.shape}')
+
         # if (int(os.getenv("LOCAL_RANK", "0")) == 1)\
         #     and (self.infer_count >= step_to_print):
         #     print(f"x shape 2: {x.shape}")
@@ -125,6 +132,9 @@ class LlamaMLP(nn.Module):
 
         x, _ = self.down_proj(x)
 
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'down_proj: -> {x.shape}')
 
         # if (int(os.getenv("LOCAL_RANK", "0")) == 1)\
         #     and (self.infer_count >= step_to_print):
@@ -214,15 +224,32 @@ class LlamaAttention(nn.Module):
         # if int(os.getenv("LOCAL_RANK", "0")) == 0:
         #     print(f"hidden_states 3: {hidden_states[-1].tolist()}")
         #     print(f"qkv_proj.linear_weights: {self.qkv_proj.linear_weights['weight'][0].tolist()}")
-        #     print(f"qkv_proj.linear_weights address: {self.qkv_proj.linear_weights['weight'].data_ptr()}")
+            # print(f"qkv_proj.linear_weights address: {self.qkv_proj.linear_weights['weight'].data_ptr()}")
 
 
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'qkv_proj: {hidden_states.shape} -> {qkv.shape}')
+
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'rotary_emb: -> {q.shape}, {k.shape}')
+
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'attn: -> {attn_output.shape}')
+
         output, _ = self.o_proj(attn_output)
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'o_proj: -> {output.shape}')
+
         return output
 
 
@@ -299,6 +326,9 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'input_layernorm: -> {hidden_states.shape}')
 
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0) and (type(kv_cache[0])!=type(None))\
@@ -315,6 +345,10 @@ class LlamaDecoderLayer(nn.Module):
         )
 
 
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'self_attn: -> {hidden_states.shape}')
+
+
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0) and (type(kv_cache[0])!=type(None))\
         #     and (self.infer_count >= step_to_print):
@@ -325,6 +359,11 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'post_attention_layernorm: -> {hidden_states.shape}')
+
+
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0) and (type(kv_cache[0])!=type(None))\
         #     and (self.infer_count >= step_to_print):
@@ -332,6 +371,10 @@ class LlamaDecoderLayer(nn.Module):
 
 
         hidden_states = self.mlp(hidden_states)
+
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'mlp: -> {hidden_states.shape}')
 
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 1) and (type(kv_cache[0])!=type(None))\
@@ -477,6 +520,18 @@ class LlamaModel(nn.Module):
         cache_gpu_num = torch.cuda.device_count() - worker_num
         # we need do cuda order remapping because ray would mess it up
         # self.cache_device_ids = list(range(worker_num+torch.cuda.current_device()*cache_gpu_num, worker_num+(torch.cuda.current_device()+1)*cache_gpu_num))
+
+        if os.getenv("TOT_ORDERED_GPUS", 'None') != 'None':
+            # to support reschedule, we need TOT_ORDERED_GPUS
+            cand_cache_device_names = os.environ['TOT_ORDERED_GPUS'].split(',')[worker_num:]
+            current_device_names_ordered = {gpu_i:i for i, gpu_i in enumerate(os.environ['CUDA_VISIBLE_DEVICES'].split(','))}
+            cand_cache_device_ids = [current_device_names_ordered[cuda_name] for cuda_name in cand_cache_device_names]
+            self.cache_device_ids = cand_cache_device_ids
+            
+            print(f"self.cache_device_ids: {self.cache_device_ids} layer_num: {len(self.layers)}")
+            
+            return
+
         if worker_num == 1:
             # although the logic is the same as when worker_num > 1, but as in this branch, we do not have os.environ['TOT_ORDERED_GPUS'], 
             # we deal with it seperately
@@ -675,6 +730,9 @@ class LlamaModel(nn.Module):
         residual = None
 
 
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'embed_tokens: {input_ids.shape} -> {hidden_states.shape}')
+
         # <jingzhi> For profiling
         # torch.cuda.synchronize()
         # time2 = time.perf_counter()
@@ -785,6 +843,9 @@ class LlamaModel(nn.Module):
 
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
+        #     print(f'norm:  -> {hidden_states.shape}')
 
         # support dynamically increase on-card layer weight amount
         self.post_increase_oncard_layers()

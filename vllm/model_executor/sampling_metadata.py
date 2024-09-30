@@ -137,11 +137,14 @@ class SamplingTensors:
         sampling_tensors = SamplingTensors.from_lists(
             temperatures, top_ps, top_ks, min_ps, presence_penalties,
             frequency_penalties, repetition_penalties, prompt_tokens,
-            output_tokens, vocab_size, device, dtype)
+            output_tokens, vocab_size, device, dtype, 
+            # <jingzhi>
+            do_penalties,
+            )
         return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
 
     @classmethod
-    def from_lists(cls, temperatures: List[float], top_ps: List[float],
+    def from_lists_vllm(cls, temperatures: List[float], top_ps: List[float],
                    top_ks: List[int], min_ps: List[float],
                    presence_penalties: List[float],
                    frequency_penalties: List[float],
@@ -206,6 +209,13 @@ class SamplingTensors:
             dtype=torch.int,
             pin_memory=pin_memory,
         )
+
+        # <jingzhi>
+        import time
+        torch.cuda.synchronize()
+        time1 = time.perf_counter()
+
+
         prompt_tensor = torch.tensor(
             prompt_padded_tokens,
             device="cpu",
@@ -218,6 +228,29 @@ class SamplingTensors:
             dtype=torch.long,
             pin_memory=pin_memory,
         )
+
+
+        # <jingzhi>
+        import time
+        torch.cuda.synchronize()
+        time2 = time.perf_counter()
+
+
+        prompt_tensor.to(device=device, non_blocking=True)
+        output_tensor.to(device=device, non_blocking=True)
+
+
+
+        # <jingzhi>
+        import time
+        torch.cuda.synchronize()
+        time3 = time.perf_counter()
+
+        print(f"in prepare sampling tensors, tensor sizes: {[prompt_tensor.numel(), output_tensor.numel()]}")
+        print(f"in prepare sampling tensors: {[time1, time2, time3]}")
+        print(f"in prepare sampling tensors: {[time2-time1, time3-time2]}")
+
+
         # Because the memory is pinned, we can do non-blocking
         # transfer to device.
         return cls(
@@ -233,4 +266,295 @@ class SamplingTensors:
                                                            non_blocking=True),
             prompt_tokens=prompt_tensor.to(device=device, non_blocking=True),
             output_tokens=output_tensor.to(device=device, non_blocking=True),
+        )
+
+
+
+
+
+
+    # <jingzhi> in this version, we do not pad prompt_tokens and output_tokens,
+    # instead, we change the tokenids in these two tensors so that we can generate the same results in later use (in applying penalty)
+    @classmethod
+    def from_lists(cls, temperatures: List[float], top_ps: List[float],
+                   top_ks: List[int], min_ps: List[float],
+                   presence_penalties: List[float],
+                   frequency_penalties: List[float],
+                   repetition_penalties: List[float],
+                   prompt_tokens: List[List[int]],
+                   output_tokens: List[List[int]], vocab_size: int,
+                   device: torch.device,
+                   dtype: torch.dtype,
+                   # <jingzhi> added parameter    
+                   do_penalties: bool,
+                   ) -> "SamplingTensors":
+        # Note that the performance will be very bad without
+        # pinned memory.
+        pin_memory = not in_wsl()
+        # prompt_max_len = max(len(tokens) for tokens in prompt_tokens)
+        # prompt_padded_tokens = [
+        #     tokens + [vocab_size] * (prompt_max_len - len(tokens))
+        #     for tokens in prompt_tokens
+        # ]
+
+        # <jingzhi>-------------------------------------------------------------
+        # <jingzhi>
+        # import time
+        # torch.cuda.synchronize()
+        # time01 = time.perf_counter()
+        
+        # prompt_padded_tokens = list()
+        # for seqi, tokens in enumerate(prompt_tokens):
+        #     offset = seqi * (vocab_size + 1)
+        #     prompt_padded_tokens.extend([offset + token for token in tokens])
+        # 
+        # prompt_padded_tokens = list()
+        # for tokens in prompt_tokens:
+        #     prompt_padded_tokens.extend(tokens)
+        # 
+        # prompt_lens = list()
+        # prompt_padded_tokens = list()
+        # for seqi, tokens in enumerate(prompt_tokens):
+        #     prompt_padded_tokens.extend(tokens)
+        #     prompt_lens.extend([seqi]*len(tokens))
+        # prompt_padded_tokens = np.concatenate([np.asarray(tokens) + seqi*(vocab_size + 1) for seqi, tokens in enumerate(prompt_tokens)]).tolist()
+        # prompt_padded_tokens = torch.concatenate([torch.tensor(tokens) + seqi*(vocab_size + 1) for seqi, tokens in enumerate(prompt_tokens)])
+        # prompt_padded_tokens = sum(prompt_tokens, [])
+        # ----------------------------------------------------------------------
+
+        # output_max_len = max(len(tokens) for tokens in output_tokens)
+        # output_padded_tokens = [
+        #     tokens + [vocab_size] * (output_max_len - len(tokens))
+        #     for tokens in output_tokens
+        # ]
+
+        # <jingzhi>-------------------------------------------------------------
+        # output_padded_tokens = list()
+        # for seqi, tokens in enumerate(output_tokens):
+        #     offset = seqi * (vocab_size + 1)
+        #     output_padded_tokens.extend([offset + token for token in tokens])
+        # 
+        # output_padded_tokens = list()
+        # for tokens in output_tokens:
+        #     output_padded_tokens.extend(tokens)
+        # 
+        # output_lens = list()
+        # output_padded_tokens = list()
+        # for seqi, tokens in enumerate(output_tokens):
+        #     output_padded_tokens.extend(tokens)
+        #     output_lens.extend([seqi]*len(tokens))
+        # output_padded_tokens = np.concatenate([np.asarray(tokens) + seqi*(vocab_size + 1) for seqi, tokens in enumerate(output_tokens)]).tolist()
+        # output_padded_tokens = torch.concatenate([torch.tensor(tokens) + seqi*(vocab_size + 1) for seqi, tokens in enumerate(output_tokens)])
+        # print(prompt_padded_tokens.device)
+        # output_padded_tokens = sum(output_tokens, [])
+        # <jingzhi>
+        # import time
+        # torch.cuda.synchronize()
+        # time02 = time.perf_counter()
+        # ----------------------------------------------------------------------
+
+        temperatures_t = torch.tensor(
+            temperatures,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        top_ps_t = torch.tensor(
+            top_ps,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        min_ps_t = torch.tensor(
+            min_ps,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        presence_penalties_t = torch.tensor(
+            presence_penalties,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        frequency_penalties_t = torch.tensor(
+            frequency_penalties,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        repetition_penalties_t = torch.tensor(
+            repetition_penalties,
+            device="cpu",
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        top_ks_t = torch.tensor(
+            top_ks,
+            device="cpu",
+            dtype=torch.int,
+            pin_memory=pin_memory,
+        )
+
+        # <jingzhi>
+        # import time
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
+
+        # prompt_padded_tokens = list()
+        # for tokens in prompt_tokens:
+        #     prompt_padded_tokens.extend(tokens)
+
+        # output_padded_tokens = list()
+        # for tokens in output_tokens:
+        #     output_padded_tokens.extend(tokens)
+
+        # prompt_tensor = torch.tensor(
+        #     prompt_padded_tokens,
+        #     device="cpu",
+        #     dtype=torch.long,
+        #     pin_memory=pin_memory,
+        # )
+        # output_tensor = torch.tensor(
+        #     output_padded_tokens,
+        #     device="cpu",
+        #     dtype=torch.long,
+        #     pin_memory=pin_memory,
+        # )
+
+
+        # <jingzhi>----------------------------------------------
+        # prompt_tensor = prompt_padded_tokens.pin_memory()
+        # output_tensor = output_padded_tokens.pin_memory()
+        # prompt_tensor = prompt_tensor + torch.repeat_interleave((vocab_size+1)*torch.arange(len(prompt_tokens)), torch.tensor([len(i) for i in prompt_tokens]))
+        # output_tensor = output_tensor + torch.repeat_interleave((vocab_size+1)*torch.arange(len(output_tokens)), torch.tensor([len(i) for i in output_tokens]))
+        # prompt_tensor = prompt_tensor + torch.tensor(prompt_lens, dtype=torch.long,)
+        # output_tensor = output_tensor + torch.tensor(output_lens, dtype=torch.long,)
+        # prompt_tensor = [torch.tensor(
+        #     tokens,
+        #     device="cpu",
+        #     dtype=torch.long,
+        #     pin_memory=pin_memory,
+        # ) for tokens in prompt_tokens]
+        # output_tensor = [torch.tensor(
+        #     tokens,
+        #     device="cpu",
+        #     dtype=torch.long,
+        #     pin_memory=pin_memory,
+        # )  for tokens in output_tokens]
+        # -------------------------------------------------------
+
+
+        # <jingzhi>
+        # import time
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
+
+
+        # prompt_tensor.to(device=device, non_blocking=True)
+        # output_tensor.to(device=device, non_blocking=True)
+
+        # <jingzhi>----------------------------------------------
+        # for i in prompt_tensor:
+        #     i.to(device=device, non_blocking=True)
+        # for i in output_tensor:
+        #     i.to(device=device, non_blocking=True)
+        # prompt_cumlens=np.cumsum([len(i) for i in prompt_tokens])
+        # output_cumlens=np.cumsum([len(i) for i in output_tokens])
+        # prompt_tensor = prompt_tensor.to(device=device, non_blocking=True)
+        # output_tensor = output_tensor.to(device=device, non_blocking=True)
+        # prompt_tensor = [prompt_tensor[prompt_cumlens[i]:prompt_cumlens[i+1]] for i in range(len(prompt_cumlens)-1)]
+        # output_tensor = [output_tensor[output_cumlens[i]:output_cumlens[i+1]] for i in range(len(output_cumlens)-1)]
+        # 
+
+
+        prompt_tensor = None
+        output_tensor = None
+        if do_penalties:
+            prompt_padded_tokens = list()
+            for tokens in prompt_tokens:
+                prompt_padded_tokens.extend(tokens)
+
+            output_padded_tokens = list()
+            for tokens in output_tokens:
+                output_padded_tokens.extend(tokens)
+
+            prompt_tensor = torch.tensor(
+                prompt_padded_tokens,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            output_tensor = torch.tensor(
+                output_padded_tokens,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+
+
+            prompt_tensor = prompt_tensor.to(device=device, non_blocking=True)
+            output_tensor = output_tensor.to(device=device, non_blocking=True)
+            prompt_lens = torch.tensor(
+                [len(i) for i in prompt_tokens],
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            output_lens = torch.tensor(
+                [len(i) for i in output_tokens],
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            prompt_lens = prompt_lens.to(device=device, non_blocking=True)
+            output_lens = output_lens.to(device=device, non_blocking=True)
+            prompt_tensor = prompt_tensor + \
+                torch.repeat_interleave((vocab_size+1)*torch.arange(len(prompt_tokens), device=device), 
+                                        prompt_lens)
+            output_tensor = output_tensor + \
+                torch.repeat_interleave((vocab_size+1)*torch.arange(len(output_tokens), device=device), 
+                                        output_lens)
+        # -------------------------------------------------------
+
+
+
+        # <jingzhi>
+        # import time
+        # torch.cuda.synchronize()
+        # time3 = time.perf_counter()
+
+        # print(f"in prepare sampling tensors, tensor sizes: {[prompt_tensor.numel(), output_tensor.numel()]}")
+        # print(f"in prepare sampling tensors: {[time1, time2, time3]}")
+        # print(f"in prepare sampling tensors: {[time02-time01, time2-time1, time3-time2]}")
+
+
+        # Because the memory is pinned, we can do non-blocking
+        # transfer to device.
+        return cls(
+            temperatures=temperatures_t.to(device=device, non_blocking=True),
+            top_ps=top_ps_t.to(device=device, non_blocking=True),
+            top_ks=top_ks_t.to(device=device, non_blocking=True),
+            min_ps=min_ps_t.to(device=device, non_blocking=True),
+            presence_penalties=presence_penalties_t.to(device=device,
+                                                       non_blocking=True),
+            frequency_penalties=frequency_penalties_t.to(device=device,
+                                                         non_blocking=True),
+            repetition_penalties=repetition_penalties_t.to(device=device,
+                                                           non_blocking=True),
+            # prompt_tokens=prompt_tensor.to(device=device, non_blocking=True),
+            # output_tokens=output_tensor.to(device=device, non_blocking=True),
+
+            # <jingzhi>----------------------------------------------
+            # prompt_tokens=[i.to(device=device, non_blocking=True) for i in prompt_tensor],
+            # output_tokens=[i.to(device=device, non_blocking=True) for i in output_tensor],
+            prompt_tokens=prompt_tensor,
+            output_tokens=output_tensor,
+            # -------------------------------------------------------
+
+
+            # <jingzhi>
+            # prompt_lens=[len(i) for i in prompt_tokens],
+            # output_lens=[len(i) for i in output_tokens],
         )

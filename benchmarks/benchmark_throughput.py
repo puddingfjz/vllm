@@ -5,7 +5,7 @@
 
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='2,3,1,0' # '2,3' # '3,0,1,2' # should be set before initialize cuda in torch
+# os.environ['CUDA_VISIBLE_DEVICES']='3,1,2,0' # '2,3' # '3,0,1,2' # should be set before initialize cuda in torch
 os.environ['USE_VLLM']='True'
 # os.environ['TOT_GPU_NUM'] = '4' # should be consistent with os.environ['CUDA_VISIBLE_DEVICES']
 # os.environ['WEIGHT_LOAD_DEGREE'] = '16' # now will set it in command
@@ -18,6 +18,8 @@ os.environ['SOFT_RESCHEDULE'] = 'False' # whether to reinitialize LLMs directly 
 os.environ['NO_PREEMPT'] = 'True' # allow model preemption or not
 # about scheduling
 os.environ['SORT_REQS'] = 'True' # whether to sort the requests according to their output lengths, default is False
+os.environ['COLLECT_TIME_LOG'] = 'False' # whether to sort the requests according to their output lengths, default is False
+
 
 
 def environs_are_correct():
@@ -79,7 +81,11 @@ from tqdm import tqdm
 
 # <jingzhi>
 from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
-
+# to support data parallel
+from vllm.engine.ray_utils import ray
+# from my_llm_infer_worker import LLM_INFER_WORKER, REMOTE_LLM_INFER_WORKER, REMOTE_LLM_INFER_WORKER_MESSAGE_PASSER
+import my_llm_infer_worker_multiprocessing
+from collections import deque
 
 print(f'executing benchmark_throughput.py')
 
@@ -254,7 +260,7 @@ def run_vllm_ori(
 
 
 # <jingzhi> run_vllm_with_preemption
-def run_vllm(
+def run_vllm_v0826_no_data_parallel(
     requests: List[Tuple[str, int, int]],
     model: str,
     tokenizer: str,
@@ -272,12 +278,16 @@ def run_vllm(
     
     # <jingzhi>
     gpu_memory_utilization: float,
+    temperature: float,
+    ignore_eos: bool,
 ) -> float:
     
     # <jingzhi> test shared array
     from vllm.core.multimodel_scheduler import SHARED_CONTECT
     # SHARED_CONTECT.test_and_print()
     # SHARED_CONTECT.test_task()
+    # set the status to inform the multi-model scheduler that the prepartion is finished
+    SHARED_CONTECT.set_finish_preparation_before_init_LLM()
     # wait for the model to be started
     SHARED_CONTECT.wait_to_be_started()
      
@@ -299,7 +309,8 @@ def run_vllm(
 
         if rescheduled_iter_num > 0:
             # need wait for the signal to start model loading
-            SHARED_CONTECT.sync_before_loading_model()
+            # SHARED_CONTECT.sync_before_loading_model()
+            SHARED_CONTECT.wait_to_be_started()
 
         print(f"finish waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
         
@@ -316,6 +327,7 @@ def run_vllm(
         print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
 
         if (rescheduled_iter_num == 0) or (os.environ['SOFT_RESCHEDULE'] == 'False'):
+            start_time_load_LLM = time.perf_counter()
             llm = LLM(
                 model=model,
                 tokenizer=tokenizer,
@@ -335,8 +347,11 @@ def run_vllm(
                 max_num_seqs=512,
                 max_paddings=512,
             )
+            end_time_load_LLM = time.perf_counter()
+            print(f"total time to load LLM: {end_time_load_LLM - start_time_load_LLM}")
         else:
             # update llm instead of initialize a new one
+            start_time_load_LLM = time.perf_counter()
             llm.update_llm_engine(
                 model=model,
                 tokenizer=tokenizer,
@@ -356,24 +371,29 @@ def run_vllm(
                 max_num_seqs=512,
                 max_paddings=512,
             )
+            end_time_load_LLM = time.perf_counter()
+            print(f"total time to update LLM: {end_time_load_LLM - start_time_load_LLM}")
 
 
         if rescheduled_iter_num == 0:
 
             # <jingzhi>
             print(f"max_model_len: {llm.llm_engine.model_config.max_model_len}")
+            print(f"temperature: {temperature}")
+            print(f"ignore_eos: {ignore_eos}")
 
             # Add the requests to the engine.
             for prompt, _, output_len in requests:
-                print(f"in len: {_}, out len: {output_len} vs {4096-_}")
+                # print(f"in len: {_}, out len: {output_len} vs {4096-_}")
                 sampling_params = SamplingParams(
                     n=n,
                     # <jingzhi> change to greedy sampling to check correctness.
-                    temperature=0.0 if use_beam_search else 1.0, # 0 or 1e-6 (greedy), #1.0
+                    temperature=0.0 if use_beam_search else temperature, # 0 or 1e-6 (greedy), #1.0
                     top_p=1.0,
                     use_beam_search=use_beam_search,
-                    ignore_eos=False, # True (original),
-                    max_tokens=llm.llm_engine.model_config.max_model_len-_ # 4096-_  # output_len, #TODO(jingzhi) test when using max tokens
+                    ignore_eos=ignore_eos, # False, # True (original),
+                    max_tokens=output_len if ignore_eos else (llm.llm_engine.model_config.max_model_len-_),
+                    # max_tokens=llm.llm_engine.model_config.max_model_len-_ # 4096-_  # output_len, #TODO(jingzhi) test when using max tokens
                 )
                 # FIXME(woosuk): Do not use internal method.
                 llm._add_request(
@@ -407,6 +427,8 @@ def run_vllm(
         print(f"this execution plan running time: {end - tmp_start}s ---abs {end}")
         print(f"outputs:\n")
         print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), output_len] for req_output, (_, _, output_len) in zip(outputs, requests) for completion_output in req_output.outputs]}")
+        print(f"tot_inp_lens = {sum([len(req_output.prompt_token_ids) for req_output in outputs])}")
+        print(f"tot_out_len = {sum([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
         # for req_output, (_, _, output_len) in zip(outputs, requests):
         #     for completion_output in req_output.outputs:
         #         print(req_output.request_id, len(req_output.prompt_token_ids), len(completion_output.token_ids), len(req_output.prompt_token_ids)+len(completion_output.token_ids), len(req_output.prompt_token_ids)+output_len)
@@ -425,9 +447,466 @@ def run_vllm(
         # torch.cuda.empty_cache()
 
         print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
+        print(f"{model} One round finished!!!!!!!!!!")
 
+
+        # print status we collect
+        # my_throughput_logger = llm.llm_engine.driver_worker.model_runner.my_throughput_logger
+        # my_throughput_logger.cal_throughput()
+        # my_throughput_logger.print_by_record()
+    
+    print(f"{model} Finally finished!!!!!!!!!!")
 
     return end - start
+
+
+
+
+
+
+
+# <jingzhi> run_vllm_with_preemption
+# <jingzhi> support data parallel:
+#    if the degree of data parallel is k, then
+#    the main process processes one group of data
+#    the other k-1 worker processes process one group of data each
+# NOTE: 1. using ray works for data parallel, but does not work for multi-level model system 
+#       as ray actor cannot be passed to a multiprocessing subprocess.
+# 
+# def run_vllm_using_ray(
+#     requests: List[Tuple[str, int, int]],
+#     model: str,
+#     tokenizer: str,
+#     quantization: Optional[str],
+#     tensor_parallel_size: int,
+#     seed: int,
+#     n: int,
+#     use_beam_search: bool,
+#     trust_remote_code: bool,
+#     dtype: str,
+#     max_model_len: Optional[int],
+#     enforce_eager: bool,
+#     kv_cache_dtype: str,
+#     device: str,
+    
+#     # <jingzhi>
+#     gpu_memory_utilization: float,
+#     temperature: float,
+#     ignore_eos: bool,
+#     fixed_output_len: int,
+# ) -> float:
+
+#     # <jingzhi> test shared array
+#     from vllm.core.multimodel_scheduler import SHARED_CONTECT
+#     # SHARED_CONTECT.test_and_print()
+#     # SHARED_CONTECT.test_task()
+#     # set the status to inform the multi-model scheduler that the prepartion is finished
+#     SHARED_CONTECT.set_finish_preparation_before_init_LLM()
+#     # wait for the model to be started
+#     SHARED_CONTECT.wait_to_be_started()
+
+#     # use this to pass message to data parallel ray workers
+#     message_passer = REMOTE_LLM_INFER_WORKER_MESSAGE_PASSER.remote()
+     
+
+#     from vllm import LLM, SamplingParams
+
+#     start = None
+#     rescheduled_iter_num = -1 # how many times this model has been rescheduled on the machine
+#     llm = None
+#     remaining_outputs = None
+#     while (not SHARED_CONTECT.is_finished()):
+
+#         rescheduled_iter_num += 1
+
+#         # <jingzhi> For Profiling
+#         start_before_prepare_model = time.perf_counter()
+
+
+#         print(f"waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+
+#         if rescheduled_iter_num > 0:
+#             # need wait for the signal to start model loading
+#             # SHARED_CONTECT.sync_before_loading_model()
+#             SHARED_CONTECT.wait_to_be_started()
+
+#         print(f"finish waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        
+
+#         # TODO (jingzhi) because we allow model preemption here, we may adjust this later
+#         if start == None:
+#             start = time.perf_counter()
+        
+#         # <jingzhi> For Profiling
+#         start_prepare_model = time.perf_counter()
+#         print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
+
+
+#         # run the inference after receiving the start signal from the main process
+#         # update the execution plan
+#         tensor_parallel_size, gpu_memory_utilization = SHARED_CONTECT.update_execution_plan(
+#             tensor_parallel_size, gpu_memory_utilization)
+
+
+#         print(f"loading LLM  tensor_parallel_size {tensor_parallel_size} gpu_memory_utilization {gpu_memory_utilization}----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        
+#         infer_args = [
+#             # the parameters of LLM engine--------------
+#             model,
+#             tokenizer,
+#             quantization,
+#             tensor_parallel_size,
+#             seed,
+#             n,
+#             use_beam_search,
+#             trust_remote_code,
+#             dtype,
+#             max_model_len,
+#             enforce_eager,
+#             kv_cache_dtype,
+#             device,
+
+#             # <jingzhi>
+#             gpu_memory_utilization,
+#             temperature,
+#             ignore_eos,
+#             fixed_output_len
+#         ]
+
+#         # ==================================================================================
+#         # ==================================================================================
+#         # ==================================================================================
+#         # ==================================================================================
+#         # DEAL WITH DATA PARALLELISM
+
+#         # prepare requests (reorder them for dp workers if necessary)
+#         dp_size = SHARED_CONTECT.get_dp_size()
+#         print(f"dp_size: {dp_size}", flush=True)
+#         if rescheduled_iter_num > 0:
+#             # except the first round, always make requests pointing to remaining_requests
+#             if dp_size == 1:
+#                 requests = [deque(remaining_outputs)]
+#             else:
+#                 requests = list(remaining_outputs)
+#                 tmp_requests = list()
+#                 for dp_i in range(dp_size):
+#                     tmp_requests.append(deque(requests[dp_i::dp_size]))
+#                 requests = tmp_requests
+#         else:
+#             if dp_size > 1:
+#                 tmp_requests = list()
+#                 for dp_i in range(dp_size):
+#                     tmp_requests.append(requests[dp_i::dp_size])
+#                 requests = tmp_requests
+#             else:
+#                 requests = [requests]
+
+
+#         # initialize inference workers
+#         ray_dp_workers: List[REMOTE_LLM_INFER_WORKER] = list()
+#         main_dp_worker = LLM_INFER_WORKER(0, requests[0], message_passer)
+#         if dp_size > 1:
+#             ray_dp_workers = [REMOTE_LLM_INFER_WORKER.options(
+#                                 # TODO <jingzhi> support changing env variables as we cannot init ray twice where the env variables in actors are initialized
+#                                 runtime_env={"env_vars": dict(os.environ)},
+#                             ).remote(
+#                                 SHARED_CONTECT.shared_id, worker_i,
+#                                 requests[worker_i], message_passer,
+#                                 os.environ["CUDA_VISIBLE_DEVICES"],
+#                                 SHARED_CONTECT.communicator,
+#                             ) 
+#                             for worker_i in range(1, dp_size)]
+        
+
+#         # reset the state about the model's complete inp pool in the system communicator
+#         SHARED_CONTECT.communicator.reset_state_for_model(SHARED_CONTECT.shared_id, dp_size)
+
+#         # make each worker run the inference
+#         ray_dp_worker_outputs = [worker.execute_method.remote("do_inference", *infer_args) for worker in ray_dp_workers]
+#         main_output = main_dp_worker.do_inference(*infer_args)
+#         if dp_size > 1:
+#             ray_dp_worker_outputs = ray.get(ray_dp_worker_outputs)
+#             # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
+#             # first check whether this model is finished
+#             is_finished = (len(main_output[1]) \
+#                            + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
+#             SHARED_CONTECT.set_finished(is_finished)
+#             # then mark the preparation_for_reschedule process as finished
+#             SHARED_CONTECT.set_finish_preparation_for_reschedule()
+#             # clear the dp message passer status
+#             message_passer.clear.remote()
+
+
+#         print(f"obtain all outputs in this round in main dp actor  ---abs {time.perf_counter()}")
+
+#         # reorganize all generated outputs
+#         gened_outputs = main_output[0]
+#         for worker_output in ray_dp_worker_outputs:
+#             gened_outputs.extend(worker_output[0])
+#         # resort the remaining requests
+#         remaining_outputs = main_output[1]
+#         for worker_output in ray_dp_worker_outputs:
+#             remaining_outputs.extend(worker_output[1])
+        
+#         # <jingzhi> NOTE: in model-level pipeline, we sort the remaining outputs by their req ids
+#         remaining_outputs = sorted(remaining_outputs, key=lambda seq_group: seq_group.request_id)
+#         # if dp_size > 1:
+#         #     remaining_outputs = sorted(remaining_outputs, key=lambda seq_group: len(seq_group.prompt_token_ids))
+        
+#         print(f"reorganize all remaining requests ---abs {time.perf_counter()}")
+
+#         # kill remote llm inference workers if any
+#         for worker in ray_dp_workers:
+#             ray.kill(worker)
+
+
+#         print(f"kill all dp actors if any ---abs {time.perf_counter()}")
+        
+#         # ray worker应该返回什么request序列呢？返回他们的finished的request和remaining request，
+#         # 先暂时naive地每次都一定返回，之后再根据是否dp_size发生了改变决定是否当前轮次要返回。
+#         # 还需要kill ray worker，也可以留到判断下一个dp_size和当前dp_size是否相同之后再决定要不要kill
+
+
+#     end = time.perf_counter()
+#     print(f"{model} Finally finished!!!!!!!!!!")
+
+#     return end - start
+
+
+
+
+
+
+
+
+
+
+
+# <jingzhi> run_vllm_with_preemption
+# <jingzhi> support data parallel:
+#    if the degree of data parallel is k, then
+#    the main process processes one group of data
+#    the other k-1 worker processes process one group of data each
+# <jingzhi> support multi-level model system
+# NOTE: we use multiprocessing to launch subprocess for dp workers
+# 
+def run_vllm(
+    requests: List[Tuple[str, int, int]],
+    model: str,
+    tokenizer: str,
+    quantization: Optional[str],
+    tensor_parallel_size: int,
+    seed: int,
+    n: int,
+    use_beam_search: bool,
+    trust_remote_code: bool,
+    dtype: str,
+    max_model_len: Optional[int],
+    enforce_eager: bool,
+    kv_cache_dtype: str,
+    device: str,
+    
+    # <jingzhi>
+    gpu_memory_utilization: float,
+    temperature: float,
+    ignore_eos: bool,
+    fixed_output_len: int,
+) -> float:
+
+
+    # <jingzhi> test shared array
+    from vllm.core.multimodel_scheduler import SHARED_CONTECT
+
+
+    # SHARED_CONTECT.test_and_print()
+    # SHARED_CONTECT.test_task()
+    # set the status to inform the multi-model scheduler that the prepartion is finished
+    SHARED_CONTECT.set_finish_preparation_before_init_LLM()
+    # wait for the model to be started
+    SHARED_CONTECT.wait_to_be_started()
+
+
+
+    # <jingzhi> use multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, ALL_COMPLETED, wait
+
+    # # use this to pass message to data parallel ray workers
+    # message_passer = REMOTE_LLM_INFER_WORKER_MESSAGE_PASSER.remote()
+     
+
+    from vllm import LLM, SamplingParams
+
+    start = None
+    rescheduled_iter_num = -1 # how many times this model has been rescheduled on the machine
+    llm = None
+    remaining_outputs = None
+    while (not SHARED_CONTECT.is_finished()):
+
+        rescheduled_iter_num += 1
+
+        # <jingzhi> For Profiling
+        start_before_prepare_model = time.perf_counter()
+
+
+        print(f"waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+
+        if rescheduled_iter_num > 0:
+            # need wait for the signal to start model loading
+            # SHARED_CONTECT.sync_before_loading_model()
+            SHARED_CONTECT.wait_to_be_started()
+
+        print(f"finish waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+
+        # TODO (jingzhi) because we allow model preemption here, we may adjust this later
+        if start == None:
+            start = time.perf_counter()
+        
+        # <jingzhi> For Profiling
+        start_prepare_model = time.perf_counter()
+        print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
+
+
+
+        # run the inference after receiving the start signal from the main process
+        # update the execution plan
+        tensor_parallel_size, gpu_memory_utilization = SHARED_CONTECT.update_execution_plan(
+            tensor_parallel_size, gpu_memory_utilization)
+
+
+
+        print(f"loading LLM  tensor_parallel_size {tensor_parallel_size} gpu_memory_utilization {gpu_memory_utilization}----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        
+        infer_args = [
+            # the parameters of LLM engine--------------
+            model,
+            tokenizer,
+            quantization,
+            tensor_parallel_size,
+            seed,
+            n,
+            use_beam_search,
+            trust_remote_code,
+            dtype,
+            max_model_len,
+            enforce_eager,
+            kv_cache_dtype,
+            device,
+
+            # <jingzhi>
+            gpu_memory_utilization,
+            temperature,
+            ignore_eos,
+            fixed_output_len
+        ]
+
+        # ==================================================================================
+        # ==================================================================================
+        # ==================================================================================
+        # ==================================================================================
+        # DEAL WITH DATA PARALLELISM
+
+
+        # prepare requests (reorder them for dp workers if necessary)
+        dp_size = SHARED_CONTECT.get_dp_size()
+        print(f"dp_size: {dp_size}", flush=True)
+        if rescheduled_iter_num > 0:
+            # except the first round, always make requests pointing to remaining_requests
+            if dp_size == 1:
+                requests = [deque(remaining_outputs)]
+            else:
+                requests = list(remaining_outputs)
+                tmp_requests = list()
+                for dp_i in range(dp_size):
+                    tmp_requests.append(deque(requests[dp_i::dp_size]))
+                requests = tmp_requests
+        else:
+            if dp_size > 1:
+                tmp_requests = list()
+                for dp_i in range(dp_size):
+                    tmp_requests.append(requests[dp_i::dp_size])
+                requests = tmp_requests
+            else:
+                requests = [requests]
+
+
+        # reset the state about the model's complete inp pool in the system communicator
+        SHARED_CONTECT.communicator.reset_state_for_model(SHARED_CONTECT.shared_id, dp_size)
+
+        # launch multiprocessing subprocess for dp workers------------------------------------------------------------
+        print(f"start doing inference-------------\n")
+        
+        
+        executor = None
+        futures = None
+        ray_dp_worker_outputs = list()
+        if dp_size > 1:
+            executor = ProcessPoolExecutor(max_workers=dp_size-1)
+            futures = [executor.submit(my_llm_infer_worker_multiprocessing.do_inference, \
+                                    worker_i, requests[worker_i], *infer_args) \
+                                        for worker_i in range(1, dp_size)]
+        
+            print(f"finish launching dp processes-------------\n")
+        
+        # run the inference of the main dp worker
+        main_output = my_llm_infer_worker_multiprocessing.do_inference(0, requests[0], *infer_args)
+        print(f"finish main dp processes-------------\n")
+        if dp_size > 1:
+            done, not_done = wait(futures, return_when=ALL_COMPLETED)
+            ray_dp_worker_outputs = [future.result() for future in done]
+
+            print(f"finish fetching dp worker results-------------\n")
+
+            # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
+            # first check whether this model is finished
+            # is_finished = (len(main_output[1]) \
+            #                + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
+            gened_output_num = (main_output[0] + \
+                           sum([worker_output[0] for worker_output in ray_dp_worker_outputs]))
+            
+            print(f"gened_output_num: {gened_output_num}-------------\n")
+
+            SHARED_CONTECT.set_finished(gened_output_num, set_event_state_anyway=True)
+            # # then mark the preparation_for_reschedule process as finished ==> mark it when calling ``set_finished``
+            # SHARED_CONTECT.set_finish_preparation_for_reschedule()
+        
+
+        print(f"obtain all outputs in this round in main dp actor  ---abs {time.perf_counter()}")
+        
+        
+        # reorganize all generated outputs
+        # gened_outputs = main_output[0]
+        # for worker_output in ray_dp_worker_outputs:
+        #     gened_outputs.extend(worker_output[0])
+        # resort the remaining requests
+        remaining_outputs = main_output
+        for worker_output in ray_dp_worker_outputs:
+            remaining_outputs.extend(worker_output[1])
+        
+        # <jingzhi> NOTE: in model-level pipeline, we sort the remaining outputs by their req ids
+        remaining_outputs = sorted(remaining_outputs, key=lambda seq_group: seq_group.request_id)
+        # if dp_size > 1:
+        #     remaining_outputs = sorted(remaining_outputs, key=lambda seq_group: len(seq_group.prompt_token_ids))
+        
+        print(f"reorganize all remaining requests ---abs {time.perf_counter()}")
+
+        # kill remote llm inference workers if any
+        if dp_size > 1:
+            executor.shutdown()
+
+
+        print(f"kill all dp actors if any ---abs {time.perf_counter()}")
+        
+        # ray worker应该返回什么request序列呢？返回他们的finished的request和remaining request，
+        # 先暂时naive地每次都一定返回，之后再根据是否dp_size发生了改变决定是否当前轮次要返回。
+        # 还需要kill ray worker，也可以留到判断下一个dp_size和当前dp_size是否相同之后再决定要不要kill
+
+
+
+    end = time.perf_counter()
+    print(f"{model} Finally finished!!!!!!!!!!")
+
+    return end - start
+
 
 
 
@@ -709,6 +1188,7 @@ def main(args: argparse.Namespace):
     # <jingzhi> For Profiling
     start_main = time.perf_counter()
 
+    print(f"\nTIMESTAMP start_main: {start_main}\n")
 
     # <jingzhi> deal with extra parameters
     os.environ['WEIGHT_LOAD_DEGREE'] = args.weight_load_degree
@@ -724,14 +1204,18 @@ def main(args: argparse.Namespace):
     # <jingzhi> For Profiling
     print(f"finish get tokenizer ---abs: {time.perf_counter()}")
 
-    if args.dataset is None:
-        # Synthesize a prompt with the given input length.
-        prompt = "hi" * (args.input_len - 1)
-        requests = [(prompt, args.input_len, args.output_len)
-                    for _ in range(args.num_prompts)]
+    # <jingzhi> support multi-level model system
+    if os.getenv("GET_INP_FROM_COMMUNICATOR", "False") == 'True':
+        requests = []
     else:
-        requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
-                                   args.output_len)
+        if args.dataset is None:
+            # Synthesize a prompt with the given input length.
+            prompt = "hi" * (args.input_len - 1)
+            requests = [(prompt, args.input_len, args.output_len)
+                        for _ in range(args.num_prompts)]
+        else:
+            requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
+                                    args.output_len)
 
 
     # <jingzhi> For Profiling
@@ -746,7 +1230,11 @@ def main(args: argparse.Namespace):
                                 args.max_model_len, args.enforce_eager,
                                 args.kv_cache_dtype, args.device,
                                 # <jingzhi> add more control
-                                args.gpu_use_ratio
+                                args.gpu_use_ratio,
+                                args.temperature,
+                                args.ignore_eos,
+                                # <jingzhi> support multi-level model system
+                                args.output_len,
                                 )
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
@@ -861,6 +1349,19 @@ if __name__ == "__main__":
         default="0.9",
         help='gpu utilization ratio.')    
 
+    parser.add_argument(
+        "--temperature", 
+        type=float,
+        default="1.0",
+        help='temperature.')    
+
+
+
+
+    parser.add_argument(
+        "--ignore-eos", 
+        action='store_true',
+        help='whether to ignore eos token or not during inference.')
 
 
 

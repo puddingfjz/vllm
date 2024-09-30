@@ -64,8 +64,18 @@ class Sampler(nn.Module):
             # print(f"last norm.weight address: {self.norm.weight.data_ptr()}")
 
 
+        # <jingzh>
+        # import time
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
         # Get the hidden states that we use for sampling.
         hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
 
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
@@ -75,6 +85,11 @@ class Sampler(nn.Module):
 
         # Get the logits for the next tokens.
         logits = self._get_logits(hidden_states, embedding, embedding_bias)
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time3 = time.perf_counter()
 
 
         # <jingzhi> For DEBUG
@@ -97,6 +112,11 @@ class Sampler(nn.Module):
         logits = _apply_logits_processors(logits, sampling_metadata)
 
 
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time4 = time.perf_counter()
+
+
         # <jingzhi> For DEBUG
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
         #     print(f"sampling logits 2 shape: {logits.shape}")
@@ -108,17 +128,50 @@ class Sampler(nn.Module):
          do_min_p) = SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype)
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time5 = time.perf_counter()
+
+
+
         # Apply presence and frequency penalties.
         if do_penalties:
+            # print("do do_penalties")
             logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
                                       sampling_tensors.output_tokens,
                                       sampling_tensors.presence_penalties,
                                       sampling_tensors.frequency_penalties,
-                                      sampling_tensors.repetition_penalties)
+                                      sampling_tensors.repetition_penalties,
+                                    #   sampling_tensors.prompt_lens,
+                                    #   sampling_tensors.output_lens
+                                      )
+            # logits = _apply_penalties_vllm(logits, sampling_tensors.prompt_tokens,
+            #                           sampling_tensors.output_tokens,
+            #                           sampling_tensors.presence_penalties,
+            #                           sampling_tensors.frequency_penalties,
+            #                           sampling_tensors.repetition_penalties)
+
+            # # <jingzhi> check accuracy
+            # if len(logits)>100:
+            #     print(f"after penalty: logits[100]: {logits[100][:100].tolist()}")
+            # print(f"after penalty: logits[-1]: {logits[-1][:100].tolist()}")
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time6 = time.perf_counter()
+
+
 
         # Apply temperature scaling.
         # Use in-place division to avoid creating a new tensor.
         logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time7 = time.perf_counter()
+
 
         
         # <jingzhi> For DEBUG
@@ -129,11 +182,27 @@ class Sampler(nn.Module):
 
 
         if do_top_p_top_k:
+            # print("do do_top_p_top_k")
             logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
                                         sampling_tensors.top_ks)
 
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time8 = time.perf_counter()
+
+
+
+
         if do_min_p:
+            # print("do do_min_p")
             logits = _apply_min_p(logits, sampling_tensors.min_ps)
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time9 = time.perf_counter()
+
+
 
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
@@ -141,6 +210,11 @@ class Sampler(nn.Module):
         # Compute the log probabilities.
         # Use log_softmax to ensure numerical stability.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time10 = time.perf_counter()
 
 
 
@@ -155,6 +229,12 @@ class Sampler(nn.Module):
         # Get the logprobs query results.
 
 
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time11 = time.perf_counter()
+
+
+
         # <jingzhi> For DEBUG
         # import os
         # if (int(os.getenv("LOCAL_RANK", "0")) == 0):
@@ -162,6 +242,18 @@ class Sampler(nn.Module):
 
         prompt_logprobs, sample_logprobs = _get_logprobs(
             logprobs, sampling_metadata, sample_results)
+        
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time12 = time.perf_counter()
+
+
+        # print(f"sample time breakdown: {(torch.Tensor([time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time11, time12]))}")
+        # # print(f"sample time breakdown: {torch.diff(torch.Tensor([time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time11, time12]))}")
+        # print(f"sample time breakdown: {[time2-time1, time3-time2, time4-time3, time5-time4, time6-time5, time7-time6, time8-time7, time9-time8, time10-time9, time11-time10, time12-time11]}")
+
+
         return _build_sampler_output(sample_results, sampling_metadata,
                                      prompt_logprobs, sample_logprobs)
 
@@ -175,7 +267,7 @@ def _prune_hidden_states(
                                       sampling_metadata.selected_token_indices)
 
 
-def _get_bin_counts_and_mask(
+def _get_bin_counts_and_mask_vllm(
     tokens: torch.Tensor,
     vocab_size: int,
     num_seqs: int,
@@ -190,6 +282,55 @@ def _get_bin_counts_and_mask(
     mask = bin_counts > 0
 
     return bin_counts, mask
+
+
+
+
+# <jingzhi> in this version, the tokens are not of shape [seqnum, max_len], but directly concated without padding
+def _get_bin_counts_and_mask(
+    tokens: torch.Tensor,
+    vocab_size: int,
+    num_seqs: int,
+    # token_lens: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Compute the bin counts for the tokens.
+    # vocab_size + 1 for padding.
+    # bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+    #                          dtype=torch.long,
+    #                          device=tokens.device)
+    bin_counts = torch.zeros(num_seqs*(vocab_size + 1),
+                             dtype=torch.long,
+                             device=tokens.device)
+    # bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+    bin_counts.scatter_add_(0, tokens, torch.ones_like(tokens))
+    bin_counts = bin_counts.view(num_seqs, vocab_size + 1)
+
+    # 
+    # bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+    #                          dtype=torch.long,
+    #                          device=tokens.device)
+    # for row, row_tokens in zip(bin_counts, tokens):
+    #     row.scatter_add_(0, row_tokens, torch.ones_like(row_tokens))
+    # start = 0
+    # for row, num in zip(bin_counts, token_lens):
+    #     row.scatter_add_(0, tokens[start:start+num], torch.ones_like(tokens[start:start+num]))
+    #     start+=num
+
+    # bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+    #                          dtype=torch.long,
+    #                          device=tokens[0].device)
+    # for row, row_tokens in zip(bin_counts, tokens):
+    #     row.scatter_add_(0, row_tokens, torch.ones_like(row_tokens))
+
+
+    bin_counts = bin_counts[:, :vocab_size]
+    mask = bin_counts > 0
+
+    # print(f"in sampling, bin_counts: {bin_counts.tolist()}, mask: {mask.tolist()}")
+
+    return bin_counts, mask
+
+
 
 
 def _apply_logits_processors(
@@ -216,11 +357,41 @@ def _apply_logits_processors(
     return logits
 
 
-def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+def _apply_penalties_vllm(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
                      output_tokens_tensor: torch.Tensor,
                      presence_penalties: torch.Tensor,
                      frequency_penalties: torch.Tensor,
                      repetition_penalties: torch.Tensor) -> torch.Tensor:
+    num_seqs, vocab_size = logits.shape
+    _, prompt_mask = _get_bin_counts_and_mask_vllm(prompt_tokens_tensor, vocab_size,
+                                              num_seqs)
+    output_bin_counts, output_mask = _get_bin_counts_and_mask_vllm(
+        output_tokens_tensor, vocab_size, num_seqs)
+
+    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+    logits = torch.where(logits > 0, logits / repetition_penalties,
+                         logits * repetition_penalties)
+
+    # We follow the definition in OpenAI API.
+    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+    logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+    logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
+    return logits
+
+
+
+
+
+# <jingzhi>
+def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                     output_tokens_tensor: torch.Tensor,
+                     presence_penalties: torch.Tensor,
+                     frequency_penalties: torch.Tensor,
+                     repetition_penalties: torch.Tensor, 
+                    #  prompt_lens: List[int], 
+                    #  output_lens: List[int]
+                     ) -> torch.Tensor:
     num_seqs, vocab_size = logits.shape
     _, prompt_mask = _get_bin_counts_and_mask(prompt_tokens_tensor, vocab_size,
                                               num_seqs)

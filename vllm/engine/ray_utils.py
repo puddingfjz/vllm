@@ -54,7 +54,9 @@ try:
             from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
             import torch
             from vllm.model_executor.parallel_utils.custom_all_reduce import delete_handle
+            from vllm.model_executor.layers.rotary_embedding import reset_ROPE_DICT
             delete_handle()
+            reset_ROPE_DICT()
             destroy_model_parallel()
             torch.distributed.destroy_process_group()
 
@@ -183,7 +185,10 @@ def initialize_cluster(
         # }] * parallel_config.world_size)
         current_placement_group = None
         if os.environ['USE_VLLM']=='False':
-            current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, int(num_gpus_in_cluster)), name='my_pg')
+            # current_placement_group = ray.util.placement_group(get_gpu_assignment(parallel_config.world_size, int(num_gpus_in_cluster)), name='my_pg'+os.environ['DP_WORKER_I'])
+            # directly adopt vllm's setting
+            current_placement_group = ray.util.placement_group(
+                ([{"GPU": 1}] * parallel_config.world_size), name='my_pg'+os.environ['DP_WORKER_I'])
         # ------------------------------------------------------------------------
         else:
             placement_group_specs = ([{"GPU": 1}] * parallel_config.world_size)

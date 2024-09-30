@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -108,6 +108,55 @@ class LLM:
         )
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
+
+
+
+
+    # <jingzhi>
+    @classmethod
+    def get_engine_configs_only(cls,
+        model: str,
+        tokenizer: Optional[str] = None,
+        tokenizer_mode: str = "auto",
+        trust_remote_code: bool = False,
+        tensor_parallel_size: int = 1,
+        dtype: str = "auto",
+        quantization: Optional[str] = None,
+        revision: Optional[str] = None,
+        tokenizer_revision: Optional[str] = None,
+        seed: int = 0,
+        gpu_memory_utilization: float = 0.9,
+        swap_space: int = 4,
+        enforce_eager: bool = False,
+        max_context_len_to_capture: int = 8192,
+        disable_custom_all_reduce: bool = False,
+        **kwargs,
+    ):
+        if "disable_log_stats" not in kwargs:
+            kwargs["disable_log_stats"] = True
+        engine_args = EngineArgs(
+            model=model,
+            tokenizer=tokenizer,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tensor_parallel_size=tensor_parallel_size,
+            dtype=dtype,
+            quantization=quantization,
+            revision=revision,
+            tokenizer_revision=tokenizer_revision,
+            seed=seed,
+            gpu_memory_utilization=gpu_memory_utilization,
+            swap_space=swap_space,
+            enforce_eager=enforce_eager,
+            max_context_len_to_capture=max_context_len_to_capture,
+            disable_custom_all_reduce=disable_custom_all_reduce,
+            **kwargs,
+        )
+        (model_config, cache_config, parallel_config, scheduler_config,
+                device_config, lora_config) = engine_args.create_engine_configs()
+        return (model_config, cache_config, parallel_config, scheduler_config,
+                device_config, lora_config)
+
 
 
 
@@ -234,8 +283,12 @@ class LLM:
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
         prefix_pos: Optional[int] = None,
+        # <jingzhi> support model-level pipeline
+        request_id: Optional[int] = None 
     ) -> None:
-        request_id = str(next(self.request_counter))
+        # request_id = str(next(self.request_counter))
+        if request_id == None:
+            request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id,
                                     prompt,
                                     sampling_params,
@@ -243,7 +296,82 @@ class LLM:
                                     lora_request=lora_request,
                                     prefix_pos=prefix_pos)
 
-    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
+
+
+    
+    # <jingzhi> support model-level pipeline
+    def _add_new_available_reqs(
+        self, 
+        new_inps:Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], 
+        sampling_parameters, sort_inps) -> None:
+        """
+            Check whether there are newly available input reqs.
+            Update: the waiting list of reqs.
+            INPUT: 
+                new_inps: list of (req_id, req_content)
+                sampling_parameters is a dict containing values for [n, temperature, top_p, use_beam_search, ignore_eos, max_tokens]
+                sort_inps: if True, we will sort the inp seqs by their lengths every time.
+
+        """
+        if len(new_inps) == 0:
+            # there is no new input
+            return
+
+        if sampling_parameters['ignore_eos']:
+            assert sampling_parameters['max_tokens'] != None
+        else:
+            # we can set the max token as the max_model_len because it is also a stop condition
+            sampling_parameters['max_tokens'] = self.llm_engine.model_config.max_model_len
+
+        sampling_params = SamplingParams(**sampling_parameters)
+        if sort_inps:
+            new_inps = sorted(new_inps, key=lambda inp: len(inp[1]), reverse=True)
+
+        
+        if isinstance(new_inps[0][1], str):
+            for req_id, prompt in new_inps:
+                self._add_request(
+                    prompt=prompt,
+                    prompt_token_ids=None,
+                    sampling_params=sampling_params,
+                    request_id=req_id,
+                )
+        else:
+            for req_id, prompt_token_ids in new_inps:
+                self._add_request(
+                    prompt=None,
+                    prompt_token_ids=prompt_token_ids,
+                    sampling_params=sampling_params,
+                    request_id=req_id,
+                )
+
+
+    def _get_outputs_to_system_communicator(
+            self, 
+            outputs: List[RequestOutput], output_num_sent_out:int, return_str:bool
+        ) -> Tuple[int, Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]]:
+        """
+            Update ``output_num_sent_out`` and return the outputs sent to the system communicator.
+        """
+
+        new_outputs = outputs[output_num_sent_out:]
+        output_num_sent_out = len(outputs)
+        if return_str:
+            return output_num_sent_out, [(output.request_id, output.outputs[0].text) for output in new_outputs]
+        else:
+            return output_num_sent_out, [(output.request_id, output.outputs[0].token_ids) for output in new_outputs]
+
+
+    # <jingzhi> support data parallel + model-level pipeline
+    def _run_engine(
+            self, use_tqdm: bool, 
+            # <jingzhi> add a new parameter to support constructing 
+            # new requests in multi-level LLM systems.
+            sampling_parameters=None) -> List[RequestOutput]:
+        """
+            We add some input parameters to support constructing new requests in multi-level LLM systems.
+        """
+
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -256,6 +384,7 @@ class LLM:
 
         # <jingzhi> support multimodel scheduling
         from vllm.core.multimodel_scheduler import SHARED_CONTECT
+        import time
 
 
         # <jingzhi> For Profiling--------------------
@@ -264,7 +393,47 @@ class LLM:
         # -------------------------------------------
 
 
-        while self.llm_engine.has_unfinished_requests():
+        # <jingzhi> support model-level pipeline
+        # check_gap = int(os.environ['MY_CHECK_GAP'])
+        # sort_inps = os.environ['MY_SORT_INPS'] == 'True'
+        sort_inps = os.getenv("MY_SORT_INPS", "False") == 'True'
+        # the number of outputs we have send to the system communicator
+        output_num_sent_out = 0
+
+        
+        # NOTE: <jingzhi> 这个地方的循环条件应该改成：当所有req都被answer了才停，根据SHARED_CONTECT里的tot_req_num_remained来判断
+        # while self.llm_engine.has_unfinished_requests():
+        # <jingzhi>
+        while SHARED_CONTECT.tot_req_num_remained > len(outputs):
+
+            # <jingzhi> support model-level pipeline
+            # we need to check whether there are new available seqs every check_in_gap steps
+            if step_i % SHARED_CONTECT.check_in_gap == 0:
+                new_inps = SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
+                self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
+
+
+            # <jingzhi> change the condition to check new seqs
+            if (step_i == 0) or \
+                (SHARED_CONTECT.check_in and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0)):
+                # TODO: 先实现一个naive的版本，不检查目前的资源使用还能不能容纳新的request --> 目前的版本是如果没有waiting的req就一直check
+
+                # NOTE: when all the requests are finished, we must (1) wait for new requests to continue the inference 
+                # or (2) break the loop when there is a stop signal
+                has_unfinished_requests = self.llm_engine.has_unfinished_requests()
+                while not (SHARED_CONTECT.should_reschedule() and (os.environ['NO_PREEMPT'] == 'False')):
+                    if has_unfinished_requests and (step_i % SHARED_CONTECT.check_in_gap != 0):
+                        # when there are running reqs, we check every check_in_gap steps
+                        break
+
+                    new_inps = SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
+                    self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
+                    if (len(new_inps) == 0) and (not has_unfinished_requests):
+                        # we query the communicator every 1 second
+                        time.sleep(1)
+                    else:
+                        break
+            
 
             # <jingzhi> For Profiling-----------------
             step_i+=1
@@ -294,9 +463,19 @@ class LLM:
 
             # <jingzhi> to support multi-model scheduling
             if SHARED_CONTECT.should_reschedule() and (os.environ['NO_PREEMPT'] == 'False'):
+            # if step_i>1 and (os.environ['NO_PREEMPT'] == 'False'):
                 # remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
                 # SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests)
                 # # now we are ready to reload the model according to the new execution plan and restart the inference
+
+                print(f"THIS MODEL IS STOPPED!")
+
+                # NOTE: after changing to multiprocessing dp worker processes, we do not need to 
+                #       notify the dp ray actors as all workers can share the latest SHARED_CONTECT content
+                # # notify other data parallel ray actors if any
+                # if SHARED_CONTECT.has_dp_parallel():
+                #     SHARED_CONTECT.notify_dp_actors_should_reschedule()
+
                 break
 
 
@@ -307,6 +486,15 @@ class LLM:
                     outputs.append(output)
                     if use_tqdm:
                         pbar.update(1)
+            
+            # send the outputs to the model communicator every check_out_gap steps
+            # <jingzhi> multi-level LLM system
+            if step_i % SHARED_CONTECT.check_out_gap == 0:
+                output_num_sent_out, new_outputs = \
+                    self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
+                SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
+
+
         if use_tqdm:
             pbar.close()
 
@@ -322,12 +510,39 @@ class LLM:
 
 
 
-        # <jingzhi> support multi-model inference
-        SHARED_CONTECT.set_finished(not self.llm_engine.scheduler.has_unfinished_seqs())
-        if not SHARED_CONTECT.is_finished():
+        
+        # <jingzhi> support multi-level model system
+        output_num_sent_out, new_outputs = \
+            self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
+        SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
+        
+        
+        
+        # <jingzhi> support data parallelism
+        if not SHARED_CONTECT.has_dp_parallel():
+            # <jingzhi> support multi-model inference
             remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
-            SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
-            # now we are ready to reload the model according to the new execution plan and restart the inference
+            SHARED_CONTECT.set_finished(len(remaining_requests))
+            if not SHARED_CONTECT.is_finished():
+                SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
+                # now we are ready to reload the model according to the new execution plan and restart the inference
+            # ----
+            # # <jingzhi> support multi-model inference
+            # SHARED_CONTECT.set_finished(not self.llm_engine.scheduler.has_unfinished_seqs())
+            # if not SHARED_CONTECT.is_finished():
+            #     remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
+            #     SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
+            #     # now we are ready to reload the model according to the new execution plan and restart the inference            
+        else:
+            # data parallelism is used
+            # for dp ray actors, we will kill them no matter they finish or not, 
+            # for dp main actor, we will kill its tp workers no matter it finishes or not
+            # for all dp actors, we will store their finished and remaining requests info
+            # the ``is_finished'' status of the dp main actor will be set after the main actor received all request info from other actors
+            # the preparation for reschedule will also be marked as finished after that
+            remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
+            SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine, mark_finish=False)
+
 
 
         print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
@@ -449,4 +664,164 @@ class LLM:
         # its previous requests.
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
         return outputs
+
+
+
+    # <jingzhi> check whether a iter workload is worthy to be profiled
+    def _is_redundant_iter_workload(
+            self, record_dict,
+            set_max_num_seqs, is_prompt, corr_context_tot_len,
+            last_seqnum, last_is_prompt, last_corr_context_tot_len,
+            weight_loading_time):
+        
+        # if the latency difference is within this threshold, we think the two latencys are the same
+        threshold = 1e-3
+
+        # 1. about another seqnum and another ``is_prompt'', then not redundant
+        if (last_seqnum, last_is_prompt) != (set_max_num_seqs, is_prompt):
+            return False
+        
+        # 1.5 corresponds to the same sampled context_tot_len interesting point as the last record, then not redundant
+        if corr_context_tot_len == last_corr_context_tot_len:
+            return False
+
+        related_records = record_dict[(set_max_num_seqs, is_prompt)]
+        
+        # try to set weight_loading_time
+        if (weight_loading_time[0] == None) and (len(related_records) == 2):
+            weight_loading_time[0] = min(related_records.values())
+
+
+        # 2. if 2 valid points and min == max, redundant
+        if len(related_records) == 2:
+            if max(related_records.values()) <= (min(related_records.values()) + threshold):
+                return True
+        
+
+        # 3. if 3 valid points, y1, y2 and y3 all > weight_loading_time[0]+threshold, redundant
+        if len(related_records) == 3:
+            if min(related_records.values()) > (weight_loading_time[0]+threshold):
+                return True
+        
+
+        # 4. if <= 3 valid points, not redundant
+        if len(related_records) <= 3:
+            return False
+        
+        # 5. compare the last two exec latency with the smallest latency
+        xs = sorted(related_records.keys())
+        if False not in [related_records[x] > (related_records[xs[0]]+threshold) for x in xs[-3:-1]]:
+            return True
+        
+        return False
+
+
+
+    # <jingzhi>
+    def _update_record_dict(
+            self, my_throughput_logger, record_dict, 
+            set_max_num_seqs, is_prompt, corr_context_tot_len):
+        last_exec_latency = my_throughput_logger.get_last_record_execLatency()
+        related_records = record_dict[(set_max_num_seqs, is_prompt)]
+        if corr_context_tot_len not in related_records:
+            related_records[corr_context_tot_len] = last_exec_latency
+        else:
+            if last_exec_latency < related_records[corr_context_tot_len]:
+                related_records[corr_context_tot_len] = last_exec_latency
+
+
+
+
+    # <jingzhi> run per iter latency profile
+    def _profile_per_iter_latency(
+            self, sampling_params_dict, iter_workloads, 
+            set_seqlens_list: List[Tuple[bool, List[int]]] = list(),
+            piecewise_cost_model_build_mode = False) -> None:
+        '''
+            Input:
+                iter_workloads: dict of lists 
+                    i.e., {is_prompt: list(), set_max_num_batched_tokens: list(), set_max_num_seqs: list()}
+                piecewise_cost_model_build_mode: 
+                    if True, some of the given iter_workloads are redundant and will not be profiled based 
+                    on the actual per-iter cost distribution.
+        '''
+        # <jingzhi> init KV_blk_per_layer_weights
+        import os
+        from collections import defaultdict
+        my_throughput_logger = self.llm_engine.driver_worker.model_runner.my_throughput_logger
+        record_dict = defaultdict(dict)
+        weight_loading_time = [None]
+
+        # run a measurement first as the first measurement result is higher than expected [should not be like this as we have profiled cache]
+        self.llm_engine._profile_per_iter_latency(
+            is_prompt=True, sampling_params_dict=sampling_params_dict,
+            set_max_num_batched_tokens=2048, set_max_num_seqs=2)
+
+        test_iter_num = len(iter_workloads['is_prompt'])
+        last_seqnum, last_is_prompt, last_corr_context_tot_len = None, None, None
+        for i in range(test_iter_num):
+            is_prompt = iter_workloads['is_prompt'][i]
+            set_max_num_batched_tokens = iter_workloads['set_max_num_batched_tokens'][i]
+            set_max_num_seqs = iter_workloads['set_max_num_seqs'][i]
+            corr_context_tot_len = iter_workloads['corr_context_tot_len'][i]
+
+            # check whether we still need to profile this iter workloads
+            if piecewise_cost_model_build_mode:
+                if self._is_redundant_iter_workload(
+                    record_dict, set_max_num_seqs, is_prompt, corr_context_tot_len,
+                    last_seqnum, last_is_prompt, last_corr_context_tot_len,
+                    weight_loading_time):
+                    continue
+
+            self.llm_engine._profile_per_iter_latency(
+                is_prompt=is_prompt, 
+                sampling_params_dict=sampling_params_dict,
+                set_max_num_batched_tokens=set_max_num_batched_tokens, 
+                set_max_num_seqs=set_max_num_seqs)
+            
+            # store results in record_dict
+            self._update_record_dict(
+                my_throughput_logger, record_dict, set_max_num_seqs, is_prompt, corr_context_tot_len)
+            last_seqnum, last_is_prompt, last_corr_context_tot_len = set_max_num_seqs, is_prompt, corr_context_tot_len
+        
+        
+        for is_prompt, set_seqlens in set_seqlens_list:
+            self.llm_engine._profile_per_iter_latency(
+                is_prompt=is_prompt, 
+                sampling_params_dict=sampling_params_dict,
+                set_seqlens=set_seqlens)            
+        # ------------------------------------------------------------------------------
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=True, sampling_params_dict=sampling_params_dict,
+        #     set_max_num_batched_tokens=2048, set_max_num_seqs=2)
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=True, sampling_params_dict=sampling_params_dict,
+        #     set_max_num_batched_tokens=2048, set_max_num_seqs=2)
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=False, sampling_params_dict=sampling_params_dict,
+        #     set_max_num_batched_tokens=112394, set_max_num_seqs=512)
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=False, sampling_params_dict=sampling_params_dict,
+        #     set_max_num_batched_tokens=112394, set_max_num_seqs=256)
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=False, sampling_params_dict=sampling_params_dict)
+        # self.llm_engine._profile_per_iter_latency(
+        #     is_prompt=False, sampling_params_dict=sampling_params_dict,
+        #     set_max_num_seqs=120)
+
+        # <jingzhi> For layer-by-layer params loading------------------------------------------------
+        from vllm._C import cache_ops
+        if os.environ['USE_VLLM']!='True':
+            # for cache_device_i in self.llm_engine.workers[0].model_runner.model.model.cache_device_ids:
+            #     cache_ops.disable_P2P_access(cache_device_i, 0, 0)
+            # in distributed inference, the current device for this worker may not be cuda:0
+            self.llm_engine.disable_P2P_access()
+        # -------------------------------------------------------------------------------------------
+
+        return 
+  
+
+
+
+
 

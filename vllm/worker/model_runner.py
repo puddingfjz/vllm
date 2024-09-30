@@ -84,6 +84,13 @@ class ModelRunner:
         self.in_wsl = in_wsl()
         self.kv_cache_dtype = kv_cache_dtype
 
+
+        # <jingzhi> record throughput data----------------------
+        from vllm.engine.metrics import MyThroughputLogger
+        self.my_throughput_logger = MyThroughputLogger(self.model_config, self.parallel_config)
+        # ------------------------------------------------------
+
+
     def load_model(self) -> None:
         self.model = get_model(self.model_config, self.device_config,
                                self.lora_config)
@@ -125,6 +132,12 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
                List[int], List[int], Set[LoRARequest]]:
+        
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
+
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
@@ -206,6 +219,13 @@ class ModelRunner:
                 slot = block_number * self.block_size + block_offset
                 slot_mapping[-1].append(slot)
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
+
+
+
         max_prompt_len = max(subquery_lens)
         input_tokens = _make_tensor_with_pad(input_tokens,
                                              max_prompt_len,
@@ -248,12 +268,39 @@ class ModelRunner:
                                           device=self.device)
 
 
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time3 = time.perf_counter()
+
+
+
         # <jingzhi> For DEBUG
         # if torch.cuda.current_device() == 0:
-        if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"prefilling: seq num: {len(prompt_lens_tensor)}, tot_tokens: {sum(prompt_lens_tensor),sum([_*_ for _ in prompt_lens_tensor])}")
-            # print(f"block_tables: {block_tables}")
-            # print(f"slot_mapping: {slot_mapping.tolist()}")
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     # the metadata contains 2 parts: 
+        #     # (1) "seq num" if regarded as a decoding stage
+        #     # (2) "tot_context_len" if regarded as a decoding stage
+        #     self.my_throughput_logger.append_flop_metadata(
+        #         len(prompt_lens_tensor),
+        #         sum(prompt_lens_tensor).item(), 
+        #         # sum([(_+1)*_//2 for _ in prompt_lens_tensor]).item(),
+        #         sum((prompt_lens_tensor+1)*prompt_lens_tensor).item(),
+        #         max(prompt_lens_tensor).item(), 
+        #         True)
+        #     print(f"prefilling: seq num: {len(prompt_lens_tensor)}, "
+        #           f"max_seqlen: {max(prompt_lens_tensor).item()}, "
+        #           f"tot_len: {sum(prompt_lens_tensor).item()}, "
+        #         #   f"attention sum as decode: {sum([(_+1)*_//2 for _ in prompt_lens_tensor]).item()}"
+        #           f"attention sum as decode: {sum((prompt_lens_tensor+1)*prompt_lens_tensor).item()}"
+        #           )
+        #     # print(f"block_tables: {block_tables}")
+        #     # print(f"slot_mapping: {slot_mapping.tolist()}")
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time4 = time.perf_counter()
+
 
 
         input_metadata = InputMetadata(
@@ -268,6 +315,16 @@ class ModelRunner:
             use_cuda_graph=False,
             kv_cache_dtype=self.kv_cache_dtype,
         )
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time5 = time.perf_counter()
+
+        # print(f"in preprare prefill input: {[time2-time1, time3-time2, time4-time3, time5-time4]}")
+        # print(f"in preprare prefill input total: {time5-time1}")
+
+
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests)
@@ -277,6 +334,11 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
                Set[LoRARequest]]:
+        
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
@@ -342,6 +404,12 @@ class ModelRunner:
                 block_tables.append([])
             batch_size = graph_batch_size
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
+
+
         input_tokens = _make_tensor_with_pad(input_tokens,
                                              max_len=1,
                                              pad=0,
@@ -385,14 +453,28 @@ class ModelRunner:
         ]
 
 
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time3 = time.perf_counter()
+
 
         # <jingzhi> For DEBUG
         # if torch.cuda.current_device() == 0:
-        if int(os.getenv("LOCAL_RANK", "0")) == 0:
-            print(f"decoding: seq num: {len(context_lens)}, tot_tokens: {sum(context_lens)}")
-            # print(f"block_tables: {block_tables}")
-            # print(f"slot_mapping: {slot_mapping.tolist()}")
+        # if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        #     # the metadata contains 2 parts: (1) "seq num" (2) "tot_context_len"
+        #     self.my_throughput_logger.append_flop_metadata(
+        #         len(context_lens), 
+        #         sum(context_lens).item(), 
+        #         sum(context_lens).item(), 
+        #         1, False)
+        #     print(f"decoding: seq num: {len(context_lens)}, tot_tokens: {sum(context_lens).item()}")
+        #     # print(f"block_tables: {block_tables}")
+        #     # print(f"slot_mapping: {slot_mapping.tolist()}")
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time4 = time.perf_counter()
 
         input_metadata = InputMetadata(
             is_prompt=False,
@@ -406,6 +488,14 @@ class ModelRunner:
             use_cuda_graph=use_captured_graph,
             kv_cache_dtype=self.kv_cache_dtype,
         )
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time5 = time.perf_counter()
+        # print(f"in preprare decode input: {[time2-time1, time3-time2, time4-time3, time5-time4]}")
+        # print(f"in preprare decode input total: {time5-time1}")
+
         return (input_tokens, input_positions, input_metadata,
                 lora_index_mapping, lora_prompt_mapping, lora_requests)
 
@@ -415,6 +505,12 @@ class ModelRunner:
         prompt_lens: List[int],
         subquery_lens: Optional[List[int]],
     ) -> SamplingMetadata:
+        
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
+
         seq_groups: List[Tuple[List[int], SamplingParams]] = []
         selected_token_indices: List[int] = []
         selected_token_start_idx = 0
@@ -460,6 +556,12 @@ class ModelRunner:
                               categorized_sample_indices_start_idx + num_seqs))
                 categorized_sample_indices_start_idx += num_seqs
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time2 = time.perf_counter()
+
+
         selected_token_indices = _async_h2d(selected_token_indices,
                                             dtype=torch.long,
                                             target_device=self.device,
@@ -472,9 +574,19 @@ class ModelRunner:
             for t, seq_ids in categorized_sample_indices.items()
         }
 
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time3 = time.perf_counter()
+
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:
             seq_data.update(seq_group_metadata.seq_data)
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time4 = time.perf_counter()
 
         sampling_metadata = SamplingMetadata(
             seq_groups=seq_groups,
@@ -483,6 +595,28 @@ class ModelRunner:
             selected_token_indices=selected_token_indices,
             categorized_sample_indices=categorized_sample_indices,
         )
+
+
+
+        # <jingzh>
+        # torch.cuda.synchronize()
+        # time5 = time.perf_counter()
+
+        # print(f"in preprare sample input: {[time2-time1, time3-time2, time4-time3, time5-time4]}")
+        # print(f"in preprare sample input total: {time5-time1}")
+
+        # <jingzhi>
+        # print(
+        #     "SamplingMetadata("
+        #     f"seq_groups={sampling_metadata.seq_groups[0]}, \n"
+        #     f"len(seq_groups)={len(sampling_metadata.seq_groups)}, \n"
+        #     # f"seq_data={self.seq_data}, "
+        #     # f"prompt_lens={sampling_metadata.prompt_lens}, \n"
+        #     f"num_prompts={sampling_metadata.num_prompts}, \n"
+        #     # f"selected_token_indices={sampling_metadata.selected_token_indices}, \n"
+        #     # f"categorized_sample_indices={sampling_metadata.categorized_sample_indices}), \n"
+        #     f"perform_sampling={sampling_metadata.perform_sampling})")
+
         return sampling_metadata
 
     def prepare_input_tensors(
@@ -576,6 +710,11 @@ class ModelRunner:
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Optional[SamplerOutput]:
+        
+        # <jingzh>
+        torch.cuda.synchronize()
+        before_prepare_time = time.perf_counter()
+
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
          lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
@@ -589,6 +728,50 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
+
+
+        # <jingzh>
+        torch.cuda.synchronize()
+        end_prepare_time = time.perf_counter()
+        self.my_throughput_logger.append_prepInp_time(end_prepare_time - before_prepare_time)            
+
+        # then we record the flops metadata-----------------------------------------------------------            
+        if self.is_driver_worker and (os.getenv("COLLECT_TIME_LOG", "False") == 'True'):
+            if input_metadata.is_prompt:
+                # the metadata contains 2 parts: 
+                # (1) "seq num" if regarded as a decoding stage
+                # (2) "tot_context_len" if regarded as a decoding stage
+                seq_lens = input_metadata.prompt_lens
+                self.my_throughput_logger.append_flop_metadata(
+                    len(seq_lens),
+                    sum(seq_lens).item(), 
+                    # sum([(_+1)*_//2 for _ in prompt_lens_tensor]).item(),
+                    sum((seq_lens+1)*seq_lens).item(),
+                    max(seq_lens).item(), 
+                    True)
+                print(f"prefilling: seq num: {len(seq_lens)}, "
+                    f"max_seqlen: {max(seq_lens).item()}, "
+                    f"tot_len: {sum(seq_lens).item()}, "
+                    #   f"attention sum as decode: {sum([(_+1)*_//2 for _ in prompt_lens_tensor]).item()}"
+                    f"attention sum as decode: {sum((seq_lens+1)*seq_lens).item()}"
+                    )
+            else:
+                # the metadata contains 2 parts: (1) "seq num" (2) "tot_context_len"
+                seq_lens = input_metadata.context_lens
+                self.my_throughput_logger.append_flop_metadata(
+                    len(seq_lens), 
+                    sum(seq_lens).item(), 
+                    sum(seq_lens).item(), 
+                    max(seq_lens).item(), 
+                    False)
+                print(f"decoding: seq num: {len(seq_lens)}, tot_tokens: {sum(seq_lens).item()}, max_seqlen: {max(seq_lens).item()}")
+
+
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+
         hidden_states = model_executable(
             input_ids=input_tokens,
             positions=input_positions,
@@ -596,11 +779,31 @@ class ModelRunner:
             input_metadata=input_metadata,
         )
 
+
+        # <jingzh>
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+
+
         # Sample the next token.
         output = self.model.sample(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
         )
+
+        # <jingzh>
+        torch.cuda.synchronize()
+        end_time2 = time.perf_counter()
+
+        if self.is_driver_worker:
+            print(f"exec time: {end_time - start_time}")
+            print(f"sample time: {end_time2 - end_time}")
+            print(f"prepInp time: {end_prepare_time - before_prepare_time}")
+            print(f"print flops metadata time: {start_time - end_prepare_time}")
+        self.my_throughput_logger.append_print_flopMetadata_time(start_time - end_prepare_time)
+        self.my_throughput_logger.append_exec_time(end_time - start_time)
+        self.my_throughput_logger.append_sample_time(end_time2 - end_time)
+
         return output
 
     @torch.inference_mode()
@@ -657,6 +860,149 @@ class ModelRunner:
         self.execute_model(seqs, kv_caches)
         torch.cuda.synchronize()
         return
+
+
+
+
+    # <jingzhi>
+    @torch.inference_mode()
+    def profile_per_iter_latency(
+        self, 
+        is_prompt: bool, 
+        sampling_params_dict: Dict[str, float], 
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]], 
+        set_max_num_batched_tokens: float = float('inf'),
+        set_max_num_seqs: float = float('inf'), 
+        set_seqlens: List[int] = list()) -> None:
+        '''
+        Profile the per iteration latency of the model.
+        Input:
+            is_prompt: controls which stage (prefill or decoding stage) to profile
+            sampling_params_dict: the sampling param dictionary to be used.
+
+            set_max_num_batched_tokens: the max_num_batched_tokens (< the limit by KV cache)
+            set_max_num_seqs: the max_num_seqs (< the limit by the scheduler config)
+        '''
+        # Enable top-k sampling to reflect the accurate memory usage.
+        # vocab_size = self.model_config.get_vocab_size()
+        # sampling_params = SamplingParams(top_p=0.99, top_k=vocab_size - 1)
+        sampling_params = SamplingParams(**sampling_params_dict)
+        max_num_seqs = self.scheduler_config.max_num_seqs
+        # we need consider ``set_max_num_seqs'' at the beginning, to ensure max_num_batched_tokens has enough KV blks to use
+        max_num_seqs = min(max_num_seqs, set_max_num_seqs)
+
+        # --------------------------------------------------------------------------------------------------
+        # 1. we first compute the max_tot_token_num and max_seq_num for the given ``model'' given the ``gpu mem utilization ratio''.
+
+        tot_blk_num = len(kv_caches[0][0])
+
+        # we need to comp max_num_batched_tokens, considering the available tot blk num
+        max_num_seqs = min(max_num_seqs, tot_blk_num) # if the KV cache is too small that we cannot run max_num_seqs together
+        max_num_batched_tokens = ((tot_blk_num//max_num_seqs)*self.block_size)*max_num_seqs + (tot_blk_num%max_num_seqs)
+
+        # print(f"max_num_batched_tokens: {max_num_batched_tokens}, tot_blk_num: {tot_blk_num}, max_num_seqs: {max_num_seqs}, block_size: {self.block_size}")
+
+        if is_prompt:
+            max_num_batched_tokens = min(max_num_batched_tokens, self.scheduler_config.max_num_batched_tokens)
+            # max_num_batched_tokens = 2048
+            # max_num_seqs = 2
+        # else:
+        #     max_num_batched_tokens = min(max_num_batched_tokens, 112394)
+
+
+
+        # --------------------------------------------------------------------------------------------------
+        # 2. we next consider the user-set max_tot_token_num and max_seq_num
+
+        max_num_batched_tokens = int(min(max_num_batched_tokens, set_max_num_batched_tokens))
+        # max_num_seqs = int(min(max_num_seqs, set_max_num_seqs))
+        max_num_seqs = int(max_num_seqs)
+
+        # --------------------------------------------------------------------------------------------------
+        # 3. we finally consider the user set seq_len list
+        if len(set_seqlens)>0:
+            max_num_seqs = len(set_seqlens)
+
+        # TODO(jingzhi) we currently do not support lora----------
+        # This represents the maximum number of different requests
+        # that will have unique loras, an therefore the max amount of memory
+        # consumption create dummy lora request copies from the lora request
+        # passed in, which contains a lora from the lora warmup path.
+        dummy_lora_requests = []
+        dummy_lora_requests_per_seq = []
+        if self.lora_config:
+            for idx in range(self.lora_config.max_loras):
+                lora_id = idx + 1
+                dummy_lora_request = LoRARequest(
+                    lora_name=f"warmup_{lora_id}",
+                    lora_int_id=lora_id,
+                    lora_local_path="/not/a/real/path",
+                )
+                self.lora_manager.add_dummy_lora(dummy_lora_request,
+                                                 rank=LORA_WARMUP_RANK)
+                dummy_lora_requests.append(dummy_lora_request)
+            dummy_lora_requests_per_seq = [
+                dummy_lora_requests[idx % len(dummy_lora_requests)]
+                for idx in range(max_num_seqs)
+            ]
+
+        # Profile memory usage with max_num_sequences sequences and the total
+        # number of tokens equal to max_num_batched_tokens.
+        block_num_start = 0
+        seqs: List[SequenceGroupMetadata] = []
+        for group_id in range(max_num_seqs):
+            seq_len = (max_num_batched_tokens // max_num_seqs +
+                       (group_id < max_num_batched_tokens % max_num_seqs))
+            
+            if len(set_seqlens)>0:
+                seq_len = set_seqlens[group_id]
+
+            seq_data = SequenceData([0] * seq_len)
+            # print(max_num_batched_tokens, max_num_seqs, group_id, seq_len) #, seq_data)
+            # if not is_prompt:
+            #     # we need to prepare at least one output token
+            #     seq_data = SequenceData([0] * (seq_len-1))
+            #     seq_data.append_token_id(0,0)
+            
+            block_tables = {group_id: list(range(block_num_start, block_num_start + (seq_len+self.block_size-1)//self.block_size))}
+            block_num_start = block_num_start + (seq_len+self.block_size-1)//self.block_size
+
+
+            # no matter which stage to profile (prefill or decoding), we need to assign valid block tables
+            seq = SequenceGroupMetadata(
+                request_id=str(group_id),
+                is_prompt=is_prompt,
+                seq_data={group_id: seq_data},
+                sampling_params=sampling_params,
+                block_tables=block_tables,
+                lora_request=dummy_lora_requests_per_seq[group_id]
+                if dummy_lora_requests_per_seq else None,
+            )
+            seqs.append(seq)
+
+        # Run the model with the dummy inputs.
+        # num_layers = self.model_config.get_num_layers(self.parallel_config)
+        # kv_caches = [(None, None)] * num_layers
+
+        # # <jingzhi> For profiling, we do not measure the latency here
+        # torch.cuda.synchronize()
+        # time1 = time.perf_counter()
+
+        self.execute_model(seqs, kv_caches)
+        torch.cuda.synchronize()
+
+        # time2 = time.perf_counter()
+        # print(f'{{"time_per_iter":{time2-time1}, "is_prompt": {is_prompt}, "tot_token_num": {tot_token_num}, "max_num_batched_tokens": {max_num_batched_tokens}, "max_num_seqs": {max_num_seqs}}}')
+
+        return
+
+
+
+
+
+
+
+
 
     def remove_all_loras(self) -> bool:
         if not self.lora_manager:

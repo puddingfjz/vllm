@@ -295,7 +295,10 @@ class LLMEngine:
 
         for node_id, gpu_ids in node_gpus.items():
             # <jingzhi> we keep the visible gpus in the same order as we specify them
-            if os.environ['USE_VLLM'] == 'False':
+            # if os.environ['USE_VLLM'] == 'False':
+            # NOTE: currently some models do not support dynamic model weight loading, but we want to test them in multi-model setting
+            # so we have to control their visible devices
+            if True:
                 if node_id == driver_node_id:
                     node_gpus[node_id] = [int(gpu_i) for gpu_i in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
                     continue
@@ -690,6 +693,9 @@ class LLMEngine:
         # <jingzhi> For Profiling
         end_time = time.perf_counter()
         print(f"_init_cache profile_num_available_blocks time: {end_time - start_time}")
+        # store the latency
+        self.driver_worker.model_runner.my_throughput_logger.append_latency(end_time - start_time)
+        print(f'{{"time_per_iter":{end_time - start_time}}}')
 
 
         # <jingzhi> after updating KVBlkPerLayerWeight in each worker, we update KVBlkPerLayerWeight in the main process as well------
@@ -916,6 +922,56 @@ class LLMEngine:
             self._init_cache_ori()
         else:
             self._init_cache_no_profile()
+
+
+
+
+
+    # <jingzhi>
+    def _profile_per_iter_latency(
+            self, 
+            is_prompt: bool,
+            sampling_params_dict: Dict[str, float], 
+            set_max_num_batched_tokens: float = float('inf'),
+            set_max_num_seqs: float = float('inf'),
+            set_seqlens: List[int] = list(),
+            ) -> None:
+        """Profiles the per iter latency for the prefill stage and the decoding stage, respectively.
+        Used for prepare the cost model.
+
+        Args:
+            set_max_num_batched_tokens: the max_num_batched_tokens (< the limit by KV cache)
+            set_max_num_seqs: the max_num_seqs (< the limit by the scheduler config)
+        """
+        # Get the maximum number of blocks that can be allocated on GPU and CPU.
+
+        # <jingzhi> For Profiling
+        start_time = time.perf_counter()
+       
+        self._run_workers(
+            "profile_per_iter_latency",
+            is_prompt=is_prompt,
+            sampling_params_dict=sampling_params_dict,
+            set_max_num_batched_tokens=set_max_num_batched_tokens,
+            set_max_num_seqs=set_max_num_seqs,
+            set_seqlens=set_seqlens,
+        )
+
+        end_time = time.perf_counter()
+        print(f'{{"time_per_iter":{end_time-start_time}, '
+              f'"is_prompt": {is_prompt}, '
+              f'"blk num": {self.cache_config.num_gpu_blocks}, '
+              f'"max_num_batched_tokens": {self.scheduler_config.max_num_batched_tokens}, '
+              f'"max_num_seqs": {self.scheduler_config.max_num_seqs}}}')
+        
+        
+
+        # store the latency
+        self.driver_worker.model_runner.my_throughput_logger.append_latency(end_time - start_time)
+
+        return end_time - start_time
+
+
 
 
 
@@ -1492,10 +1548,21 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
+        # <jingzhi>
+        import torch
+        torch.cuda.synchronize()
+        start_schedule_time = time.perf_counter()
+
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
         if not scheduler_outputs.is_empty():
             # Execute the model.
+
+            # <jingzhi> For Profiling
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+
             all_outputs = self._run_workers(
                 "execute_model",
                 driver_kwargs={
@@ -1507,6 +1574,18 @@ class LLMEngine:
                     "load_more_layer_on_card_num":KVBlkPerLayerWeight.load_more_layer_on_card_num,
                     "blocks_to_reorganize":scheduler_outputs.blocks_to_reorganize,
                 })
+            
+
+            # <jingzhi> For Profiling
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            print(f"time_per_iter:{end_time-start_time}, time_for_schedule: {start_time - start_schedule_time}")
+
+
+            # store the latency
+            self.driver_worker.model_runner.my_throughput_logger.append_latency(end_time - start_time)
+            self.driver_worker.model_runner.my_throughput_logger.append_schedule_time(start_time - start_schedule_time)
+
 
             # Only the driver worker returns the sampling results.
             output = all_outputs[0]
@@ -1517,7 +1596,16 @@ class LLMEngine:
         # <jingzhi> we need to reset KVBlkPerLayerWeight.load_more_layer_on_card_num after we use it
         KVBlkPerLayerWeight.load_more_layer_on_card_num = 0
 
-        return self._process_model_outputs(output, scheduler_outputs)
+        # return self._process_model_outputs(output, scheduler_outputs)
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()        
+        ret = self._process_model_outputs(output, scheduler_outputs)
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        print(f"proc_output_time:{end_time-start_time}")  
+
+        return ret
 
     def do_log_stats(self) -> None:
         """Forced log when no requests active."""
@@ -1592,6 +1680,10 @@ class LLMEngine:
         (new_tokens, new_output_text, prefix_offset,
          read_offset) = detokenize_incrementally(
              self.get_tokenizer_for_seq(seq),
+
+            # [BUGFIX]<jingzhi>
+            self.tokenizer.tokenizer_len,
+
              all_input_ids=seq.get_token_ids(),
              prev_tokens=seq.tokens,
              prefix_offset=seq.prefix_offset,
@@ -1713,7 +1805,9 @@ class LLMEngine:
         # first destroy distributed process groups in torch
         from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
         from vllm.model_executor.parallel_utils.custom_all_reduce import delete_handle
+        from vllm.model_executor.layers.rotary_embedding import reset_ROPE_DICT
         delete_handle()
+        reset_ROPE_DICT()
         destroy_model_parallel()
         torch.distributed.destroy_process_group()
 

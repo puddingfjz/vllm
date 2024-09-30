@@ -103,6 +103,9 @@ class TokenizerGroup:
         else:
             self.lora_tokenizers = None
 
+        # [BUGFIX]<jingzhi>
+        self.tokenizer_len = len(self.tokenizer)
+
     def encode(self,
                prompt: str,
                request_id: Optional[str] = None,
@@ -184,6 +187,10 @@ def _convert_tokens_to_string_with_added_encoders(
 # under Apache 2.0 license
 def detokenize_incrementally(
     tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+
+    # [BUGFIX]<jingzhi>
+    tokenizer_len: int,
+
     all_input_ids: List[int],
     prev_tokens: Optional[List[str]],
     prefix_offset: int = 0,
@@ -211,6 +218,17 @@ def detokenize_incrementally(
         new_tokens = tokenizer.convert_ids_to_tokens(
             [new_token_id], skip_special_tokens=skip_special_tokens)
         output_tokens = prev_tokens + new_tokens
+
+    # [BUGFIX] (jingzhi) sometimes new_token_id > len(tokenizer), so the generated new_token will be None, and this causes error
+    # new_token_id#, len(tokenizer)
+    # print(tokenizer_len, flush=True)
+    # print(new_token_id, len(tokenizer), flush=True)
+    if new_token_id >= tokenizer_len:
+        new_tokens = [""]
+        output_tokens[-1] = ""
+    if prev_tokens is None:
+        new_tokens = output_tokens
+
 
     # The prefix text is necessary only to defeat cleanup algorithms in
     # the decode which decide to add a space or not depending on the

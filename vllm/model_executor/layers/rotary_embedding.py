@@ -325,6 +325,12 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
+# <jingzhi> we need to reset _REPE_DICT when we want to change the driver worker of a model
+def reset_ROPE_DICT():
+    global _ROPE_DICT
+    _ROPE_DICT = {}
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,

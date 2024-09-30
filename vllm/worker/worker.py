@@ -76,10 +76,11 @@ class Worker:
         # TODO (jingzhi): seems the worker process can inherit the os environment variables from the main process, so we do not need to set "os.environ['CHANGE_KV_LAYOUT']" here
         # self.tot_gpu_num = tot_gpu_num
         os.environ['LOCAL_RANK'] = str(local_rank)
-        print(f"os.environ['CUDA_VISIBLE_DEVICES']:{os.environ['CUDA_VISIBLE_DEVICES']}, LOCAL_RANK: {os.environ['LOCAL_RANK']}")
-        self.tot_ordered_gpus = 'None' # os.environ['TOT_ORDERED_GPUS']
-        # print(f"os.environ['TOT_ORDERED_GPUS']:{os.environ['TOT_ORDERED_GPUS']}")
-
+        print(f"os.environ['CUDA_VISIBLE_DEVICES']:{os.environ['CUDA_VISIBLE_DEVICES']}, LOCAL_RANK: {os.environ['LOCAL_RANK']}  self.model: {self.model_config.model}")
+        # self.tot_ordered_gpus = 'None' # os.environ['TOT_ORDERED_GPUS']
+        self.tot_ordered_gpus = os.getenv("TOT_ORDERED_GPUS", 'None')
+        print(f"os.environ['TOT_ORDERED_GPUS']:{self.tot_ordered_gpus}  self.model: {self.model_config.model}")
+        # print(f"JUST FOR DEBUG: device_config.device in init worker: {device_config.device}")
 
     def init_model(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -101,6 +102,7 @@ class Worker:
             if self.tot_ordered_gpus != 'None':
                 ori_gpu_orders = self.tot_ordered_gpus.split(',')
                 curr_gpu_orders = os.environ["CUDA_VISIBLE_DEVICES"].split(',')
+                print(f"ori_gpu_orders: {ori_gpu_orders}, curr_gpu_orders: {curr_gpu_orders}")
                 for i, gpu_i in enumerate(curr_gpu_orders):
                     if gpu_i == ori_gpu_orders[self.local_rank]:
                         self.device = torch.device(f"cuda:{i}")
@@ -263,6 +265,38 @@ class Worker:
 
         # <jingzhi> also return the information of KVBlkPerLayerWeight ==> do not need to return KVBlkPerLayerWeight
         # return num_gpu_blocks, num_cpu_blocks, (KVBlkPerLayerWeight.blk_num_per_layer, KVBlkPerLayerWeight.cached_layer_num)
+
+
+
+
+
+    # <jingzhi>
+    @torch.inference_mode()
+    def profile_per_iter_latency(
+        self,
+        is_prompt: bool,
+        sampling_params_dict: Dict[str, float], 
+        set_max_num_batched_tokens: float = float('inf'),
+        set_max_num_seqs: float = float('inf'),
+        set_seqlens: List[int] = list(),
+    ) -> Tuple[int, int]:
+        """Profile the per iteration latency of the model.
+        Args:
+            is_prompt: controls which stage (prefill or decoding stage) to profile
+            sampling_params_dict: the sampling param dictionary to be used.
+
+            set_max_num_batched_tokens: the max_num_batched_tokens (< the limit by KV cache)
+            set_max_num_seqs: the max_num_seqs (< the limit by the scheduler config)
+        """
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model.
+        self.model_runner.profile_per_iter_latency(
+            is_prompt, sampling_params_dict, self.gpu_cache, 
+            set_max_num_batched_tokens,set_max_num_seqs,
+            set_seqlens)
+    
+
+
 
 
 
