@@ -651,6 +651,12 @@ def get_cost_table():
                 #        'NousResearch/Llama-2-70b-hf']
                 ]
     
+
+    for file_info in logfiles:
+        print('!/benchmarks'+file_info[3][1:])
+    for file_info in prepInp_decode_logfiles:
+        print('!/benchmarks'+file_info[2][1:])
+
     cost_table = CostTable(
         logfiles=logfiles,
         prepInp_decode_logfiles=prepInp_decode_logfiles,
