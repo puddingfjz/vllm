@@ -404,18 +404,25 @@ class LLM:
         # NOTE: <jingzhi> 这个地方的循环条件应该改成：当所有req都被answer了才停，根据SHARED_CONTECT里的tot_req_num_remained来判断
         # while self.llm_engine.has_unfinished_requests():
         # <jingzhi>
-        while SHARED_CONTECT.tot_req_num_remained > len(outputs):
+        # 这个地方的判断条件需要变一下，或许应该变成当前没有未完成的req并且也不可能获得新的req了。
+        possible_to_get_future_reqs: bool = True
+        # while SHARED_CONTECT.tot_req_num_remained > len(outputs):
+        while True:
 
             # <jingzhi> support model-level pipeline
-            # we need to check whether there are new available seqs every check_in_gap steps
-            if step_i % SHARED_CONTECT.check_in_gap == 0:
-                new_inps = SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
-                self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
+            # # we need to check whether there are new available seqs every check_in_gap steps
+            # if step_i % SHARED_CONTECT.check_in_gap == 0:
+            #     new_inps = SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
+            #     self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
 
 
-            # <jingzhi> change the condition to check new seqs
-            if (step_i == 0) or \
-                (SHARED_CONTECT.check_in and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0)):
+            # <jingzhi> change the condition to check new seqs: 
+            # (1) is the first iter or (2) it is possible to get future reqs and has no pending (waiting+swapped) reqs
+            # if (step_i == 0) or \
+            #     (SHARED_CONTECT.check_in and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0)):
+            # <jingzhi> change the condition to check new seqs: 
+            # (1) it is possible to get future reqs and (2) has no pending (waiting+swapped) reqs
+            if possible_to_get_future_reqs and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0):
                 # TODO: 先实现一个naive的版本，不检查目前的资源使用还能不能容纳新的request --> 目前的版本是如果没有waiting的req就一直check
 
                 # NOTE: when all the requests are finished, we must (1) wait for new requests to continue the inference 
@@ -426,8 +433,13 @@ class LLM:
                         # when there are running reqs, we check every check_in_gap steps
                         break
 
-                    new_inps = SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
+                    new_inps, possible_to_get_future_reqs = \
+                        SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
                     self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
+                    
+                    if not possible_to_get_future_reqs:
+                        break
+                    
                     if (len(new_inps) == 0) and (not has_unfinished_requests):
                         # we query the communicator every 1 second
                         time.sleep(1)
@@ -435,8 +447,16 @@ class LLM:
                         break
             
 
+
+            # check whether we need to stop the inference process
+            if (not possible_to_get_future_reqs) and (not self.llm_engine.has_unfinished_requests()):
+                # (1) not possible to get reqs in the future and (2) all assigned reqs have been finished
+                break
+
+
             # <jingzhi> For Profiling-----------------
             step_i+=1
+            print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}")
             print(f"step i: {step_i}", flush=True)
 
 
@@ -489,7 +509,7 @@ class LLM:
             
             # send the outputs to the model communicator every check_out_gap steps
             # <jingzhi> multi-level LLM system
-            if step_i % SHARED_CONTECT.check_out_gap == 0:
+            if step_i % SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id] == 0:
                 output_num_sent_out, new_outputs = \
                     self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
                 SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
@@ -522,7 +542,7 @@ class LLM:
         if not SHARED_CONTECT.has_dp_parallel():
             # <jingzhi> support multi-model inference
             remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
-            SHARED_CONTECT.set_finished(len(remaining_requests))
+            SHARED_CONTECT.set_finished(len(outputs))
             if not SHARED_CONTECT.is_finished():
                 SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
                 # now we are ready to reload the model according to the new execution plan and restart the inference
@@ -545,7 +565,7 @@ class LLM:
 
 
 
-        print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
+        print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
 
 
 

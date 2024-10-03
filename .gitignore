@@ -204,8 +204,71 @@ _build/
 
 # logs and scripts
 *.err
-My_README.md
 ENV_SCRIPTS_complete_version.md
 env_command.md
 
+# file to get inp lens from
+!/benchmarks/Cost_Model_per_iter/baseline_tp1_llama2_7b_7.log
 
+# these are files required for cost model construction
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_0503_tp1_temp1.0_wldeg2_samp_prepInp.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp2_temp1.0_wldeg2_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp4_temp1.0_wldeg2_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp1_temp1.0_wldeg8_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp1_temp1.0_wldeg16_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp2_temp1.0_wldeg8_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_tp2_temp1.0_wldeg16_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp1_temp1.0_wldeg2_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp2_temp1.0_wldeg2_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp4_temp1.0_wldeg2_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp1_temp1.0_wldeg10_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp1_temp1.0_wldeg20_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp2_temp1.0_wldeg10_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-13b-hf_tp2_temp1.0_wldeg20_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-70b-hf_tp2_temp1.0_wldeg2_0504_2.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-70b-hf_tp4_temp1.0_wldeg2_0504_2.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-70b-hf_tp2_temp1.0_wldeg16_0504_2.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-70b-hf_tp2_temp1.0_wldeg20_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-70b-hf_tp2_temp1.0_wldeg40_0504_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-chat-hf_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-chat-hf_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-chat-hf_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_chatglm3-6b_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_chatglm3-6b_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_chatglm3-6b_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-j-6b_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-j-6b_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-j-6b_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-neox-20b_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-neox-20b_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_gpt-neox-20b_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan2-13B-Chat_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan2-13B-Chat_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan2-13B-Chat_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan-7B_tp1_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan-7B_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Baichuan-7B_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Mixtral-8x7B-v0.1_tp2_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/Formal_Mixtral-8x7B-v0.1_tp4_temp1.0_wldeg2_0518_4.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_vicuna-13b-v1.5_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_vicuna-13b-v1.5_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_vicuna-13b-v1.5_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_oasst-sft-4-pythia-12b-epoch-3.5_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_oasst-sft-4-pythia-12b-epoch-3.5_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_oasst-sft-4-pythia-12b-epoch-3.5_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_alpaca-13b_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_alpaca-13b_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_alpaca-13b_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_baize-v2-13b_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_baize-v2-13b_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_baize-v2-13b_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_koala-13B-HF_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_koala-13B-HF_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_koala-13B-HF_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_dolly-v2-12b_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_dolly-v2-12b_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_dolly-v2-12b_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_mpt-7b-chat_tp1_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_mpt-7b-chat_tp2_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/NEWROUND_mpt-7b-chat_tp4_0728_temp1.0_wldeg2_1.log
+!/benchmarks/Cost_Model_per_iter/Formal_Llama-2-7b-hf_0503_tp1_temp1.0_wldeg2_DecodePrepInp.log
