@@ -72,6 +72,7 @@
 # =============================================================================================================================
 # =============================================================================================================================
 
+from multiprocessing import get_context
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 from multiprocessing import Array, Event, Manager
@@ -88,6 +89,7 @@ import model_communicate_utils
 from vllm.core.multimodel_scheduler import MyManager
 
 import torch
+import traceback
 
 
 
@@ -106,29 +108,48 @@ class RAY_WORKER():
 
 
 
+glob_variable: bool = False
 
-def init_task(task_i: int, communicator):
+
+def init_task(task_i: int, communicator, event):
     try:
+        global glob_variable
+        print(f"glob_variable: {glob_variable}")
+
+        # from vllm.core.multimodel_scheduler import SHARED_CONTECT
+        # SHARED_CONTECT.shared_setting = shared_setting
+        event.set()
+        print(f"event.is_set(): {event.is_set()}")
+
+
         model_communicate_utils.communicator = communicator
         if task_i == 0:
+
+            # SHARED_CONTECT.shared_setting[0] = 1
+            # print(f"task {task_i}: SHARED_CONTECT.shared_setting: {SHARED_CONTECT.shared_setting[0], SHARED_CONTECT.shared_setting[1]}")
+
             # communicator.add_seqs(0, ['this', 'is'])
             # ret = communicator.get_seqs.remote(0, 1)
             # print(ray.get(ret))
             # communicator.add_seqs(0, ['this', 'is'])
             communicator.reset_state_for_model(0, 2)
             communicator.add_seqs(0, [(0, 'this'), (1, 'is')])
-            print(f"\nRAY_WORKER.remote(communicator)--------------\n")
-            worker = RAY_WORKER.remote(communicator)
-            # communicator.add_seqs(0, [TEST(1,2,3), TEST(4,5,6)])
-            print(f"{task_i}, finished")
+            # print(f"\nRAY_WORKER.remote(communicator)--------------\n")
+            # # worker = RAY_WORKER.remote(communicator)
+            # # communicator.add_seqs(0, [TEST(1,2,3), TEST(4,5,6)])
+            # print(f"{task_i}, finished")
         else:
+            # SHARED_CONTECT.shared_setting[1] = 2
+            # print(f"task {task_i}: SHARED_CONTECT.shared_setting: {SHARED_CONTECT.shared_setting[0], SHARED_CONTECT.shared_setting[1]}")
+
             # ret = communicator.get_seqs.remote(0, 1)
             # print(ray.get(ret))
+            print(f"{task_i}, {communicator.get_info()}")
             ret = communicator.get_seqs(1, 1, 1)
             print(f"{task_i}, ret: {ret}")
     except Exception as e:
-        print(task_i, e)
-
+        print("Exception", task_i, e)
+        print(traceback.format_exc())
 
 
 
@@ -144,7 +165,15 @@ async def test():
     print(time.perf_counter())
     tasks = []
     # communicator = REMOTE_LLM_COMMUNICATOR.remote(2)
-    
+
+    global glob_variable
+    glob_variable = True
+
+    from vllm.core.multimodel_scheduler import SHARED_CONTECT
+    SHARED_CONTECT.shared_setting = Array('i', [0 for i in range(2)]) # 'd' is for double
+    event = Event()
+
+
     with MyManager() as manager:
         communicator = manager.Communicator(2, in_edge_dict_with_dummy_inp_nodes={1:[0]})
         # communicator.add_seqs(0, [(2, 'this'), (3, 'is')])
@@ -152,8 +181,10 @@ async def test():
         print(f"at the beginning: {communicator.get_info()}")
         print(f"at the beginning: {[str(i) for i in communicator.get_info()[0][0]]}")
 
+
+        context = get_context('spawn')
         # launch the exec_plans in order
-        with ProcessPoolExecutor(max_workers=2) as executor:
+        with ProcessPoolExecutor(max_workers=2,mp_context=context) as executor:
             # for model_id, (gpus, model) in enumerate(zip(['2,1,3,0', '3,0,2,1'], model_list)):
             
             # start a process for each model, no matter it is in launched_exec_plan_states or not
@@ -162,16 +193,20 @@ async def test():
             for i in range(2):
                 tasks.append(
                     loop.run_in_executor(
-                        executor, init_task, i, communicator
+                        executor, init_task, i, communicator, event
                     )        
                 )
         
         print(f"in the end: {communicator.get_info()}")
         print(f"in the end: {[str(i) for i in communicator.get_info()[0][0]]}")
+        # print(f"in the end: SHARED_CONTECT.shared_setting: {SHARED_CONTECT.shared_setting[0], SHARED_CONTECT.shared_setting[1]}")
+        print(f"in the end: event.is_set(): {event.is_set()}")
 
 
 # from model_communicate import *
-asyncio.run(test())
+if __name__ == '__main__':
+    asyncio.run(test())
+    print(glob_variable)
 
 '''
 from model_communicate import *

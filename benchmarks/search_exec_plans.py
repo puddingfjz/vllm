@@ -3401,7 +3401,7 @@ def get_model_info_objs(
 
 
 
-def get_inplens():
+def get_inplens(req_num: int):
     import json
     def get_lens(filename):
         with open(filename, 'r') as file:
@@ -3415,7 +3415,7 @@ def get_inplens():
     filename = './Cost_Model_per_iter/baseline_tp1_llama2_7b_7.log' # not ignore eos
     lens = get_lens(filename)
     inps = [i[0] for i in lens]
-    return inps[:]
+    return inps[:req_num]
 
 
 def get_outlens():
@@ -3442,7 +3442,7 @@ def get_best_model_schedule(
         check_gap: int, sort_input: bool,
         model_paths: List[str], 
         # 
-        inp_generator, inp_merger, outlen_generator,
+        num_prompts, inp_generator, inp_merger, outlen_generator,
         # 
         out_edge_dict: Dict[int, List[int]],
         sample_config: Tuple[float, float, float, float],
@@ -3466,7 +3466,7 @@ def get_best_model_schedule(
 
     # 2. get input lengths
     # inp_lens = get_inplens()
-    inp_lens = inp_generator()
+    inp_lens = inp_generator(num_prompts)
     print(f"len(inp_lens): {len(inp_lens)}")
 
     # 3.  initialize model info objects and the model system object
@@ -3694,6 +3694,7 @@ if __name__ == "__main__":
 
 
     # inp/out len generator functions for the general setting
+    # req_num = 1000
     # inp_generator = get_inplens
     # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
     # outlen_generator = output_length_sampler.sample_out_len_for_given_model
@@ -3738,7 +3739,7 @@ if __name__ == "__main__":
         check_gap,
         sort_input,
         model_paths, 
-        inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        num_prompts=req_num, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         out_edge_dict=out_edge_dict,
         sample_config=(1, 1, -1, 0),
         trust_remote_code=True, revision=None,

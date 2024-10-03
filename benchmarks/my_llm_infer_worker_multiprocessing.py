@@ -13,6 +13,8 @@ import os
 from vllm.core.multimodel_scheduler import SHARED_CONTECT, LLM_COMMUNICATOR
 
 
+import traceback
+
    
 def do_inference(
         worker_i: int, 
@@ -64,7 +66,7 @@ def do_inference(
     # <jingzhi> For Profiling
     start_prepare_model = time.perf_counter()
     # print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
-    print(f"start do_inference: ---abs {start_prepare_model}")
+    print(f"start do_inference: model id{SHARED_CONTECT.shared_id} dp_id {worker_i}: ---abs {start_prepare_model}")
 
     if (rescheduled_iter_num == 0) or (os.environ['SOFT_RESCHEDULE'] == 'False'):
         start_time_load_LLM = time.perf_counter()
@@ -150,7 +152,7 @@ def do_inference(
         # directly set the remaining requests to the scheduler waiting list
         print(f"directly using unfinished requests!")
         # llm.llm_engine.scheduler.waiting = SHARED_CONTECT.remaining_requests
-        llm.llm_engine.scheduler.waiting = remaining_requests
+        llm.llm_engine.scheduler.waiting = deque(remaining_requests)
 
 
     # prepare sampling parameters
@@ -177,11 +179,17 @@ def do_inference(
     tmp_start = time.perf_counter()
 
     # FIXME(woosuk): Do not use internal method.
-    outputs = llm._run_engine(use_tqdm=True, sampling_parameters=sampling_parameters)
+    try:
+        outputs = llm._run_engine(use_tqdm=True, sampling_parameters=sampling_parameters)
+    except Exception as e:
+        print(f"Exception in llm._run_engine: {e}")
+        print(traceback.format_exc())
+        
+
     end = time.perf_counter()
     
 
-    print(f"this execution plan running time: {end - tmp_start}s ---abs {end}")
+    print(f"model id: {SHARED_CONTECT.shared_id}, this execution plan running time: {end - tmp_start}s ---abs {end}")
     print(f"outputs:\n")
     # print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), output_len] for req_output, (_, _, output_len) in zip(outputs, requests) for completion_output in req_output.outputs]}")
     print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), -1] for req_output in outputs for completion_output in req_output.outputs]}")
@@ -205,7 +213,7 @@ def do_inference(
     # torch.cuda.empty_cache()
 
     print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
-    print(f"{model} One round finished!!!!!!!!!!")
+    print(f"{model} {SHARED_CONTECT.shared_id} One round finished!!!!!!!!!!")
 
 
     # print status we collect
@@ -214,7 +222,7 @@ def do_inference(
     # my_throughput_logger.print_by_record()
 
     # return request status
-    print(f"worker i: {worker_i}, len of outputs and remainings before return: {len(SHARED_CONTECT.gened_outputs), len(SHARED_CONTECT.remaining_requests)}")
+    print(f"model {SHARED_CONTECT.shared_id} worker i: {worker_i}, len of outputs and remainings before return: {len(SHARED_CONTECT.gened_outputs), len(SHARED_CONTECT.remaining_requests)}")
     # return (SHARED_CONTECT.gened_outputs, SHARED_CONTECT.remaining_requests)
     return len(SHARED_CONTECT.gened_outputs), SHARED_CONTECT.remaining_requests
     

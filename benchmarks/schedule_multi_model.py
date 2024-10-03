@@ -44,6 +44,8 @@ from collections import defaultdict
 
 # shared_counter: Array # = Array('d', [-1, -1])
 
+import traceback
+
 
 class MyExecPlanState:
     """Record the state of an exec plan"""
@@ -82,6 +84,7 @@ class InferenceArgs:
     """Arguments for vLLM single model inference."""
     def __init__(self, 
         model:str="huggyllama/llama-7b", 
+        num_prompts: int = 1000
         # tensor_parallel_size:int=1
     ) -> None:
         self.backend: str = "vllm"
@@ -95,7 +98,7 @@ class InferenceArgs:
         self.n: int = 1
         self.use_beam_search: bool = False
         # TODO: setting num_prompts
-        self.num_prompts: int = 1000
+        self.num_prompts: int = num_prompts # 1000
         self.seed: int = 0
         self.hf_max_batch_size: int = None
         self.trust_remote_code: bool = True
@@ -165,7 +168,7 @@ def start_a_model_inference_child_process(
         os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False'
       
     # os.environ['RUN_MULTI_MODEL'] = 'True'
-    args = InferenceArgs(model)
+    args = InferenceArgs(model, req_num)
 
     # set os.environ['CUDA_VISIBLE_DEVICES'] before importing benchmark_throughput
     # benchmark_throughput.SHARED_CONTECT.shared_setting = SHARED_CONTECT.shared_setting
@@ -178,7 +181,8 @@ def start_a_model_inference_child_process(
     try:
         benchmark_throughput.main(args)
     except Exception as e:
-        print(e)
+        print(f"Exception in running benchmark_throughput.main(): {e}")
+        print(traceback.format_exc())
 
 
 
@@ -245,7 +249,7 @@ def get_model_path_list() -> List[str]:
                 ]
     
     # for test
-    model_paths = ['NousResearch/Llama-2-7b-hf', 'NousResearch/Llama-2-7b-chat-hf']
+    model_paths = ['NousResearch/Llama-2-7b-hf']
     return model_paths
 
 
@@ -349,7 +353,7 @@ def search_best_scheduling(
         # 
         out_edge_dict: Dict[int, List[int]],
         check_gap: int, sort_input: bool,
-        inp_generator, inp_merger, outlen_generator,
+        num_prompts: int, inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num: int = 4,
         max_group_seq_num: int = 100,
@@ -367,6 +371,7 @@ def search_best_scheduling(
         check_gap,
         sort_input,
         model_paths, 
+        num_prompts,
         inp_generator,
         inp_merger,
         outlen_generator,
@@ -391,6 +396,7 @@ def search_best_scheduling(
 def initialize_SHARED_CONTECT(
         tot_gpu_num: int,
         model_paths: List[str], 
+        check_gap: int,
         plan_state_group_list:List[List[MyExecPlanState]],
         model_driver_worker_gpu_i: Dict[int,int],
         gpu_order_we_set: List[int],
@@ -412,6 +418,10 @@ def initialize_SHARED_CONTECT(
     SHARED_CONTECT.started_status = [Event() for _ in range(len(model_paths))]
     SHARED_CONTECT.shared_setting = counter
     SHARED_CONTECT.shared_finish_status = Array(ctypes.c_bool, [False for i in range(len(model_paths))])
+    # add check_out_gaps
+    check_out_gaps = Array('i', [int(1e9)]*len(model_paths)) # 'd' is for double
+    SHARED_CONTECT.check_out_gaps = check_out_gaps
+    SHARED_CONTECT.check_in_gap = check_gap
 
     
     # set the initial execution plan
@@ -909,7 +919,8 @@ def get_out_edge_dict_from_in_edge_dict_with_inp_nodes(
 def init_prompts_for_the_model_system(
         communicator: LLM_COMMUNICATOR,
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]], 
-        in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]]):
+        in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]], 
+        num_prompts: int):
     """
         Sample input dataset for the model system.
         INPUT:
@@ -920,7 +931,7 @@ def init_prompts_for_the_model_system(
     """
 
     # simply use the tokenizer of llama2 7b to check the lengths of the prompts
-    args = InferenceArgs(model='NousResearch/Llama-2-7b-hf')
+    args = InferenceArgs(model='NousResearch/Llama-2-7b-hf', num_prompts=num_prompts)
 
     from transformers import AutoTokenizer
     # Sample the requests.
@@ -936,13 +947,15 @@ def init_prompts_for_the_model_system(
         dataset_dict[dataset] = inp_prompts
 
     req_num_dict = defaultdict(int)
+    prompts_dict = dict()
     for model_id, (dataset, chunk_id, chunk_size) in node_dataset_chunk_mapping.items():
         inp_prompts = dataset_dict[dataset]
         to_add = inp_prompts
         if chunk_size > 0:
             to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
         
-        communicator.add_seqs(model_id, to_add)
+        # communicator.add_seqs(model_id, to_add)
+        prompts_dict[model_id] = to_add
         req_num_dict[model_id] = len(to_add)
     
 
@@ -956,6 +969,18 @@ def init_prompts_for_the_model_system(
                 visited.append(tgt)
 
     
+    ungened_out_req_nums = req_num_dict.copy()
+
+    # send the req_num_dict to the communicator
+    # set the unavailable_req_num (i.e., unavailable inp req num) for the dummy inp nodes to 0
+    for model_id in node_dataset_chunk_mapping:
+        req_num_dict[model_id] = 0
+    communicator.init_unavailable_req_nums_and_ungened_out_req_nums(req_num_dict, ungened_out_req_nums)
+
+    # send the prompts of the dummy inp nodes (i.e., dummy inp nodes' outputs) to the communicator 
+    for model_id, to_add in prompts_dict.items():
+        communicator.add_seqs(model_id, to_add)
+
     return req_num_dict
         
     
@@ -978,24 +1003,102 @@ def set_check_in_out_gap(
         If a model has no input model in this stage, check_in_gap is 1e9;
         If a model has no output model in this stage, check_out_gap is 1e9.
         OUTPUT:
-            SHARED_CONTECT.check_in, SHARED_CONTECT.check_in_gap, SHARED_CONTECT.check_out_gap
+            SHARED_CONTECT.check_in (deleted), SHARED_CONTECT.check_in_gap, SHARED_CONTECT.check_out_gap
+        NOTE:
+            all the models share the same fixed SHARED_CONTECT.check_in_gap;
+            different models have different SHARED_CONTECT.check_out_gap which may change over stages
     """
+
     model_ids = [plan_state.exec_plan.model.model_id for plan_state in curr_stage_plan_states]
     for plan_state in curr_stage_plan_states:
         model_id = plan_state.exec_plan.model.model_id
-        inp_model_ids = plan_state.exec_plan.model.input_model_ids
-        if len(set(inp_model_ids).intersection(model_ids)) > 0:
-            SHARED_CONTECT.check_in_gap = check_gap
-            SHARED_CONTECT.check_in = True
-        else:
-            SHARED_CONTECT.check_in_gap = int(1e9)
-            SHARED_CONTECT.check_in = False
         out_model_ids = out_edge_dict[model_id]
         if len(set(out_model_ids).intersection(model_ids)) > 0:
-            SHARED_CONTECT.check_out_gap = check_gap
+            SHARED_CONTECT.check_out_gaps[model_id] = check_gap
         else:
-            SHARED_CONTECT.check_out_gap = int(1e9)
+            SHARED_CONTECT.check_out_gaps[model_id] = int(1e9)
+
+
+    # model_ids = [plan_state.exec_plan.model.model_id for plan_state in curr_stage_plan_states]
+    # for plan_state in curr_stage_plan_states:
+    #     model_id = plan_state.exec_plan.model.model_id
+    #     inp_model_ids = plan_state.exec_plan.model.input_model_ids
+    #     if len(set(inp_model_ids).intersection(model_ids)) > 0:
+    #         SHARED_CONTECT.check_in_gap = check_gap
+    #         SHARED_CONTECT.check_in = True
+    #     else:
+    #         SHARED_CONTECT.check_in_gap = int(1e9)
+    #         SHARED_CONTECT.check_in = False
+    #     out_model_ids = out_edge_dict[model_id]
+    #     if len(set(out_model_ids).intersection(model_ids)) > 0:
+    #         SHARED_CONTECT.check_out_gap = check_gap
+    #     else:
+    #         SHARED_CONTECT.check_out_gap = int(1e9)
         
+
+
+
+
+
+
+
+def test_search(
+        gen_execplans_baseline:str,
+        search_method_baseline:str,
+        # 
+        in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]],
+        node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]],
+        check_gap: int, sort_input: bool,
+        num_prompts: int, inp_generator, inp_merger, outlen_generator,
+        # 
+        tot_gpu_num:int = 4,
+        max_group_seq_num: float = float('inf'),
+):
+    import os
+    os.environ['RUN_MULTI_MODEL'] = 'True'
+    os.environ['SOFT_RESCHEDULE'] = 'False'
+    os.environ['NO_PREEMPT'] = 'False'
+    os.environ['COLLECT_TIME_LOG'] = 'False' 
+    os.environ['MY_SORT_INPS'] = 'True' if sort_input else 'False'
+    os.environ['GET_INP_FROM_COMMUNICATOR'] = 'True' # whether to get the input from the communicator
+
+    print(f"os.environ['CUDA_VISIBLE_DEVICES'] in main_with_preemption: {os.environ['CUDA_VISIBLE_DEVICES']}", flush=True)
+    gpu_order_we_set = None
+    if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+        gpu_order_we_set = list(range(tot_gpu_num))
+    else:
+        gpu_order_we_set = [int(i) for i in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
+    assert len(gpu_order_we_set) == tot_gpu_num, f"gpu_order_we_set: {gpu_order_we_set} should contain {tot_gpu_num} cards"
+
+
+    model_driver_worker_gpu_i: Dict[int, int] = dict()
+
+    # TODO: setting tot_gpu_num
+    # tot_gpu_num = 4
+
+    # loop = asyncio.get_running_loop()
+    # tasks = []
+
+    # search the best model scheduling
+    model_paths = get_model_path_list()
+    # convert the in_edge_dict to out_edge_dict
+    out_edge_dict = get_out_edge_dict_from_in_edge_dict_with_inp_nodes(in_edge_dict_with_dummy_inp_nodes)
+    plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
+        gen_execplans_baseline,
+        search_method_baseline,
+        model_paths, 
+        # 
+        out_edge_dict,
+        check_gap, sort_input,
+        num_prompts, inp_generator, inp_merger, outlen_generator,
+        # 
+        tot_gpu_num = tot_gpu_num, 
+        max_group_seq_num = max_group_seq_num)
+
+    print("\n\n\n\n\nfinish searching!\n\n\n\n\n", flush=True)
+    # TODO: setting tot_gpu_num
+    # tot_gpu_num = 4
+
 
 
 
@@ -1009,7 +1112,7 @@ async def main_with_preemption(
         in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]],
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]],
         check_gap: int, sort_input: bool,
-        inp_generator, inp_merger, outlen_generator,
+        num_prompts: int, inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num:int = 4,
         max_group_seq_num: float = float('inf'),
@@ -1050,7 +1153,7 @@ async def main_with_preemption(
         # 
         out_edge_dict,
         check_gap, sort_input,
-        inp_generator, inp_merger, outlen_generator,
+        num_prompts, inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num = tot_gpu_num, 
         max_group_seq_num = max_group_seq_num)
@@ -1061,7 +1164,7 @@ async def main_with_preemption(
     
 
     launched_exec_plan_states, new_target_stage_i, candidate_exec_plan_states = initialize_SHARED_CONTECT(
-        tot_gpu_num=tot_gpu_num, model_paths=model_paths, 
+        tot_gpu_num=tot_gpu_num, model_paths=model_paths, check_gap=check_gap,
         plan_state_group_list=plan_state_group_list,
         model_driver_worker_gpu_i=model_driver_worker_gpu_i, 
         gpu_order_we_set=gpu_order_we_set)
@@ -1079,7 +1182,8 @@ async def main_with_preemption(
         communicator: LLM_COMMUNICATOR = manager.Communicator(len(model_paths), in_edge_dict_with_dummy_inp_nodes)
 
         # set inputs for dummy inp nodes in the system
-        req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes)
+        req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
+                                                         num_prompts)
 
 
         print(f"\nTIMESTAMP 3: {time.perf_counter()}\n")
@@ -1431,9 +1535,11 @@ def get_schedule_setting(test_case:str):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
+    req_num = None
     if test_case == 'general':
         # inp/out len generator functions for the general setting
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(get_model_path_list()))}
+        req_num = 1000
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
@@ -1484,7 +1590,7 @@ def get_schedule_setting(test_case:str):
     check_gap = 16
     sort_input = True
 
-    return check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping
+    return check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, req_num, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping
 
 
 
@@ -1498,7 +1604,7 @@ if __name__ == "__main__":
     search_method_baseline = 'ours' # 'naive'  'ours'
     
     test_case = 'general' # 'general' 'map-reduce' 'chain-summary'
-    check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+    check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, num_prompts, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         get_schedule_setting(test_case=test_case)
     
     asyncio.run(main_with_preemption(
@@ -1509,11 +1615,27 @@ if __name__ == "__main__":
         in_edge_dict_with_dummy_inp_nodes=in_edge_dict_with_dummy_inp_nodes,
         node_dataset_chunk_mapping=node_dataset_chunk_mapping,
         check_gap=check_gap, sort_input=sort_input,
-        inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        num_prompts=num_prompts, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
-        tot_gpu_num=4,
+        tot_gpu_num=2,
         max_group_seq_num=100))
     # # asyncio.run(main_with_preemption_debug())
+
+
+    # test_search(
+    #     gen_execplans_baseline=gen_execplans_baseline,
+    #     search_method_baseline=search_method_baseline,
+    #     # 
+    #     # support model-level pipeline parallel
+    #     in_edge_dict_with_dummy_inp_nodes=in_edge_dict_with_dummy_inp_nodes,
+    #     node_dataset_chunk_mapping=node_dataset_chunk_mapping,
+    #     check_gap=check_gap, sort_input=sort_input,
+    #     num_prompts=num_prompts, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+    #     # 
+    #     tot_gpu_num=2,
+    #     max_group_seq_num=100)
+
+
     # --------------------------------------------------------------------
 
     # main_test(

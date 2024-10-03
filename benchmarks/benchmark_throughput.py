@@ -839,35 +839,64 @@ def run_vllm(
         executor = None
         futures = None
         ray_dp_worker_outputs = list()
-        if dp_size > 1:
-            executor = ProcessPoolExecutor(max_workers=dp_size-1)
-            futures = [executor.submit(my_llm_infer_worker_multiprocessing.do_inference, \
-                                    worker_i, requests[worker_i], *infer_args) \
-                                        for worker_i in range(1, dp_size)]
+        # if dp_size > 1:
+        #     executor = ProcessPoolExecutor(max_workers=dp_size-1)
+        #     futures = [executor.submit(my_llm_infer_worker_multiprocessing.do_inference, \
+        #                             worker_i, requests[worker_i], *infer_args) \
+        #                                 for worker_i in range(1, dp_size)]
         
-            print(f"finish launching dp processes-------------\n")
+        #     print(f"finish launching dp processes-------------\n")
+
+        # if dp_size > 1:
+        # NOTE: we will launch the subprocesses for each dp worker, even when there is only 1 dp worker, 
+        # to avoid re-init cuda environment
+        executor = ProcessPoolExecutor(max_workers=dp_size)
+        futures = [executor.submit(my_llm_infer_worker_multiprocessing.do_inference, \
+                                worker_i, requests[worker_i], *infer_args) \
+                                    for worker_i in range(dp_size)]
+    
+        print(f"finish launching dp processes-------------\n")
         
         # run the inference of the main dp worker
-        main_output = my_llm_infer_worker_multiprocessing.do_inference(0, requests[0], *infer_args)
-        print(f"finish main dp processes-------------\n")
-        if dp_size > 1:
-            done, not_done = wait(futures, return_when=ALL_COMPLETED)
-            ray_dp_worker_outputs = [future.result() for future in done]
+        # main_output = my_llm_infer_worker_multiprocessing.do_inference(0, requests[0], *infer_args)
+        # print(f"finish main dp processes-------------\n")
+        # if dp_size > 1:
+        #     done, not_done = wait(futures, return_when=ALL_COMPLETED)
+        #     ray_dp_worker_outputs = [future.result() for future in done]
 
-            print(f"finish fetching dp worker results-------------\n")
+        #     print(f"finish fetching dp worker results-------------\n")
 
-            # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
-            # first check whether this model is finished
-            # is_finished = (len(main_output[1]) \
-            #                + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
-            gened_output_num = (main_output[0] + \
-                           sum([worker_output[0] for worker_output in ray_dp_worker_outputs]))
+        #     # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
+        #     # first check whether this model is finished
+        #     # is_finished = (len(main_output[1]) \
+        #     #                + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
+        #     gened_output_num = (main_output[0] + \
+        #                    sum([worker_output[0] for worker_output in ray_dp_worker_outputs]))
             
-            print(f"gened_output_num: {gened_output_num}-------------\n")
+        #     print(f"gened_output_num: {gened_output_num}-------------\n")
 
-            SHARED_CONTECT.set_finished(gened_output_num, set_event_state_anyway=True)
-            # # then mark the preparation_for_reschedule process as finished ==> mark it when calling ``set_finished``
-            # SHARED_CONTECT.set_finish_preparation_for_reschedule()
+        #     SHARED_CONTECT.set_finished(gened_output_num, set_event_state_anyway=True)
+        #     # # then mark the preparation_for_reschedule process as finished ==> mark it when calling ``set_finished``
+        #     # SHARED_CONTECT.set_finish_preparation_for_reschedule()
+
+
+        # if dp_size > 1:
+        done, not_done = wait(futures, return_when=ALL_COMPLETED)
+        ray_dp_worker_outputs = [future.result() for future in done]
+
+        print(f"finish fetching dp worker results-------------\n")
+
+        # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
+        # first check whether this model is finished
+        # is_finished = (len(main_output[1]) \
+        #                + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
+        gened_output_num = sum([worker_output[0] for worker_output in ray_dp_worker_outputs])
+        
+        print(f"gened_output_num: {gened_output_num}-------------\n")
+
+        SHARED_CONTECT.set_finished(gened_output_num, set_event_state_anyway=True)
+        # # then mark the preparation_for_reschedule process as finished ==> mark it when calling ``set_finished``
+        # SHARED_CONTECT.set_finish_preparation_for_reschedule()
         
 
         print(f"obtain all outputs in this round in main dp actor  ---abs {time.perf_counter()}")
@@ -878,7 +907,8 @@ def run_vllm(
         # for worker_output in ray_dp_worker_outputs:
         #     gened_outputs.extend(worker_output[0])
         # resort the remaining requests
-        remaining_outputs = main_output
+        # remaining_outputs = main_output[1]
+        remaining_outputs = list()
         for worker_output in ray_dp_worker_outputs:
             remaining_outputs.extend(worker_output[1])
         
