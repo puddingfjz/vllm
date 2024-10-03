@@ -115,6 +115,14 @@ class MyModelInfor:
             self, inp_lens: List[int], out_lens: List[int], inp_seq_ids: List[int],
             cost_table: CostTable, 
             remaining_decode_flops = None):
+
+        # we want to make sure there is not seq with 0 outlens stored.
+        valid_inds = np.nonzero(out_lens)[0]
+        inp_seq_ids = np.asarray(inp_seq_ids)[valid_inds]
+        inp_lens = np.asarray(inp_lens)[valid_inds]
+        out_lens = np.asarray(out_lens)[valid_inds]
+        # -------------------------------------------------
+
         self.inp_seq_ids = inp_seq_ids
         self.inp_lens = tuple(inp_lens)
         self.out_lens = tuple(out_lens)

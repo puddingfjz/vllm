@@ -249,7 +249,7 @@ def get_model_path_list() -> List[str]:
                 ]
     
     # for test
-    model_paths = ['NousResearch/Llama-2-7b-hf']
+    model_paths = ['NousResearch/Llama-2-7b-hf', 'NousResearch/Llama-2-7b-chat-hf']
     return model_paths
 
 
@@ -1539,12 +1539,22 @@ def get_schedule_setting(test_case:str):
     if test_case == 'general':
         # inp/out len generator functions for the general setting
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(get_model_path_list()))}
-        req_num = 1000
+        req_num = 200
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
         node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1) \
                                       for i in range(len(get_model_path_list()))}
+
+
+        # inp/out len generator functions for the general setting
+        # 假设是下面的这种拓扑结构：model 1 -> model 2
+        in_edge_dict_with_dummy_inp_nodes = {0:[-1], 1:[0]}
+        req_num = 20
+        inp_generator = get_inplens
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+        outlen_generator = output_length_sampler.sample_out_len_for_given_model
+        node_dataset_chunk_mapping = {-1: ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1)}
 
     elif test_case == 'map-reduce':
         # inp/out len generator functions for the map-reduce or chain summary scenario
