@@ -37,7 +37,7 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 import itertools
 
-from search_exec_plans import MyExecPlan, MyExecPlanGroupSeq, get_best_model_schedule, get_dependent_exec_plans_for_each_plan, get_inplens
+from search_exec_plans import MyExecPlan, MyExecPlanGroupSeq, MyModelInfor, get_best_model_schedule, get_dependent_exec_plans_for_each_plan, get_inplens
 import output_length_sampler
 
 from collections import defaultdict
@@ -155,7 +155,7 @@ class InferenceArgs:
 
 # start a model for inference
 def start_a_model_inference_child_process(
-        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, model_id: int, model: str = "huggyllama/llama-7b", 
+        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, shared_id: int, model: str = "huggyllama/llama-7b", 
         return_str=True, req_num=None):
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = gpus
@@ -173,7 +173,7 @@ def start_a_model_inference_child_process(
     # set os.environ['CUDA_VISIBLE_DEVICES'] before importing benchmark_throughput
     # benchmark_throughput.SHARED_CONTECT.shared_setting = SHARED_CONTECT.shared_setting
     # set shared id for each model
-    SHARED_CONTECT.shared_id = model_id
+    SHARED_CONTECT.shared_id = shared_id
     SHARED_CONTECT.communicator = communicator
     SHARED_CONTECT.return_str = return_str
     SHARED_CONTECT.tot_req_num_remained = req_num
@@ -288,6 +288,7 @@ def prepare_exec_plan_states(
         )->List[List[MyExecPlanState]]:
     '''
         Prepare the corresponding MyExecPlanState object for each exec plan.
+        Set the ``last_exec_plan_for_the_model`` and ``need_prepare_infer_env`` attributes for each exec plan.
         Output:
             List of exec plan state objects for each stage.
     '''
@@ -343,6 +344,58 @@ def prepare_exec_plan_states(
 
 
 
+def _get_model_sys_structure_from_selected_plan_group_seq(
+        plan_state_group_list: List[List[MyExecPlanState]], 
+        in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]], 
+        out_edge_dict: Dict[int, List[int]],
+) -> Tuple[Dict[int, int], Dict[int, MyModelInfor], Dict[int, List[int]], Dict[int, List[int]]]:
+    """
+        Input:
+            1. in_edge_dict_with_dummy_inp_nodes: the in edge dict of the initial model system with dummy inp nodes.
+            2. out_edge_dict: the out edge dict of the initial model system without dummy inp nodes.
+    """
+
+
+    print(f"in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+    print(f"out_edge_dict: {out_edge_dict}")
+
+
+    model_id_shared_id_mapping: Dict[int, int] = dict()
+    shared_id: int = 0
+
+    # 1. get the involved models (base model or fused model)
+    model_dict: Dict[int, MyModelInfor] = dict()
+    for plan_state_group in plan_state_group_list:
+        for plan_state in plan_state_group:
+            model_id = plan_state.exec_plan.model.model_id
+            model_dict[model_id] = plan_state.exec_plan.model
+            if model_id not in model_id_shared_id_mapping:
+                model_id_shared_id_mapping[model_id] = shared_id
+                shared_id += 1
+
+    # 2. get the node mapping between the original model system and the new model system which may contain some fused models
+    node_mapping: Dict[int, int] = dict()
+    for model_id, model in model_dict.items():
+        for ori in model.get_base_model_ids():
+            node_mapping[ori] = model_id
+    dummy_model_ids = np.concatenate(list(in_edge_dict_with_dummy_inp_nodes.values()))
+    dummy_model_ids = dummy_model_ids[dummy_model_ids<0]
+    for model_id in dummy_model_ids:
+        node_mapping[model_id] = model_id
+
+    # 3. get the new dummy in edge dict
+    new_in_edge_dict_with_dummy_inp_nodes = defaultdict(list)
+    for k, vs in in_edge_dict_with_dummy_inp_nodes.items():
+        new_in_edge_dict_with_dummy_inp_nodes[node_mapping[k]].extend([node_mapping[v] for v in vs])
+
+    # 4. get the new out edge dict
+    new_out_edge_dict = defaultdict(list)
+    for k, vs in out_edge_dict.items():
+        new_out_edge_dict[node_mapping[k]].extend([node_mapping[v] for v in vs])
+    
+
+    return model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict
+
 
 
 
@@ -353,10 +406,13 @@ def search_best_scheduling(
         # 
         out_edge_dict: Dict[int, List[int]],
         check_gap: int, sort_input: bool,
-        num_prompts: int, inp_generator, inp_merger, outlen_generator,
+        num_prompts: int, 
+        inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num: int = 4,
         max_group_seq_num: int = 100,
+        top_k: int=100,
+        similar_threshold: float=0.1,
     )->List[List[MyExecPlanState]]:
     
     # 1. first search the best scheduling
@@ -372,6 +428,7 @@ def search_best_scheduling(
         sort_input,
         model_paths, 
         num_prompts,
+        inp_seq_ids_dict,
         inp_generator,
         inp_merger,
         outlen_generator,
@@ -381,6 +438,8 @@ def search_best_scheduling(
         gpu_name='A100-80G', tot_gpu_num = tot_gpu_num, byte_per_gpu=80*(1024**3), 
         data_byte=2,
         max_group_seq_num=max_group_seq_num,
+        top_k=top_k,
+        similar_threshold=similar_threshold,
     )
 
 
@@ -393,7 +452,7 @@ def search_best_scheduling(
 
 
 
-def initialize_SHARED_CONTECT(
+def initialize_SHARED_CONTECT_not_support_fused_models(
         tot_gpu_num: int,
         model_paths: List[str], 
         check_gap: int,
@@ -405,6 +464,8 @@ def initialize_SHARED_CONTECT(
         Update: (1) SHARED_CONTECT events, shared_finish_status, shared_setting
                 (2) call SHARED_CONTECT.start_specific_models()
         Output: (1) launched_exec_plan_states; (2) new target stage i; (3) candidate_exec_plan_states
+        NOTE:
+            1. this version does not support the case where there are fused models in the model system.
     '''
 
     import ctypes
@@ -462,7 +523,89 @@ def initialize_SHARED_CONTECT(
 
 
 
+
+def initialize_SHARED_CONTECT(
+        tot_gpu_num: int,
+        # model_paths: List[str], 
+        check_gap: int,
+        plan_state_group_list:List[List[MyExecPlanState]],
+        model_driver_worker_gpu_i: Dict[int,int],
+        gpu_order_we_set: List[int],
+        model_id_shared_id_mapping: Dict[int, int],
+        new_out_edge_dict: Dict[int, List[int]],
+    ) -> Tuple[List[MyExecPlanState], int, List[MyExecPlanState]]:
+    '''
+        Update: (1) SHARED_CONTECT events, shared_finish_status, shared_setting
+                (2) call SHARED_CONTECT.start_specific_models()
+        Output: (1) launched_exec_plan_states; (2) new target stage i; (3) candidate_exec_plan_states
+    '''
+
+    import ctypes
+
+    new_model_num = len(model_id_shared_id_mapping)
     
+    SHARED_CONTECT.set_execution_plan_size(tot_gpu_num)
+    counter = Array('i', [0 for i in range(new_model_num*SHARED_CONTECT.execution_plan_size)]) # 'd' is for double
+    # all child processors will inherit this event
+    SHARED_CONTECT.events = [Event() for _ in range(2+new_model_num)]
+    # set the event to allow models to run
+    # SHARED_CONTECT.events[1].set()
+    SHARED_CONTECT.started_status = [Event() for _ in range(new_model_num)]
+    SHARED_CONTECT.shared_setting = counter
+    SHARED_CONTECT.shared_finish_status = Array(ctypes.c_bool, [False for i in range(new_model_num)])
+    # add check_out_gaps
+    check_out_gaps = Array('i', [int(1e9)]*new_model_num) # 'd' is for double
+    SHARED_CONTECT.check_out_gaps = check_out_gaps
+    SHARED_CONTECT.check_in_gap = check_gap
+
+    
+    # set the initial execution plan
+    available_gpus: List[int] = list(range(tot_gpu_num))
+    launched_exec_plan_states: List[MyExecPlanState] = plan_state_group_list[0]
+    for exec_plan_state in launched_exec_plan_states:
+        
+        exec_plan = exec_plan_state.exec_plan
+        # exec_plan_state.set_comp_gpus(available_gpus[:exec_plan.num_worker])
+        # data parallel
+        # NOTE: the gpu assignment policy for data parallel
+        exec_plan_state.set_comp_gpus(available_gpus[:exec_plan.num_worker*exec_plan.dp_size])
+        
+        setting = get_exec_settings_from_exec_plans(
+            exec_plan=exec_plan, available_gpus=available_gpus, tot_gpu_num=tot_gpu_num, gpu_order_we_set=gpu_order_we_set)
+        # SHARED_CONTECT.set_execution_plan(setting, model_ids=[exec_plan.model.model_id])
+        # NOTE: here we set setting for shared id, instead of model id
+        SHARED_CONTECT.set_execution_plan(setting, shared_ids=[model_id_shared_id_mapping[exec_plan.model.model_id]])
+        # TODO: does not consider that we can reuse some dp workers' infer envs 
+        # so that more than 1 dp driver worker's gpu infor should be record
+        if exec_plan.model.model_id not in model_driver_worker_gpu_i:
+            model_driver_worker_gpu_i[exec_plan.model.model_id] = available_gpus[0]
+
+        # update the available gpus
+        # available_gpus = available_gpus[exec_plan.num_worker:]
+        # support data parallel
+        available_gpus = available_gpus[exec_plan.num_worker*exec_plan.dp_size:]
+
+        exec_plan_state.launched = True
+        # NOTE: wait until all models finish the preparation before init their LLM objects to start them
+        # SHARED_CONTECT.start_specific_models([exec_plan.model.model_id])
+
+    new_target_stage_i: int = 1
+    candidate_exec_plan_states: List[MyExecPlanState] = []
+    if len(plan_state_group_list)>1:
+        candidate_exec_plan_states = plan_state_group_list[1]
+
+
+
+    # need to set check out gap 
+    set_check_in_out_gap(
+        curr_stage_plan_states=launched_exec_plan_states, check_gap=check_gap, new_out_edge_dict=new_out_edge_dict,
+        model_id_shared_id_mapping=model_id_shared_id_mapping)
+
+    return launched_exec_plan_states, new_target_stage_i, candidate_exec_plan_states
+
+
+
+
 
 
 
@@ -735,6 +878,7 @@ def _get_the_next_round_exec_plan_schedule(
         tot_gpu_num: int,
         plan_state_group_list:List[List[MyExecPlanState]],
         model_driver_worker_gpu_i: Dict[int,int],
+        model_id_shared_id_mapping: Dict[int, int],
     # )->Tuple[List[MyExecPlanState], List[MyExecPlanState], List[int], List[MyExecPlanState], int]:
     )->Tuple[List[MyExecPlanState], List[MyExecPlanState], int]:
     '''
@@ -757,7 +901,7 @@ def _get_the_next_round_exec_plan_schedule(
     cand_to_launch_list: List[List[MyExecPlanState]] = [list(), list()]
     for plan_state in launched_exec_plan_states:
         # do not consider exec plans of finished models
-        if SHARED_CONTECT.query_finish_status(plan_state.exec_plan.model.model_id):
+        if SHARED_CONTECT.query_finish_status(model_id_shared_id_mapping[plan_state.exec_plan.model.model_id]):
             continue
 
         if plan_state.stage_i < target_stage_i:
@@ -776,7 +920,7 @@ def _get_the_next_round_exec_plan_schedule(
     # 2. deal with the models which does not change their exec plan
     for plan_state in candidate_exec_plan_states:
         # do not consider exec plans of finished models
-        if SHARED_CONTECT.query_finish_status(plan_state.exec_plan.model.model_id):
+        if SHARED_CONTECT.query_finish_status(model_id_shared_id_mapping[plan_state.exec_plan.model.model_id]):
             plan_state.launched = True
             continue
 
@@ -840,6 +984,7 @@ def _get_the_next_round_exec_plan_schedule(
                     tot_gpu_num,
                     plan_state_group_list,
                     model_driver_worker_gpu_i,
+                    model_id_shared_id_mapping,
                 )
     
     # return to_launch, new_candidate_exec_plan_states, model_ids_to_stop, new_launch, new_target_stage_i
@@ -855,6 +1000,7 @@ def get_the_next_round_exec_plan_schedule(
         tot_gpu_num: int,
         plan_state_group_list:List[List[MyExecPlanState]],
         model_driver_worker_gpu_i: Dict[int,int],
+        model_id_shared_id_mapping: Dict[int, int],
     )->Tuple[List[MyExecPlanState], List[MyExecPlanState], List[int], List[MyExecPlanState], int]:
 
     # 1. get the new launch plan
@@ -865,6 +1011,7 @@ def get_the_next_round_exec_plan_schedule(
         tot_gpu_num,
         plan_state_group_list,
         model_driver_worker_gpu_i,
+        model_id_shared_id_mapping,
     )
 
     # 2. get model_ids_to_stop and new_launch
@@ -880,7 +1027,9 @@ def get_the_next_round_exec_plan_schedule(
 
 
 
-def start_exec_plans(new_launch: List[MyExecPlanState], tot_gpu_num: int, gpu_order_we_set: List[int]):
+def start_exec_plans(
+        new_launch: List[MyExecPlanState], tot_gpu_num: int, gpu_order_we_set: List[int],
+        model_id_shared_id_mapping: Dict[int, int]):
     for exec_plan_state in new_launch:
         
         exec_plan = exec_plan_state.exec_plan
@@ -888,10 +1037,11 @@ def start_exec_plans(new_launch: List[MyExecPlanState], tot_gpu_num: int, gpu_or
         
         setting = get_exec_settings_from_exec_plans(
             exec_plan=exec_plan, available_gpus=exec_plan_state.comp_gpus, tot_gpu_num=tot_gpu_num, gpu_order_we_set=gpu_order_we_set)
-        SHARED_CONTECT.set_execution_plan(setting, model_ids=[exec_plan.model.model_id])
+        shared_id = model_id_shared_id_mapping[exec_plan.model.model_id]
+        SHARED_CONTECT.set_execution_plan(setting, shared_ids=[shared_id])
 
         exec_plan_state.launched = True
-        SHARED_CONTECT.start_specific_models([exec_plan.model.model_id])
+        SHARED_CONTECT.start_specific_models([shared_id])
 
 
 
@@ -928,6 +1078,8 @@ def init_prompts_for_the_model_system(
         NOTE: we also set the total number of requests each model needs to do inference for.
         OUTPUT:
             req_num_dict: the number of req to answer for each model.
+        Modify:
+            call communicator.add_seqs to add the input requests to the corresponding dummy models.
     """
 
     # simply use the tokenizer of llama2 7b to check the lengths of the prompts
@@ -959,14 +1111,21 @@ def init_prompts_for_the_model_system(
         req_num_dict[model_id] = len(to_add)
     
 
+    print(f"req_num_dict: {req_num_dict}", flush=True)
+
     # set the req number for each non-dummy model node
     tot_node_num = len(req_num_dict) + len(in_edge_dict_with_dummy_inp_nodes)
     visited = list(req_num_dict.keys())
+    
+    print(f"tot_node_num: {tot_node_num}, visited: {visited}", flush=True)
+
     while len(visited) < tot_node_num:
         for tgt, srcs in in_edge_dict_with_dummy_inp_nodes.items():
+            print(f"tgt, srcs: {tgt, srcs}", flush=True)
             if set(srcs).issubset(visited):
                 req_num_dict[tgt] = min([req_num_dict[src] for src in srcs])
                 visited.append(tgt)
+                print(f"visited: {visited}", flush=True)
 
     
     ungened_out_req_nums = req_num_dict.copy()
@@ -988,15 +1147,19 @@ def init_prompts_for_the_model_system(
 
 
 
-def get_return_str(out_edge_dict: Dict[int, List[int]], model_id: int, model_paths: List[str])->bool:
+def get_return_str_list_version(out_edge_dict: Dict[int, List[int]], model_id: int, model_paths: List[str])->bool:
     outs = out_edge_dict[model_id]
     tgt = model_paths[model_id]
     return (True in [tgt != model_paths[out] for out in outs])
 
 
+def get_return_str(new_out_edge_dict: Dict[int, List[int]], model_id: int, model_path_dict: Dict[int, str])->bool:
+    outs = new_out_edge_dict[model_id]
+    tgt = model_path_dict[model_id]
+    return (True in [tgt != model_path_dict[out] for out in outs])
 
 
-def set_check_in_out_gap(
+def set_check_in_out_gap_not_support_fused_model(
         curr_stage_plan_states: List[MyExecPlanState], 
         check_gap: int, out_edge_dict: Dict[int, List[int]]):
     """
@@ -1038,6 +1201,32 @@ def set_check_in_out_gap(
 
 
 
+
+
+def set_check_in_out_gap(
+        curr_stage_plan_states: List[MyExecPlanState], 
+        check_gap: int, new_out_edge_dict: Dict[int, List[int]],
+        model_id_shared_id_mapping: Dict[int, int]):
+    """
+        If a model has no input model in this stage, check_in_gap is 1e9;
+        If a model has no output model in this stage, check_out_gap is 1e9.
+        OUTPUT:
+            SHARED_CONTECT.check_in (deleted), SHARED_CONTECT.check_in_gap, SHARED_CONTECT.check_out_gap
+        NOTE:
+            all the models share the same fixed SHARED_CONTECT.check_in_gap;
+            different models have different SHARED_CONTECT.check_out_gap which may change over stages
+            1. support fused models in the model system.
+    """
+
+    model_ids = [plan_state.exec_plan.model.model_id for plan_state in curr_stage_plan_states]
+    for plan_state in curr_stage_plan_states:
+        model_id = plan_state.exec_plan.model.model_id
+        out_model_ids = new_out_edge_dict[model_id]
+        shared_id = model_id_shared_id_mapping[model_id]
+        if len(set(out_model_ids).intersection(model_ids)) > 0:
+            SHARED_CONTECT.check_out_gaps[shared_id] = check_gap
+        else:
+            SHARED_CONTECT.check_out_gaps[shared_id] = int(1e9)
 
 
 
@@ -1106,16 +1295,24 @@ def test_search(
 
 
 async def main_with_preemption(
+        model_paths:List[str],
         gen_execplans_baseline:str,
         search_method_baseline:str,
         # 
         in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]],
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]],
         check_gap: int, sort_input: bool,
-        num_prompts: int, inp_generator, inp_merger, outlen_generator,
+        num_prompts: int, 
+        # 
+        inp_seq_ids_dict, 
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+        # 
+        inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num:int = 4,
         max_group_seq_num: float = float('inf'),
+        top_k: float = float('inf'),
+        similar_threshold: float=0.1
 ):
     import os
     os.environ['RUN_MULTI_MODEL'] = 'True'
@@ -1142,8 +1339,9 @@ async def main_with_preemption(
     loop = asyncio.get_running_loop()
     tasks = []
 
-    # search the best model scheduling
-    model_paths = get_model_path_list()
+    # search the best model scheduling 
+    # NOTE: we obtain the model paths from the input
+    # model_paths = get_model_path_list()
     # convert the in_edge_dict to out_edge_dict
     out_edge_dict = get_out_edge_dict_from_in_edge_dict_with_inp_nodes(in_edge_dict_with_dummy_inp_nodes)
     plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
@@ -1153,10 +1351,27 @@ async def main_with_preemption(
         # 
         out_edge_dict,
         check_gap, sort_input,
-        num_prompts, inp_generator, inp_merger, outlen_generator,
+        num_prompts, 
+        inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num = tot_gpu_num, 
-        max_group_seq_num = max_group_seq_num)
+        max_group_seq_num = max_group_seq_num,
+        top_k = top_k,
+        similar_threshold=similar_threshold)
+    
+
+    # get the NEW model system STRUCTURE from the ``plan_state_group_list``
+    model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
+        _get_model_sys_structure_from_selected_plan_group_seq(
+            plan_state_group_list, in_edge_dict_with_dummy_inp_nodes, out_edge_dict,)
+
+    # the number of models in the new model system topo (may contain fused models)
+    new_model_num = len(model_id_shared_id_mapping)
+    new_model_path_dict = {model_id: model.model_path for model_id, model in model_dict.items()}
+
+    print(f"\nnew_in_edge_dict_with_dummy_inp_nodes: {new_in_edge_dict_with_dummy_inp_nodes}")
+    print(f"new_out_edge_dict: {new_out_edge_dict}")
+    print(f"model_id_shared_id_mapping: {model_id_shared_id_mapping}")
 
     print("\n\n\n\n\nfinish searching!\n\n\n\n\n", flush=True)
     # TODO: setting tot_gpu_num
@@ -1164,10 +1379,13 @@ async def main_with_preemption(
     
 
     launched_exec_plan_states, new_target_stage_i, candidate_exec_plan_states = initialize_SHARED_CONTECT(
-        tot_gpu_num=tot_gpu_num, model_paths=model_paths, check_gap=check_gap,
+        tot_gpu_num=tot_gpu_num, # model_paths=model_paths, 
+        check_gap=check_gap,
         plan_state_group_list=plan_state_group_list,
         model_driver_worker_gpu_i=model_driver_worker_gpu_i, 
-        gpu_order_we_set=gpu_order_we_set)
+        gpu_order_we_set=gpu_order_we_set,
+        model_id_shared_id_mapping=model_id_shared_id_mapping,
+        new_out_edge_dict=new_out_edge_dict)
     first_stage_model_ids = [exec_plan_state.exec_plan.model.model_id for exec_plan_state in launched_exec_plan_states]
 
 
@@ -1179,17 +1397,25 @@ async def main_with_preemption(
 
         print(f"\nTIMESTAMP 2: {time.perf_counter()}\n")
 
-        communicator: LLM_COMMUNICATOR = manager.Communicator(len(model_paths), in_edge_dict_with_dummy_inp_nodes)
+        base_model_ids_dict = {model_id:model.get_base_model_ids() for model_id, model in model_dict.items()}
+        communicator: LLM_COMMUNICATOR = manager.Communicator(
+            new_model_num, # len(model_paths), 
+            in_edge_dict_with_dummy_inp_nodes,
+            base_model_ids_dict,
+            inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+            )
 
         # set inputs for dummy inp nodes in the system
-        req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
+        # NOTE: stores the req num of base models (for fused models, store req num for the base models inside)
+        base_req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
                                                          num_prompts)
 
 
         print(f"\nTIMESTAMP 3: {time.perf_counter()}\n")
 
         # launch the exec_plans in order
-        with ProcessPoolExecutor(max_workers=len(model_paths)) as executor:
+        # with ProcessPoolExecutor(max_workers=len(model_paths)) as executor:
+        with ProcessPoolExecutor(max_workers=new_model_num) as executor:
 
             print(f"\nTIMESTAMP 4: {time.perf_counter()}\n")
 
@@ -1197,13 +1423,26 @@ async def main_with_preemption(
             
             # start a process for each model, no matter it is in launched_exec_plan_states or not
             # NOTE: we will use os.environ['TOT_ORDERED_GPUS'] to control the actual gpu order in each model to support reschedule
-            for model_id, model_path in enumerate(model_paths):
+            # for model_id, model_path in enumerate(model_paths):
+            #     tasks.append(
+            #         loop.run_in_executor(
+            #             executor, start_a_model_inference, 
+            #             communicator, query_use_vllm(model_path), ','.join([str(i) for i in gpu_order_we_set]), model_id, model_path, 
+            #             get_return_str(out_edge_dict=out_edge_dict, model_id=model_id, model_paths=model_paths),
+            #             req_num_dict[model_id],
+            #         )        
+            #     )
+
+            # for model_id, model_path in enumerate(model_paths):
+            for model_id, model_path in new_model_path_dict.items():
+                shared_id = model_id_shared_id_mapping[model_id]
+                tot_req_num = sum([base_req_num_dict[base_model_id] for base_model_id in model_dict[model_id].get_base_model_ids()])
                 tasks.append(
                     loop.run_in_executor(
                         executor, start_a_model_inference, 
-                        communicator, query_use_vllm(model_path), ','.join([str(i) for i in gpu_order_we_set]), model_id, model_path, 
-                        get_return_str(out_edge_dict=out_edge_dict, model_id=model_id, model_paths=model_paths),
-                        req_num_dict[model_id],
+                        communicator, query_use_vllm(model_path), ','.join([str(i) for i in gpu_order_we_set]), shared_id, model_path, 
+                        get_return_str(new_out_edge_dict=new_out_edge_dict, model_id=model_id, model_path_dict=new_model_path_dict),
+                        tot_req_num,
                     )        
                 )
 
@@ -1213,9 +1452,11 @@ async def main_with_preemption(
 
 
             # wait for all processes finishing the preparation before initializing their LLM objects
-            SHARED_CONTECT.wait_all_models_to_finish_preparation_before_init_LLM(model_ids=range(len(model_paths)))
+            # SHARED_CONTECT.wait_all_models_to_finish_preparation_before_init_LLM(model_ids=range(len(model_paths)))
+            SHARED_CONTECT.wait_all_models_to_finish_preparation_before_init_LLM(shared_ids=range(new_model_num))
             # start the first stage models
-            SHARED_CONTECT.start_specific_models(first_stage_model_ids)
+            # SHARED_CONTECT.start_specific_models(first_stage_model_ids)
+            SHARED_CONTECT.start_specific_models([model_id_shared_id_mapping[_] for _ in first_stage_model_ids])
 
 
             start = time.perf_counter()
@@ -1241,11 +1482,13 @@ async def main_with_preemption(
                         new_target_stage_i,
                         tot_gpu_num, plan_state_group_list,
                         model_driver_worker_gpu_i,
+                        model_id_shared_id_mapping,
                     )
                 
 
                 # 2. stop the models
-                SHARED_CONTECT.stop_specific_models(model_ids_to_stop)
+                # SHARED_CONTECT.stop_specific_models(model_ids_to_stop)
+                SHARED_CONTECT.stop_specific_models([model_id_shared_id_mapping[_] for _ in model_ids_to_stop])
 
                 # TODO (jingzhi) try to make the finished processes release their resources
                 print(len(done_list), len(pending_list))
@@ -1258,11 +1501,15 @@ async def main_with_preemption(
                     await task
 
                 # 3. wait for model finish preparing for rescheduling            
-                SHARED_CONTECT.wait_all_models_to_finish_prepare_for_reschedule(model_ids_to_stop)
+                # SHARED_CONTECT.wait_all_models_to_finish_prepare_for_reschedule(model_ids_to_stop)
+                SHARED_CONTECT.wait_all_models_to_finish_prepare_for_reschedule([model_id_shared_id_mapping[_] for _ in model_ids_to_stop])
                 
                 # 4. start newly launched models
-                set_check_in_out_gap(curr_stage_plan_states=launched_exec_plan_states, check_gap=check_gap, out_edge_dict=out_edge_dict)
-                start_exec_plans(new_launch, tot_gpu_num, gpu_order_we_set=gpu_order_we_set)
+                set_check_in_out_gap(
+                    curr_stage_plan_states=launched_exec_plan_states, check_gap=check_gap, new_out_edge_dict=new_out_edge_dict,
+                    model_id_shared_id_mapping=model_id_shared_id_mapping)
+                start_exec_plans(new_launch, tot_gpu_num, gpu_order_we_set=gpu_order_we_set,
+                                 model_id_shared_id_mapping=model_id_shared_id_mapping)
 
 
                 # <jingzhi> For Profiling
@@ -1536,15 +1783,29 @@ def get_schedule_setting(test_case:str):
         None, None, None, None, None
 
     req_num = None
+    inp_seq_ids_dict = None
+    model_paths = None
+
+    # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
+    inp_req_ids = dict()
+    
+    # store information if the output of a model need to be merged to generate new out reqs
+    out_req_id_mapping = dict()
+    new_out_req_part_num = dict()
+    
+    # whether a base model's different input sources are independent or need to be merged, ...
+    independent_srcs = dict()
     if test_case == 'general':
         # inp/out len generator functions for the general setting
-        in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(get_model_path_list()))}
+        model_paths = get_model_path_list()
+        in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
         req_num = 200
+        inp_seq_ids_dict = {i: list(range(req_num)) for i in range(len(model_paths))}
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
         node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1) \
-                                      for i in range(len(get_model_path_list()))}
+                                      for i in range(len(model_paths))}
 
 
         # inp/out len generator functions for the general setting
@@ -1555,6 +1816,8 @@ def get_schedule_setting(test_case:str):
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
         node_dataset_chunk_mapping = {-1: ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1)}
+
+        independent_srcs = {i:False for i in range(len(model_paths))}
 
     elif test_case == 'map-reduce':
         # inp/out len generator functions for the map-reduce or chain summary scenario
@@ -1570,27 +1833,73 @@ def get_schedule_setting(test_case:str):
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths)-1)}
         in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = list(range(len(model_paths)-1))
         # 
-        inp_generator = lambda : [512]*req_num
+        inp_generator = lambda req_num: [512]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size) \
                                       for i in range(len(model_paths)-1)}
+        
+        # leave it later: for the case where we horizontally fuse all ``map`` models
+        out_req_id_mapping = {}
+        new_out_req_part_num = {}
+        independent_srcs = {}
 
     elif test_case == 'chain-summary':
         # # chain summary
+        # req_num = 1000
+        # chunk_size = 512
+        # model_paths = ['NousResearch/Llama-2-13b-hf'] * (20000 // chunk_size)
+        # # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+        # # # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+        # in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] + list(range(i)) for i in range(len(model_paths))}
+        
+        # inp_generator = lambda req_num: [512]*req_num
+        # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+        # outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+        # node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size)\
+        #                               for i in range(len(model_paths))}
+
+
         req_num = 1000
         chunk_size = 512
-        model_paths = ['NousResearch/Llama-2-13b-hf'] * (20000 // chunk_size)
+        max_length = chunk_size*5 # 20000
+        model_paths = ['NousResearch/Llama-2-13b-hf'] * (max_length // chunk_size)
+        print(f"model_paths: {model_paths}")
         # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
-        # # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
-        in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] + list(range(i)) for i in range(len(model_paths))}
-        
-        inp_generator = lambda : [512]*req_num
+        # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+        # in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] + list(range(i)) for i in range(len(model_paths))}
+        in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
+        in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
+
+        inp_generator = lambda req_num: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size)\
                                       for i in range(len(model_paths))}
+        
+        inp_seq_ids_dict = defaultdict(list)
+        # inp_lens = np.asarray(inp_generator(req_num))
+        # inp_lens = np.asarray([chunk_size]*int(0.2*req_num)+[2*chunk_size]*int(0.2*req_num)\
+        #                     +[3*chunk_size]*int(0.2*req_num)+[4*chunk_size]*int(0.2*req_num)\
+        #                         +[5*chunk_size]*int(0.2*req_num))
+        inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
+        inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
+        print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+        # add another model after the chain summary
+        model_paths.append('NousResearch/Llama-2-7b-hf')
+        in_edge_dict_with_dummy_inp_nodes[5] = [-6, 3, 4]
+        # out_edge_dict[3].append(5)
+        # out_edge_dict[4] = [5]
+        inp_seq_ids_dict[5] = sorted(set(inp_seq_ids_dict[3] + inp_seq_ids_dict[4]))
 
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+        
+        # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
+        inp_req_ids = dict()
+        independent_srcs = dict()
 
 
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
@@ -1600,7 +1909,9 @@ def get_schedule_setting(test_case:str):
     check_gap = 16
     sort_input = True
 
-    return check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, req_num, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping
+    return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs
 
 
 
@@ -1613,11 +1924,14 @@ if __name__ == "__main__":
     gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
-    test_case = 'general' # 'general' 'map-reduce' 'chain-summary'
-    check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, num_prompts, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+    test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
+    model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
+             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs = \
         get_schedule_setting(test_case=test_case)
     
     asyncio.run(main_with_preemption(
+        model_paths=model_paths,
         gen_execplans_baseline=gen_execplans_baseline,
         search_method_baseline=search_method_baseline,
         # 
@@ -1625,10 +1939,16 @@ if __name__ == "__main__":
         in_edge_dict_with_dummy_inp_nodes=in_edge_dict_with_dummy_inp_nodes,
         node_dataset_chunk_mapping=node_dataset_chunk_mapping,
         check_gap=check_gap, sort_input=sort_input,
-        num_prompts=num_prompts, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        num_prompts=num_prompts, 
+        inp_seq_ids_dict=inp_seq_ids_dict, 
+        inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 
+        new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
+        inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
         tot_gpu_num=2,
-        max_group_seq_num=100))
+        max_group_seq_num=100,
+        top_k=100,
+        similar_threshold=0.1))
     # # asyncio.run(main_with_preemption_debug())
 
 

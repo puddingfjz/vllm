@@ -4,7 +4,7 @@ for the given set of models and the given set of requests.
 """
 
 import numpy as np
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union
 import itertools
 import fake_scheduling
 from my_per_iter_latency_estimator import CostTable, get_cost_table
@@ -15,12 +15,14 @@ from vllm.worker.cache_engine import CacheEngine
 from collections import defaultdict
 
 from model_size_database import model_sizes
+import time
 
 
 _ENGINE_ARGS_LIST = dict()
 _FAKE_SCHEDULING_RES = dict() # key: (model name, exec_plan, inp_lens, out_lens) value: the output of fake_scheduling
 _MAX_SEQ_NUM = 0
 _CHECKED_SEQ_NUM = 0
+_MODEL_ID = 0
 
 class InferenceArgs:
     """ The args of the inference setting. """
@@ -48,6 +50,7 @@ class MyModelInfor:
         data_byte, # the number of bytes to store a value in model weights or intermediate tensors
         inp_lens: List[int], # the request input lengths.
         out_lens: List[int] = list(), # the request output lengths.
+        inp_seq_ids: List[int] = list() # the inp seq ids, to support the chain summary case
     ) -> None:
         self.data_byte = data_byte
         self.model_name = None
@@ -85,12 +88,35 @@ class MyModelInfor:
 
         self.input_model_ids: List[int] = list()
 
+        # this value is only set for base models at the beginning, and will not change during the search process
+        self.inp_base_model_ids: List[int] = list()
+
+
         # model-level pipeline
         self.ori_tot_inp_num: int = len(inp_lens) # this value will not change during the search
-        self.inp_seq_ids = np.asarray(range(self.ori_tot_inp_num))
+        # self.inp_seq_ids = np.asarray(range(self.ori_tot_inp_num))
+        self.inp_seq_ids = np.asarray(inp_seq_ids) if len(inp_seq_ids)>0 else np.asarray(range(self.ori_tot_inp_num))
+
+        self.ori_tot_remaining_decode_flops = self.remaining_decode_flops
+
+        self.ori_inp_seq_ids = sorted(self.inp_seq_ids)
+
 
     # def set_input_model_ids(self, input_model_ids: List[int]):
     #     self.input_model_ids = input_model_ids
+        
+        
+    def get_base_model_ids(self):
+        return [self.model_id]
+
+    def get_base_models(self):
+        return [self]
+    
+    # def get_inp_model_ids(self):
+    #     return self.input_model_ids
+
+    def not_started(self):
+        return self.ori_tot_remaining_decode_flops == self.remaining_decode_flops
 
     def set_model_name_from_path(self):
         pos = self.model_path.find('/')
@@ -187,6 +213,178 @@ class MyModelInfor:
 
 
 
+
+
+
+
+
+
+
+
+
+
+class MyFusedModelInfor(MyModelInfor):
+    """ 
+        My model information class. Contains basic model information. 
+        Contains the informatio of a fused model.
+    """
+    def __init__(
+        self,
+        model_list: List[MyModelInfor],
+    ) -> None:
+        
+        global _MODEL_ID
+
+        self.model_list = model_list
+        self.model_id = _MODEL_ID
+        _MODEL_ID+=1
+        
+        model_0 = model_list[0]
+        self.data_byte = model_0.data_byte
+        self.model_name = model_0.model_name
+        self.model_path = model_0.model_path
+
+        self.trust_remote_code=model_0.trust_remote_code
+        self.revision=model_0.revision
+        # self.model_config=None
+        self.hf_config=model_0.hf_config
+        self.layer_num = model_0.layer_num
+
+        
+        self.sample_config = model_0.sample_config
+
+        # only this parameter will be updated during the search
+        self.inp_lens = None #[model.inp_lens for model in self.model_list]
+        self.out_lens = None #[model.out_lens for model in self.model_list]
+        
+
+        # print(f"MyFusedModelInfor: {self.model_name} base_model_ids: {self.get_base_model_ids()} avg output len: {[sum(_)/len(_) for _ in [model.out_lens for model in self.model_list]]}")
+        # print(f"MyFusedModelInfor: {self.model_name} base_model_ids: {self.get_base_model_ids()} max output len: {[max(_) for _ in [model.out_lens for model in self.model_list]]}")
+
+        self.remaining_decode_flops = None #[model.remaining_decode_flops for model in self.model_list]
+
+        # self.model_id = model_id
+
+        # this variable will be set when we contruct new model sys by replacing models with fused models
+        self.input_model_ids: List[int] = list()
+        self.init_inp_model_ids()
+
+        self.inp_base_model_ids = None
+
+        # model-level pipeline
+        self.ori_tot_inp_num: int = [model.ori_tot_inp_num for model in self.model_list] # this value will not change during the search
+        # self.inp_seq_ids = np.asarray(range(self.ori_tot_inp_num))
+        self.inp_seq_ids = None #[model.inp_seq_ids for model in self.model_list]
+
+        self.ori_tot_remaining_decode_flops = [model.ori_tot_remaining_decode_flops for model in self.model_list]
+
+
+
+    def get_base_model_ids(self):
+        return [model.model_id for model in self.model_list]
+
+    def get_base_models(self):
+        return self.model_list
+    
+    def init_inp_model_ids(self):
+        for model in self.model_list:
+            self.input_model_ids = self.input_model_ids + model.input_model_ids
+        # we do not include the in-fused-model in_edges here
+        self.input_model_ids = sorted(set(self.input_model_ids).difference(self.get_base_model_ids()))
+    
+    # def get_inp_model_ids(self):
+    #     return np.concatenate([model.get_inp_model_ids() for model in self.model_list])
+        
+    def not_started(self):
+        return self.ori_tot_remaining_decode_flops == [model.remaining_decode_flops for model in self.model_list]
+
+
+
+
+
+    # def get_hidden_size(self):
+    #     return self.hf_config.hidden_size
+
+    # def get_name(self):
+    #     return self.model_name
+
+
+    def update_inp_out_seqlens(
+            self, inp_lens_for_models: List[int], out_lens_for_models: List[int], inp_seq_ids_for_models: List[int],
+            cost_table: CostTable, 
+            remaining_decode_flops_for_models = None):
+
+        if remaining_decode_flops_for_models == None:
+            remaining_decode_flops_for_models = [None for _ in range(len(self.model_list))]
+
+        print(f"in update_inp_out_seqlens\n")
+        print(self.model_list, inp_lens_for_models, out_lens_for_models, inp_seq_ids_for_models, remaining_decode_flops_for_models)
+
+        for model, inp_lens, out_lens, inp_seq_ids, remaining_decode_flops in zip(\
+            self.model_list, inp_lens_for_models, out_lens_for_models, inp_seq_ids_for_models, remaining_decode_flops_for_models):
+            model.update_inp_out_seqlens(inp_lens, out_lens, inp_seq_ids, cost_table, remaining_decode_flops=remaining_decode_flops)
+
+
+
+    def get_inp_out_seqlens(self):
+        return (tuple([model.inp_lens for model in self.model_list]), tuple([model.out_lens for model in self.model_list]))
+    
+    def get_inp_seq_ids(self):
+        return [model.inp_seq_ids for model in self.model_list]
+
+
+    def get_remaining_flops(self):
+        ''' Return flops in TFLOPs '''
+        return [model.remaining_decode_flops for model in self.model_list]
+    
+        return fake_scheduling.comp_flops_from_seqlens(
+            self.inp_lens, self.out_lens, only_decode=True, cost_table=cost_table, 
+            model_path=self.model_path, trust_remote_code=self.trust_remote_code, revision=self.revision)
+
+
+    def set_remaining_decode_flops(self, cost_table: CostTable, remaining_decode_flops = None):
+        ''' 
+            Return flops in TFLOPs.
+            We do not need this function in a fused model.
+        '''
+        assert False
+
+
+
+    def is_finished(self):
+        return False not in [model.is_finished() for model in self.model_list]
+
+
+    def get_state(self):
+        '''
+            The state of the model, i.e., its inference progress, is determined by its remaining seqlens.
+        '''
+        assert False
+        # return (self.model_name, self.get_remaining_flops())
+        return (self.model_name, tuple(self.get_base_model_ids()), \
+                tuple([model.inp_lens for model in self.model_list]), \
+                    tuple([model.out_lens for model in self.model_list]))
+
+
+    def __str__(self) -> str:
+        return f'{self.model_name}'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class MyExecPlan:
     """ My execution plan definition. """
     def __init__(
@@ -272,7 +470,45 @@ class MyExecPlan:
     
 
 
-    def get_finish_times_merged(self, seq_ids: List[int]):
+    def copy_the_plan(self):
+        return MyExecPlan(
+            self.model, 
+            self.num_worker, 
+            self.wld_degree, 
+            self.cache_gpu_num, 
+            self.mem_per_comp_gpu, # gpu utilization ratio
+            self.dp_size, # data parallelism degree: num of dp workers
+            self.param_byte_per_comp_gpu, 
+            self.param_byte_per_cache_gpu,
+            self.gpu_cache_byte_per_block,
+            self.infer_args,
+            self.tot_gpu_mem_byte,
+        )
+
+
+    def get_base_model_ids(self):
+        return self.model.get_base_model_ids()
+    
+    # def get_exec_plans(self):
+    #     return [self]
+    
+    def get_base_models(self):
+        return [self.model]
+    
+    def models_not_started(self):
+        return self.model.not_started()
+
+    def get_dp_inp_lens_list_for_models(self):
+        return self.dp_inp_lens_list
+
+
+    def get_finish_times_merged_not_support_different_ori_seq_ids_in_different_models(self, seq_ids: List[int], model_ind: int):
+
+        """
+            NOTE: this version does not support different models have different original seq ids to answer.
+        """
+
+        assert model_ind == 0, f"Wrong model ind: {model_ind}"
 
         # print(f"in get_finish_times_merged: exec_plan: {str(self)}")
         # print(f"self.dp_inp_seq_ids_list: {self.dp_inp_seq_ids_list}")
@@ -282,6 +518,39 @@ class MyExecPlan:
             for dp_inp_seq_ids, finish_times in zip(self.dp_inp_seq_ids_list, self.finish_times_list):
                 self.finish_times_merged[dp_inp_seq_ids] = finish_times
         return self.finish_times_merged[seq_ids]
+    
+
+
+    def get_finish_times_merged(self, seq_ids: List[int], model_ind: int):
+
+        assert model_ind == 0, f"Wrong model ind: {model_ind}"
+
+        # print(f"in get_finish_times_merged: exec_plan: {str(self)}")
+        # print(f"self.dp_inp_seq_ids_list: {self.dp_inp_seq_ids_list}")
+
+        if len(self.finish_times_merged) == 0:
+            self.finish_times_merged = np.asarray([-1-self.extra_cost]*self.model.ori_tot_inp_num) 
+            for dp_inp_seq_ids, finish_times in zip(self.dp_inp_seq_ids_list, self.finish_times_list):
+                inds = np.searchsorted(self.model.ori_inp_seq_ids, dp_inp_seq_ids)
+                # self.finish_times_merged[dp_inp_seq_ids] = finish_times
+                self.finish_times_merged[inds] = finish_times
+
+
+        # print(f"in get_finish_times_merged: self.finish_times_merged: {self.finish_times_merged}")
+
+        # we need to consider the case where the inp seq id is not the output of the model
+        # for example: a model after the chain summary, it depends on different model stages in the summary chain
+        #           the total inp seq ids will be the full set of inp seq ids, but they are outputs of different model stages
+
+        return get_infor_given_seq_ids(
+            values=self.finish_times_merged, 
+            seq_ids_we_have=self.model.ori_inp_seq_ids, 
+            seq_ids_requested=seq_ids, 
+            default_value=-1-self.extra_cost)
+
+        inds = np.searchsorted(self.model.ori_inp_seq_ids, seq_ids)
+        # return self.finish_times_merged[seq_ids]
+        return self.finish_times_merged[inds]
 
 
 
@@ -406,6 +675,43 @@ class MyExecPlan:
         
 
 
+    def _sort_and_partition_data_parallel(
+            self, 
+            arrive_times: List[float],
+            ):
+        inp_lens, out_lens = self.model.get_inp_out_seqlens()
+        
+        # model-level pipeline
+        # SORT the input seqs by their arrival times and their seq ids
+        inp_seq_ids = self.model.get_inp_seq_ids()
+        # consider the extra cost in arrive times
+        arrive_times = np.asarray(arrive_times) - self.extra_cost
+        to_sort = list(zip(arrive_times, inp_seq_ids))
+        # print(f"arrive_times: {arrive_times}")
+        # print(f"inp_lens: {inp_lens}")
+        # print(f"out_lens: {out_lens}")
+        # print(f"inp_seq_ids: {inp_seq_ids}")
+        # print(f"to_sort: {to_sort}")
+        order = sorted(range(len(to_sort)), key=lambda i: to_sort[i])
+        inp_lens = np.asarray(inp_lens)[order]
+        out_lens = np.asarray(out_lens)[order]
+        inp_seq_ids = np.asarray(inp_seq_ids)[order]
+        arrive_times = arrive_times[order]
+        self.inp_arrive_times = to_sort
+
+        for dp_id in range(self.dp_size):
+            # divide the requests into dp_size groups evenly
+            self.dp_inp_lens_list[dp_id] = inp_lens[dp_id::self.dp_size]
+            self.dp_out_lens_list[dp_id] = out_lens[dp_id::self.dp_size]
+            self.dp_inp_seq_ids_list[dp_id] = inp_seq_ids[dp_id::self.dp_size]
+
+        return inp_lens, out_lens, inp_seq_ids, arrive_times
+
+
+
+
+
+
     # data parallel + model-level pipeline
     """
         Basic idea: 
@@ -441,27 +747,29 @@ class MyExecPlan:
 
         # print(f"in estimate_exec_time: {str(self)}")
 
-        inp_lens, out_lens = self.model.get_inp_out_seqlens()
+        # inp_lens, out_lens = self.model.get_inp_out_seqlens()
         
-        # model-level pipeline
-        # SORT the input seqs by their arrival times and their seq ids
-        inp_seq_ids = self.model.get_inp_seq_ids()
-        # consider the extra cost in arrive times
-        arrive_times = np.asarray(arrive_times) - self.extra_cost
-        to_sort = list(zip(arrive_times, inp_seq_ids))
-        order = sorted(range(len(to_sort)), key=lambda i: to_sort[i])
-        inp_lens = np.asarray(inp_lens)[order]
-        out_lens = np.asarray(out_lens)[order]
-        inp_seq_ids = np.asarray(inp_seq_ids)[order]
-        arrive_times = arrive_times[order]
-        self.inp_arrive_times = to_sort
+        # # model-level pipeline
+        # # SORT the input seqs by their arrival times and their seq ids
+        # inp_seq_ids = self.model.get_inp_seq_ids()
+        # # consider the extra cost in arrive times
+        # arrive_times = np.asarray(arrive_times) - self.extra_cost
+        # to_sort = list(zip(arrive_times, inp_seq_ids))
+        # order = sorted(range(len(to_sort)), key=lambda i: to_sort[i])
+        # inp_lens = np.asarray(inp_lens)[order]
+        # out_lens = np.asarray(out_lens)[order]
+        # inp_seq_ids = np.asarray(inp_seq_ids)[order]
+        # arrive_times = arrive_times[order]
+        # self.inp_arrive_times = to_sort
 
-        for dp_id in range(self.dp_size):
-            # divide the requests into dp_size groups evenly
-            self.dp_inp_lens_list[dp_id] = inp_lens[dp_id::self.dp_size]
-            self.dp_out_lens_list[dp_id] = out_lens[dp_id::self.dp_size]
-            self.dp_inp_seq_ids_list[dp_id] = inp_seq_ids[dp_id::self.dp_size]
+        # for dp_id in range(self.dp_size):
+        #     # divide the requests into dp_size groups evenly
+        #     self.dp_inp_lens_list[dp_id] = inp_lens[dp_id::self.dp_size]
+        #     self.dp_out_lens_list[dp_id] = out_lens[dp_id::self.dp_size]
+        #     self.dp_inp_seq_ids_list[dp_id] = inp_seq_ids[dp_id::self.dp_size]
         
+
+        inp_lens, out_lens, inp_seq_ids, arrive_times = self._sort_and_partition_data_parallel(arrive_times)
 
         # print(f"inp lens: {inp_lens}")
         # print(f"out lens: {out_lens}")
@@ -471,12 +779,23 @@ class MyExecPlan:
         # key = (self.model.model_name, self.get_key(), self.model.get_inp_out_seqlens(), tuple(arrive_times))
         # NOTE: input ``arrive_times`` may not be sorted, so we sort it
         key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+        # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
+        # print(f"_FAKE_SCHEDULING_RES keys: {_FAKE_SCHEDULING_RES.keys()}")
+        # for k in _FAKE_SCHEDULING_RES.keys():
+        #     print(k)
+
         if key in _FAKE_SCHEDULING_RES:
+
+            print(f"REUSE EXISTING FAKE SCHEDULING RESULTS!\n")
+
             (self.cumsum_latencys_list, self.cum_rng_nums_list, self.rng_starts_list, self.rng_ends_list,
                 self.is_prefill_steps_list, self.finish_times_list) = _FAKE_SCHEDULING_RES[key]
             
             self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
                                        for cumsum_latencys in self.cumsum_latencys_list]
+
+
+            print(f"total_latency_list: {self.total_latency_list}, self.extra_cost: {self.extra_cost}")
 
             # # print(f"self.cumsum_latencys: {self.cumsum_latencys}")
             # print(f"from cache, key={key}")
@@ -494,6 +813,9 @@ class MyExecPlan:
 
             return self.total_latency_list
         else:
+
+            print(f"DO FAKE SCHEDULING SEARCH!\n")
+
             # TODO: 这个地方的assert可能不对，因为我们可能是把request按照arrive时间排序的。相同arrive时间可以按照长度排序，
             # 但是这个排序很奇怪，因为model-level pipeline的情况，可能不会保证时刻都排好序。先不管这个？不管request的排序了。
             # 在写入output request的时候不排序，但是在读取input request的时候要排序？在读取input request的排序也不方便啊，
@@ -617,7 +939,7 @@ class MyExecPlan:
                 extra_cost: the time to prepare (e.g., load) the model before running.
         '''
 
-        # print(f"exec_plan: {str(self)}")
+        print(f"exec_plan: {str(self)}")
         # print(f"arrive_times: {arrive_times}")
 
         if self.total_latency_list[0] == None:
@@ -641,8 +963,9 @@ class MyExecPlan:
                 i.e., no model-level pipeline is considered here.
         """
         if self.total_latency_list[0] == None:
+            arrive_times = [-1]*len(self.model.get_inp_seq_ids())
             self.estimate_exec_time(cost_table, 
-                check_gap=1, sort_input=sort_input, arrive_times=list())
+                check_gap=1, sort_input=sort_input, arrive_times=arrive_times)
 
         return max(self.total_latency_list)
 
@@ -753,9 +1076,20 @@ class MyExecPlan:
             # NOTE: due to the precision issue, sometimes stop_time > self.cumsum_latencys[-1], but it is impossible
             stop_time = min(cumsum_latencys[-1], stage_stop_time)
 
+            # print(f"in update_inp_out_seqlens_and_throughput_after_an_infer_stage\n")
+
             # 0. check whether we have run this function for the corresponding stop iter.
             stop_iter_i = np.searchsorted(cumsum_latencys, stop_time, side='left')
+
+            # print(f"stop_time: {stop_time}, stop_iter_i: {stop_iter_i}, len(cumsum_latencys): {len(cumsum_latencys)}")
+            # print(f"cumsum_latencys: {cumsum_latencys}")
+            # print(f"cum_rng_nums: {cum_rng_nums}")
+            # print(f"rng_starts: {rng_starts}")
+            # print(f"rng_ends: {rng_ends}")
+
             if stop_iter_i in cache_stop_time_info:
+
+                print(f"reuse stop iter i information\n")
 
                 # print(f"stop_iter_i: {stop_iter_i}, stop time info: {self.cache_stop_time_info[stop_iter_i]}")
 
@@ -783,6 +1117,8 @@ class MyExecPlan:
             finished_lens = fake_scheduling.get_info_at_stop_time(
                 cumsum_latencys, cum_rng_nums, rng_starts, rng_ends, 
                 stop_time, stop_iter_i)
+
+            # print(f"finished_lens: {finished_lens}")
             # finished_lens, remaining_lens = fake_scheduling.get_info_at_stop_time(
             #     self.decode_latencys, self.prefill_latencys, 
             #     self.is_prefill_steps, self.infer_progress, 
@@ -836,6 +1172,8 @@ class MyExecPlan:
             # # return (tuple(inp_lens[valid_indices]), tuple(remaining_lens[valid_indices])), valid_throughput
 
 
+        # print(f"new_inp_out_lens_list: {new_inp_out_lens_list}")
+
         return (new_inp_out_lens_list, valid_throughput_list), stop_iter_i_list
 
 
@@ -869,6 +1207,28 @@ class MyExecPlan:
         
         new_key = (self.model.model_name, self.get_key(), (tuple(new_inp_lens), tuple(new_out_lens)))
         _FAKE_SCHEDULING_RES[new_key] = cumsum_latencys, cum_rng_nums, rng_starts, rng_ends, is_prefill_steps
+
+
+
+
+
+
+    def _sort_scheduling_results_by_seq_ids(
+            self,
+            alive_seq_ids,
+            cum_rng_nums, rng_starts, rng_ends, finish_times_of_alive_seqs):
+        order = np.argsort(alive_seq_ids)
+        new_rng_starts = np.empty_like(rng_starts)
+        new_rng_ends = np.empty_like(rng_ends)
+        rng_nums = np.diff(cum_rng_nums)[order]
+        new_cum_rng_nums = np.cumsum(np.concatenate(([0], rng_nums)))
+        for i, ori_ind in enumerate(order):
+            new_rng_starts[new_cum_rng_nums[i]:new_cum_rng_nums[i+1]] = \
+                rng_starts[cum_rng_nums[ori_ind]:cum_rng_nums[ori_ind+1]]
+            new_rng_ends[new_cum_rng_nums[i]:new_cum_rng_nums[i+1]] = \
+                rng_ends[cum_rng_nums[ori_ind]:cum_rng_nums[ori_ind+1]]
+        new_finish_times_of_alive_seqs = finish_times_of_alive_seqs[order]
+        return new_cum_rng_nums, new_rng_starts, new_rng_ends, new_finish_times_of_alive_seqs
 
 
 
@@ -935,14 +1295,23 @@ class MyExecPlan:
                         trust_remote_code=self.model.trust_remote_code, revision=self.model.revision
                         )
             
+
+            # we may need to reorder the scheduling results if the remaining seqs are not in the order of their seq ids
+            cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs = \
+                self._sort_scheduling_results_by_seq_ids(
+                    self.dp_inp_seq_ids_list[dp_id][alive_old_indices],
+                    cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs)
+
+
             # dp_seq_ids = self.dp_seq_ids_list[dp_id]
             # finish_times_merged[dp_seq_ids[alive_old_indices]] = finish_times_of_alive_seqs
             finish_times_list[dp_id] = finish_times_of_alive_seqs
-            assert (new_inp_out_lens_list[dp_id][2] == alive_old_indices).all()
+            assert (new_inp_out_lens_list[dp_id][2] == alive_old_indices).all(), print(new_inp_out_lens_list[dp_id][2], alive_old_indices)
 
 
         new_key = (self.model.model_name, self.get_key(), (tuple(new_inp_lens_merged), tuple(new_out_lens_merged)), \
-                   tuple())
+                   tuple([-1 - self.extra_cost]*len(new_inp_lens_merged)))
+        # print(f"update fake scheduling: new_key: {new_key}")
         _FAKE_SCHEDULING_RES[new_key] = \
             cumsum_latencys_list, cum_rng_nums_list, rng_starts_list, rng_ends_list, is_prefill_steps_list, \
             finish_times_list
@@ -972,6 +1341,893 @@ class MyExecPlan:
 
 
 
+
+
+
+
+class MyVerticalFusedExecPlan(MyExecPlan):
+    """ 
+        My execution plan definition. There may be multiple models fused vertically in this plan. 
+        NOTE: we assume the original complete inp seq ids for each model is range(ori_tot_req_num)!
+        有需要的时候再改吧。
+    """
+    def __init__(
+        self,
+        # model_list: List[MyModelInfor], 
+        fused_model: MyFusedModelInfor,
+        # fused_exec_plans: List[MyExecPlan],
+        shared_exec_plan: MyExecPlan,
+        # 
+    ) -> None:
+        self.model:MyFusedModelInfor = fused_model
+        self.model_list: List[MyModelInfor] = fused_model.model_list
+        # self.fused_exec_plans: List[MyExecPlan] = fused_exec_plans      
+
+        exec_plan_0 = shared_exec_plan
+        self.num_worker = exec_plan_0.num_worker
+        self.wld_degree = exec_plan_0.wld_degree
+        self.cache_gpu_num = exec_plan_0.cache_gpu_num
+        self.mem_per_comp_gpu = exec_plan_0.mem_per_comp_gpu
+        self.dp_size = exec_plan_0.dp_size
+        self.param_byte_per_comp_gpu = exec_plan_0.param_byte_per_comp_gpu
+        self.param_byte_per_cache_gpu = exec_plan_0.param_byte_per_cache_gpu
+        self.gpu_cache_byte_per_block = exec_plan_0.gpu_cache_byte_per_block
+
+        # infer_args: the settings of the inference process
+        self.infer_args: InferenceArgs = exec_plan_0.infer_args
+        # the total gpu memory available, e.g., 80GB for A100-80GB
+        self.tot_gpu_mem_byte: int = exec_plan_0.tot_gpu_mem_byte
+        # basic mem consumption includes the intermediate variables
+        self.basic_mem_consumption: int = exec_plan_0.basic_mem_consumption
+        self.gpu_cache_block_num = exec_plan_0.gpu_cache_block_num
+        # self.set_gpu_cache_block_num()
+
+
+        # store some fake scheduling data
+        # this parameters are supposed to be set only once
+        # store the fake scheduling data for each dp worker
+        self.cumsum_latencys_list: List[List[float]] = [list() for _ in range(self.dp_size)]
+        self.cum_rng_nums_list_for_models: List[List[int]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        self.rng_starts_list_for_models: List[List[int]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        self.rng_ends_list_for_models: List[List[int]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        self.is_prefill_steps_list: List[List[bool]] = [list() for _ in range(self.dp_size)]
+
+        self.total_latency_list: List[Optional[float]] = [None for _ in range(self.dp_size)]
+
+        self.cache_stop_time_info_list: List[Dict[int, Tuple[Tuple[List[int], List[int]], float]]] \
+            = [dict() for _ in range(self.dp_size)]
+        
+        # NOTE: we have one dp_inp_lens_list for each model in the mode_list
+        self.dp_inp_lens_list_for_models: List[List[List[int]]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        self.dp_out_lens_list_for_models: List[List[List[int]]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        # self.dp_inp_lens_list: List[List[int]] = [list() for _ in range(self.dp_size)]
+        # self.dp_out_lens_list: List[List[int]] = [list() for _ in range(self.dp_size)]
+
+        # model-level pipeline 
+        # ``finish_times_merged`` stores the finish time of each input in the order of input id (i.e., sequence id)
+        # len(self.finish_times_merged) == the model's ori total inp number
+        self.finish_times_merged_for_models: List[List[float]] = [list() for _ in self.model_list]
+        self.finish_times_list_for_models: List[List[List[float]]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        # # NOTE: ``ref_dp_inp_seq_ids_list`` is the inp seq ids sorted by arrive times in the reused fake scheduling result
+        # self.ref_dp_inp_seq_ids_list: List[int] = list() 
+        # self.inp_arrive_times does not consider extra_cost
+        self.inp_arrive_times_for_models: List[List[Tuple[float, int]]] = [list() for _ in self.model_list] # [(arrive_time, seq_id)]
+        self.extra_cost: float = 0.0
+        # store the inp seq ids corresponding to dp_inp_lens_list (i.e., sorted by arrive times and seq ids)
+        self.dp_inp_seq_ids_list_for_models: List[List[List[int]]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        self.dp_arrive_times_list_for_models: List[List[List[float]]] = \
+            [[list() for model in self.model_list] for _ in range(self.dp_size)]
+
+
+        # valid_throughput and tep_remainin_lens depend on the plan group, instead of individual exec_plans.
+        # self.valid_throughput: float = 0
+        # self.tmp_remaining_lens
+
+
+    def copy_the_plan(self):
+        shared_exec_plan = MyExecPlan(
+            self.model, 
+            self.num_worker, 
+            self.wld_degree, 
+            self.cache_gpu_num, 
+            self.mem_per_comp_gpu, # gpu utilization ratio
+            self.dp_size, # data parallelism degree: num of dp workers
+            self.param_byte_per_comp_gpu, 
+            self.param_byte_per_cache_gpu,
+            self.gpu_cache_byte_per_block,
+            self.infer_args,
+            self.tot_gpu_mem_byte,
+        )
+        return MyVerticalFusedExecPlan(self.model, shared_exec_plan)
+
+
+
+
+    def get_base_model_ids(self):
+        return self.model.get_base_model_ids()
+
+    # def get_exec_plans(self):
+    #     return self.fused_exec_plans
+    
+    def get_base_models(self):
+        return self.model_list
+    
+    def models_not_started(self):
+        # return False not in [model.not_started() for model in self.model_list]
+        return self.model.not_started()
+        
+    def get_dp_inp_lens_list_for_models(self):
+        return self.dp_inp_lens_list_for_models
+
+    def get_finish_times_merged_limited_version(self, seq_ids: List[int]):
+        """
+            NOTE: this version only support fused model 是严格线性依赖关系，在fused model之外的model只会依赖于fused model的最后一个base model
+            的output。
+        """
+
+        if len(self.finish_times_merged_for_models[-1]) == 0:
+            self.finish_times_merged_for_models[-1] = np.asarray([-1-self.extra_cost]*self.model_list[-1].ori_tot_inp_num) 
+            
+            for dp_inp_seq_ids_for_models, finish_times_for_models in \
+                zip(self.dp_inp_seq_ids_list_for_models, self.finish_times_list_for_models):
+                inds = np.searchsorted(self.model_list[-1].ori_inp_seq_ids, dp_inp_seq_ids_for_models[-1])
+                self.finish_times_merged_for_models[-1][inds] = finish_times_for_models[-1]
+        
+        inds = np.searchsorted(self.model_list[-1].ori_inp_seq_ids, seq_ids)
+        return self.finish_times_merged_for_models[-1][inds]
+
+
+
+
+    def get_finish_times_merged(self, seq_ids: List[int], model_ind: int):
+        """
+            Input: 
+                model_ind: we want to get the seq finish times of the ``model_ind``-th base model of the fused model 
+        """
+
+        if len(self.finish_times_merged_for_models[model_ind]) == 0:
+            self.finish_times_merged_for_models[model_ind] = np.asarray([-1-self.extra_cost]*self.model_list[model_ind].ori_tot_inp_num) 
+            
+            for dp_inp_seq_ids_for_models, finish_times_for_models in \
+                zip(self.dp_inp_seq_ids_list_for_models, self.finish_times_list_for_models):
+                inds = np.searchsorted(self.model_list[model_ind].ori_inp_seq_ids, dp_inp_seq_ids_for_models[model_ind])
+                self.finish_times_merged_for_models[model_ind][inds] = finish_times_for_models[model_ind]
+
+        # we need to consider the case where the inp seq id is not the output of the model
+        # for example: a model after the chain summary, it depends on different model stages in the summary chain
+        #           the total inp seq ids will be the full set of inp seq ids, but they are outputs of different model stages
+
+        # print(f"in get_finish_times_merged: self.finish_times_merged_for_models: {self.finish_times_merged_for_models}")
+
+
+        return get_infor_given_seq_ids(
+            values=self.finish_times_merged_for_models[model_ind], 
+            seq_ids_we_have=self.model_list[model_ind].ori_inp_seq_ids, 
+            seq_ids_requested=seq_ids, 
+            default_value=-1-self.extra_cost)
+
+
+        inds = np.searchsorted(self.model_list[model_ind].ori_inp_seq_ids, seq_ids)
+        return self.finish_times_merged_for_models[model_ind][inds]
+
+
+
+
+    def merge_new_inp_out_lens_of_data_parallel_workers(
+            self, new_inp_out_lens_list_for_models: List[List[List[List[int]]]]
+        )->List[List[int]]:
+        """
+            Support vertical fusion of models.
+        """
+        # print(f"in merge_new_inp_out_lens_of_data_parallel_workers")
+        # print(new_inp_out_lens_list)
+        # print(self.dp_inp_seq_ids_list)
+
+        print(f"{str(self)}")
+        
+        # data_num = 3: there are 3 kinds of data: inp_lens, out_lens, valid_indices
+        data_num = len(new_inp_out_lens_list_for_models[0])
+        new_inp_lens_for_models = list()
+        new_out_lens_for_models = list()
+        new_inp_seq_ids_for_models = list()
+        for i in range(len(self.model_list)):
+            new_inp_out_lens_list = [[dp_data[data_i][i] for data_i in range(data_num)] for dp_data in new_inp_out_lens_list_for_models]
+            dp_inp_seq_ids_list = [dp_data[i] for dp_data in self.dp_inp_seq_ids_list_for_models]
+
+            # print(f"new_inp_out_lens_list:{new_inp_out_lens_list}")
+            # print(f"dp_inp_seq_ids_list:{dp_inp_seq_ids_list}")
+
+            inp_lens_list = [dp_inp_out_lens[0] for dp_inp_out_lens in new_inp_out_lens_list]
+            out_lens_list = [dp_inp_out_lens[1] for dp_inp_out_lens in new_inp_out_lens_list]
+            inp_seq_ids_list = [dp_inp_seq_ids[dp_inp_out_lens[2]] \
+                                for dp_inp_seq_ids, dp_inp_out_lens \
+                                    in zip(dp_inp_seq_ids_list, new_inp_out_lens_list)]
+            inp_lens = np.concatenate(inp_lens_list)
+            out_lens = np.concatenate(out_lens_list)
+            inp_seq_ids = np.concatenate(inp_seq_ids_list)
+            # order = np.argsort(-inp_lens)
+            # sort by inp seqs ids
+            # print(f"inp_lens: {inp_lens}")
+            # print(f"out_lens: {out_lens}")
+            # print(f"inp_seq_ids: {inp_seq_ids}")
+
+            order = np.argsort(inp_seq_ids)
+
+            # print(f"order: {order}")
+
+            inp_lens = inp_lens[order]
+            out_lens = out_lens[order]
+            inp_seq_ids = inp_seq_ids[order]
+            new_inp_lens_for_models.append(inp_lens)
+            new_out_lens_for_models.append(out_lens)
+            new_inp_seq_ids_for_models.append(inp_seq_ids)            
+        return [new_inp_lens_for_models, new_out_lens_for_models, new_inp_seq_ids_for_models]
+
+
+
+    def set_gpu_cache_block_num(self):
+        '''
+            gpu cache block num = (available gpu mem - parameter mem) // mem per block
+        '''
+
+        """
+            We will not call this method directly on a fused exec plan object.
+        """
+        assert False
+
+
+
+
+    # def set_extra_cost(self, extra_cost: float):
+    #     """
+    #         We will not call this method directly on a fused exec plan object.
+    #         We use the same method as in MyExecPlan.
+    #     """
+    #     assert False
+
+    
+
+    def _sort_and_partition_data_parallel(
+            self, 
+            arrive_times_list: List[List[float]],
+            ):
+        """
+            Update:
+                self.dp_inp_seq_ids_list_for_models, 
+                self.dp_inp_lens_list_for_models,
+                self.dp_out_lens_list_for_models,
+                self.dp_arrive_times_list_for_models
+        """
+
+        def _sort_and_assign(seq_infos, model_i: int, dp_size: int):
+            """
+                sort the seqs and assign them to the dp workers.
+            """
+            inp_lens = [i[0] for i in seq_infos]
+            out_lens = [i[1] for i in seq_infos]
+            inp_seq_ids = [i[2] for i in seq_infos]
+            arrive_times = [i[3] for i in seq_infos]
+
+            to_sort = list(zip(arrive_times, inp_seq_ids))
+            order = sorted(range(len(to_sort)), key=lambda i: to_sort[i])
+            inp_lens = np.asarray(inp_lens)[order]
+            out_lens = np.asarray(out_lens)[order]
+            inp_seq_ids = np.asarray(inp_seq_ids)[order]
+            arrive_times = np.asarray(arrive_times)[order]
+
+            # print(f"inp_lens: {inp_lens}, dp_size: {dp_size}")
+
+            for dp_id in range(dp_size):
+                # divide the requests into dp_size groups evenly                
+                self.dp_inp_lens_list_for_models[dp_id][model_i].extend(inp_lens[dp_id::dp_size])
+                self.dp_out_lens_list_for_models[dp_id][model_i].extend(out_lens[dp_id::dp_size])
+                self.dp_inp_seq_ids_list_for_models[dp_id][model_i].extend(inp_seq_ids[dp_id::dp_size])
+                self.dp_arrive_times_list_for_models[dp_id][model_i].extend(arrive_times[dp_id::dp_size])
+        
+        def _assign_in_consistent_with_previous_assignment(seq_infos, model_i: int, dp_size: int):
+            """
+                assign seqs to the dp worker which generates the their previous versions.
+            """
+            inp_lens = np.asarray([i[0] for i in seq_infos])
+            out_lens = np.asarray([i[1] for i in seq_infos])
+            inp_seq_ids = np.asarray([i[2] for i in seq_infos])
+            arrive_times = np.asarray([i[3] for i in seq_infos])
+            order = np.argsort(inp_seq_ids)
+            for dp_id in range(dp_size):
+                last_model_seq_ids = self.dp_inp_seq_ids_list_for_models[dp_id][model_i-1]
+                seq_ids_to_add = sorted(set(inp_seq_ids).intersection(last_model_seq_ids))
+                inds = np.searchsorted(inp_seq_ids[order], seq_ids_to_add)
+                self.dp_inp_lens_list_for_models[dp_id][model_i].extend(inp_lens[order][inds])
+                self.dp_out_lens_list_for_models[dp_id][model_i].extend(out_lens[order][inds])
+                self.dp_inp_seq_ids_list_for_models[dp_id][model_i].extend(inp_seq_ids[order][inds])
+                self.dp_arrive_times_list_for_models[dp_id][model_i].extend(arrive_times[order][inds])
+
+
+        def _sort_by_seq_ids(dp_size: int):
+            """
+                Sort the seq info lists by seq ids.
+            """
+            for dp_id in range(dp_size):
+                for model_i in range(len(self.model_list)):
+                    order = np.argsort(self.dp_inp_seq_ids_list_for_models[dp_id][model_i])
+                    self.dp_inp_lens_list_for_models[dp_id][model_i] = \
+                        np.asarray(self.dp_inp_lens_list_for_models[dp_id][model_i])[order]
+                    self.dp_out_lens_list_for_models[dp_id][model_i] = \
+                        np.asarray(self.dp_out_lens_list_for_models[dp_id][model_i])[order]
+                    self.dp_inp_seq_ids_list_for_models[dp_id][model_i] = \
+                        np.asarray(self.dp_inp_seq_ids_list_for_models[dp_id][model_i])[order]
+                    self.dp_arrive_times_list_for_models[dp_id][model_i] = \
+                        np.asarray(self.dp_arrive_times_list_for_models[dp_id][model_i])[order]
+
+
+
+
+        seq_ids_visited = list()
+        # dp_size = self.dp_size       
+
+        for i in range(len(self.model_list)):
+            # 1. get the seq whose inp arrive times are known
+            known = list()
+            unknown = list()
+            model = self.model_list[i]
+            inp_lens, out_lens = model.get_inp_out_seqlens()
+            inp_seq_ids = model.get_inp_seq_ids()
+            for inp_len, out_len, seq_id, arrive_time in zip(inp_lens, out_lens, inp_seq_ids, arrive_times_list[i]):
+                if seq_id not in seq_ids_visited:
+                    unknown.append((inp_len, out_len, seq_id, arrive_time - self.extra_cost))
+                    seq_ids_visited.append(seq_id)
+                else:
+                    known.append((inp_len, out_len, seq_id, arrive_time - self.extra_cost))
+            
+            # print(f"unknown: {unknown}")
+            # print(f"known: {known}")
+
+            # 2. partition the known and unknown among the dp workers
+            # all the seq ids are sorted
+            assert sorted(inp_seq_ids) == list(inp_seq_ids)
+            # for unknown seqs, partition them evenly 
+            _sort_and_assign(unknown, i, self.dp_size)
+            # for known seqs, partition them according to the previous partition solution
+            _assign_in_consistent_with_previous_assignment(known, i, self.dp_size)
+
+
+        # sort the seq infos by seq ids
+        _sort_by_seq_ids(self.dp_size)
+
+
+    def _get_inp_key(
+            self,
+            arrive_times_list: List[List[float]],):
+        """
+            The key contains the inp_lens, out_lens, and the arrive_times.
+        """ 
+        def _to_tuple(vs):
+            return tuple([tuple([tuple(j) for j in i]) for i in vs])
+
+        # directly return the model inp/out lens
+        inp_lens = list()
+        out_lens = list()
+        arrive_times = list()
+        for i in range(len(self.model_list)):
+            model = self.model_list[i]
+            inps, outs = model.get_inp_out_seqlens()
+            inp_lens.append(tuple(inps))
+            out_lens.append(tuple(outs))
+            arrive_times.append(tuple(np.asarray(arrive_times_list[i]) - self.extra_cost))
+        return ((tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+
+        tuple_inp_lens = _to_tuple(self.dp_inp_lens_list_for_models)
+        tuple_out_lens = _to_tuple(self.dp_out_lens_list_for_models)
+        tuple_arrive_times = _to_tuple(self.dp_arrive_times_list_for_models)
+        return ((tuple_inp_lens, tuple_out_lens), tuple_arrive_times)
+
+
+    # data parallel + model-level pipeline
+    """
+        Basic idea: 
+            1. when generating outputs, we sort the output of all dp workers by (finish time, seq id)
+            2. when querying available inputs, whether to sort all the available inputs is controlled by ``sort_input``
+    """
+    def estimate_exec_time(
+            self, cost_table: CostTable,
+            # 
+            check_gap: int,
+            sort_input: bool,
+            # arrive_times: List[float],
+            arrive_times_list: List[List[float]],
+            # extra_cost: float,
+            ):
+        '''
+            Estimate the total inference of this model for the given inp_lens.
+            Input:
+                check_gap: query whether there are newly available requests every ``check_gap`` inference steps.
+                sort_input: whether to sort the waiting requests when we query available requests.
+                arrive_times: the arrive times of all input requests, extra_cost considered.
+                extra_cost: the extra time before running the model, e.g., loading the LLM. [stored as self property]
+            NOTE:
+                1. to support data parallelism + model-level pipeline parallelism, we need limit each dp worker to 
+                    query dp_id-th available request, i.e., we split arrive_times like we do to inp_lens. 
+            NOTE: 
+                2. the output total exec time considers the extra_cost (e.g., loading the LLM)
+                3. the arrive times are in the order of mode.inp_seq_ids. SO we need to SORT them!!!
+        '''
+        # 1. first get the input and output lengths (the out lens are already sampled when initialize the model info obj)
+        # inp_lens = list(self.model.get_remaining_seqlens())
+        # out_lens = output_length_sampler.sample_out_len_for_given_model(
+        #     model=self.model.model_name, inp_lens=inp_lens)
+
+        # print(f"in estimate_exec_time: {str(self)}")
+
+        # 1. first get the input and output lengths
+        # NOTE: for model 0, we divide inputs evenly; for other models, we assign divide the inputs 
+        # according to the dp input assignment for model 0
+
+
+        time1 = time.perf_counter()
+
+        self._sort_and_partition_data_parallel(arrive_times_list)
+       
+        time2 = time.perf_counter()
+        print(f"TIME--_sort_and_partition_data_parallel: {time2 - time1}")
+
+        # print(f"inp lens: {inp_lens}")
+        # print(f"out lens: {out_lens}")
+
+        # 2. do fake scheduling
+        # support model-level pipeline: we add arrive_times to the key
+        # key = (self.model.model_name, self.get_key(), self.model.get_inp_out_seqlens(), tuple(arrive_times))
+        # NOTE: input ``arrive_times`` may not be sorted, so we sort it
+        # key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+        key = (self.model.model_name, self.get_key(), *(self._get_inp_key(arrive_times_list)))
+        # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
+        if key in _FAKE_SCHEDULING_RES:
+
+            print(f"Reuse fake scheduling results")
+
+            (self.cumsum_latencys_list, 
+             self.cum_rng_nums_list_for_models, self.rng_starts_list_for_models, self.rng_ends_list_for_models,
+             self.is_prefill_steps_list, 
+             self.finish_times_list_for_models) = _FAKE_SCHEDULING_RES[key]
+            
+            self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
+                                       for cumsum_latencys in self.cumsum_latencys_list]
+
+            # # print(f"self.cumsum_latencys: {self.cumsum_latencys}")
+            # print(f"from cache, key={key}")
+            # print(f"self.cum_rng_nums: {self.cum_rng_nums.tolist()}")
+            # print(f"self.rng_starts: {self.rng_starts.tolist()}")
+            # print(f"self.rng_ends: {self.rng_ends.tolist()}")
+            # for k in _FAKE_SCHEDULING_RES.keys():
+            #     print(k)
+            # print(f"self.cum_rng_nums_list_for_models: {self.cum_rng_nums_list_for_models}")
+            # print(f"self.rng_starts_list_for_models: {self.rng_starts_list_for_models}")
+            # print(f"self.rng_ends_list_for_models: {self.rng_ends_list_for_models}")
+
+            time3 = time.perf_counter()
+            print(f"TIME--reuse fake scheduling: {time3 - time2}")
+
+
+            return self.total_latency_list
+        else:
+
+            print(f"DO FAKE SCHEDULING SEARCH!\n")
+
+            # TODO: 这个地方的assert可能不对，因为我们可能是把request按照arrive时间排序的。相同arrive时间可以按照长度排序，
+            # 但是这个排序很奇怪，因为model-level pipeline的情况，可能不会保证时刻都排好序。先不管这个？不管request的排序了。
+            # 在写入output request的时候不排序，但是在读取input request的时候要排序？在读取input request的排序也不方便啊，
+            # 要不然就不对来自所依赖的所有dp worker的input request进行统一排序了，感觉OK？理论上不同request的总长度分布是一样的。
+            # 但是其实我们现在的写法会对output整体进行排序：应该改成对整体按照arrive-time进行排序，没有按长度再排序的过程了。
+            # 要不然就把按长度排序这块去掉吧，感觉OK的。<= 因为感觉来自不同dp worker的output长度分布应该是一样的；这样从这些output
+            # 中均匀间隔地获取input，得到的input长度分布也应该是一样的。
+            # 
+            # assert list(inp_lens) == sorted(inp_lens, reverse=True), f"The input lens of model {self.model.model_id} is not sorted!"
+
+
+            for dp_id in range(self.dp_size):
+                # divide the requests into dp_size groups evenly
+                dp_inp_lens_for_models = self.dp_inp_lens_list_for_models[dp_id]
+                dp_out_lens_for_models = self.dp_out_lens_list_for_models[dp_id]            
+                dp_seq_ids_for_models = self.dp_inp_seq_ids_list_for_models[dp_id]
+                dp_arrive_times_for_models = self.dp_arrive_times_list_for_models[dp_id]
+
+
+                time3 = time.perf_counter()
+
+
+                # support model-level pipeline
+                # # NOTE: here we add the extra cost to the finish times --> CHANGE TO NOT ADDing EXTRA COST
+                # exec_plan_0 = self.fused_exec_plans[0]
+                (self.cumsum_latencys_list[dp_id], self.cum_rng_nums_list_for_models[dp_id], 
+                    self.rng_starts_list_for_models[dp_id], self.rng_ends_list_for_models[dp_id], 
+                    self.is_prefill_steps_list[dp_id], 
+                    self.finish_times_list_for_models[dp_id]) = \
+                        fake_scheduling.fake_FCFS_schedule_vertical_fuse(
+                            inp_lens=list(dp_inp_lens_for_models[0]),out_lens=list(dp_out_lens_for_models[0]), 
+                            arrive_times=dp_arrive_times_for_models[0], 
+                            ref_seq_ids=dp_seq_ids_for_models[0],
+                            # 
+                            ref_seq_ids_list=dp_seq_ids_for_models[1:],
+                            inp_lens_list=dp_inp_lens_for_models[1:],
+                            out_lens_list=dp_out_lens_for_models[1:],
+                            arrive_times_list=dp_arrive_times_for_models[1:],
+                            # 
+                            check_gap=check_gap,
+                            max_seq_num=self.infer_args.max_seq_num, max_block_num=self.gpu_cache_block_num, 
+                            max_num_batched_tokens=self.infer_args.max_num_batched_tokens,
+                            block_size=self.infer_args.block_size, 
+                            sort_input=sort_input, 
+                            cost_estimate_args={
+                                "cost_table":cost_table, 
+                                "model_name":self.model.model_path, 
+                                "exec_plan":self.get_key_single_dp_worker(), 
+                                "sample_config":self.model.sample_config, 
+                                "trust_remote_code":self.model.trust_remote_code, 
+                                "revision":self.model.revision}
+                            )
+
+                # NOTE: since there is a precision issue, we use self.cumsum_latencys[-1] as tot_latency
+                if len(self.cumsum_latencys_list[dp_id]) == 0:
+                    self.total_latency_list[dp_id] = 0
+                else:
+                    self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+
+                time4 = time.perf_counter()
+                print(f"TIME--fake scheduling vertical: {time4 - time3}")
+
+            
+            # self.infer_progress = infer_progress
+            # store the metadata in the global cache
+            _FAKE_SCHEDULING_RES[key] = (self.cumsum_latencys_list, self.cum_rng_nums_list_for_models, 
+                                         self.rng_starts_list_for_models, self.rng_ends_list_for_models, 
+                                         self.is_prefill_steps_list, self.finish_times_list_for_models,) 
+                                        #  self.dp_inp_seq_ids_list)
+
+            # # print(f"self.cumsum_latencys: {self.cumsum_latencys}")
+            # print(f"compute from sketch, key={key}")
+            # print(f"self.cum_rng_nums: {self.cum_rng_nums.tolist()}")
+            # print(f"self.rng_starts: {self.rng_starts.tolist()}")
+            # print(f"self.rng_ends: {self.rng_ends.tolist()}")       
+
+
+            time5 = time.perf_counter()  
+            print(f"TIME--estimate time cost: {time5 - time1}")
+
+
+            return self.total_latency_list
+
+
+
+    # data parallel + model-level pipeline
+    # change name from get_total_latency to get_min_dp_latency --> get_max_dp_latency_considering_plan_group
+    def get_max_dp_latency_considering_plan_group(self, cost_table: CostTable,
+            check_gap: int, sort_input: bool, arrive_times_list: List[List[float]]):
+        '''
+            Input:
+                extra_cost: the time to prepare (e.g., load) the model before running.
+        '''
+
+        print(f"exec_plan: {str(self)}")
+        # print(f"arrive_times: {arrive_times_list}")
+        
+
+        if self.total_latency_list[0] == None:
+            self.estimate_exec_time(cost_table, 
+                check_gap=check_gap, sort_input=sort_input, arrive_times_list=arrive_times_list)
+
+        print(f"exec plan latency list: {str(self), self.total_latency_list}")
+        
+        # print(f"finish times list: {self.finish_times_list}")
+
+        return max(self.total_latency_list) + self.extra_cost
+
+
+    # data parallel
+    def get_max_dp_latency(self, cost_table: CostTable, sort_input: bool):
+        """
+            This function is only used in the baseline where we select the best exec plan for each LLM independently.
+            NOTE: 
+                1. as we select the best exec plan for each LLM independently, 
+                we assume all input requests are available.
+                i.e., no model-level pipeline is considered here.
+        """
+        if self.total_latency_list[0] == None:
+            arrive_times_list = [[-1]*len(model.get_inp_seq_ids()) for model in self.model_list]
+            self.estimate_exec_time(cost_table, 
+                check_gap=1, sort_input=sort_input, arrive_times_list=arrive_times_list)
+
+        return max(self.total_latency_list)
+
+
+
+    # data parallel
+    # return the results for each data parallel worker seperately
+    def update_inp_out_seqlens_and_throughput_after_an_infer_stage(
+            self, stop_time: float, cost_table: CostTable):
+        '''
+            1. compute valid throughput.
+            2. Update the remaining seqlens after it finishes the current infer stage (until stop_time).
+        '''
+        new_inp_out_lens_list_for_models, valid_throughput_list, stop_iter_i_list = list(), list(), list()
+        stage_stop_time = stop_time
+
+        for dp_id in range(self.dp_size):
+            cumsum_latencys = self.cumsum_latencys_list[dp_id]
+            cache_stop_time_info = self.cache_stop_time_info_list[dp_id]
+            cum_rng_nums_for_models = self.cum_rng_nums_list_for_models[dp_id]
+            rng_starts_for_models = self.rng_starts_list_for_models[dp_id]
+            rng_ends_for_models = self.rng_ends_list_for_models[dp_id]
+
+            if len(cumsum_latencys) == 0:
+                new_inp_out_lens_list_for_models.append(
+                    (tuple(np.asarray([[] for _ in range(len(self.model_list))])), 
+                     tuple(np.asarray([[] for _ in range(len(self.model_list))])), 
+                     np.asarray([[] for _ in range(len(self.model_list))], dtype=np.int64)))
+                valid_throughput_list.append(0)
+                stop_iter_i_list.append(0)
+                continue
+
+            # print(f"in update_inp_out_seqlens_and_throughput_after_an_infer_stage: {str(self)}")
+            # NOTE: due to the precision issue, sometimes stop_time > self.cumsum_latencys[-1], but it is impossible
+            stop_time = min(cumsum_latencys[-1], stage_stop_time)
+
+            # 0. check whether we have run this function for the corresponding stop iter.
+            stop_iter_i = np.searchsorted(cumsum_latencys, stop_time, side='left')
+            if stop_iter_i in cache_stop_time_info:
+
+                # print(f"stop_iter_i: {stop_iter_i}, stop time info: {self.cache_stop_time_info[stop_iter_i]}")
+
+                new_inp_out_lens_for_models, valid_throughput = cache_stop_time_info[stop_iter_i]
+                
+                # print(f"stop_iter_i: {stop_iter_i}, len(cumsum_latencys): {len(cumsum_latencys)}")
+                # print(f"new_inp_out_lens: {new_inp_out_lens}")
+
+                new_inp_out_lens_list_for_models.append(new_inp_out_lens_for_models)
+                valid_throughput_list.append(valid_throughput)
+                stop_iter_i_list.append(stop_iter_i)
+                continue
+
+                # return cache_stop_time_info[stop_iter_i], stop_iter_i
+
+            actual_stop_time = cumsum_latencys[stop_iter_i]
+
+            # print(self.model.model_name, f"stop_iter_i:{stop_iter_i}")
+            # print(self.model.model_name, f"rng_starts:{self.rng_starts}")
+            # print(self.model.model_name, f"rng_ends:{self.rng_ends}")
+            # print(self.model.model_name, f"cum_rng_nums:{self.cum_rng_nums}")
+
+
+            # print(f"cum_rng_nums_for_models: {cum_rng_nums_for_models}")
+            # print(f"rng_starts_for_models: {rng_starts_for_models}")
+            # print(f"rng_ends_for_models: {rng_ends_for_models}")
+
+            # 1. compute the seq infer progress after the infer stage
+
+            # first flatten all metadata
+            # indptr = np.cumsum([0]+[len(cum_rng_nums) for cum_rng_nums in cum_rng_nums_for_models])
+
+            finished_lens = np.concatenate([fake_scheduling.get_info_at_stop_time(
+                cumsum_latencys, cum_rng_nums, rng_starts, rng_ends, 
+                stop_time, stop_iter_i) for cum_rng_nums, rng_starts, rng_ends \
+                    in zip(cum_rng_nums_for_models, rng_starts_for_models, rng_ends_for_models)])
+
+            # finished_lens, remaining_lens = fake_scheduling.get_info_at_stop_time(
+            #     self.decode_latencys, self.prefill_latencys, 
+            #     self.is_prefill_steps, self.infer_progress, 
+            #     stop_time)
+
+
+            # print(f"in  update_inp_out_seqlens_and_throughput_after_an_infer_stage----")
+            # print(f"stop_iter_i: {stop_iter_i}")
+            # print(f"self.cum_rng_nums: {self.cum_rng_nums.tolist()}")
+            # print(f"self.rng_starts: {self.rng_starts.tolist()}")
+            # print(f"self.rng_ends: {self.rng_ends.tolist()}")
+            print(str(self), f"finished_lens: len: {len(finished_lens)}: {finished_lens}")
+
+
+            # 2. compute the valid throughput in the current infer stage
+            # inp_lens, out_lens = self.model.get_inp_out_seqlens()
+            # dp_inp_lens = self.dp_inp_lens_list[dp_id]
+            # dp_out_lens = self.dp_out_lens_list[dp_id]
+
+            dp_inp_lens_flattened = np.concatenate( self.dp_inp_lens_list_for_models[dp_id] )
+            dp_out_lens_flattened = np.concatenate( self.dp_out_lens_list_for_models[dp_id] )
+
+            # print(str(self), f"dp_inp_lens_flattened: len: {len(dp_inp_lens_flattened)}: {dp_inp_lens_flattened}")
+
+            # print(self.model.model_name, f"old inp_lens:{inp_lens}, old remaining_lens:{out_lens}")
+            print(self)
+
+            # exec_plan_0 = self.fused_exec_plans[0]
+            valid_throughput = fake_scheduling.comp_valid_throughput_at_stop_time(
+                dp_inp_lens_flattened,
+                finished_lens, actual_stop_time, cost_table,
+                self.model.model_path, self.model.trust_remote_code, self.model.revision)
+
+            # 3. update the remaining_seqlens
+            dp_inp_lens_flattened = np.asarray(dp_inp_lens_flattened) + np.asarray(finished_lens)
+            remaining_lens = np.asarray(dp_out_lens_flattened) - np.asarray(finished_lens)
+            valid_indices = (remaining_lens>0)
+
+            indptr = np.cumsum([0]+[len(_) for _ in self.dp_inp_lens_list_for_models[dp_id]])
+            # convert flattened metadata back
+            dp_inp_lens_for_models = [dp_inp_lens_flattened[indptr[i]:indptr[i+1]] for i in range(len(self.model_list))]
+            remaining_lens_for_models = [remaining_lens[indptr[i]:indptr[i+1]] for i in range(len(self.model_list))]
+            valid_indices_for_models = [valid_indices[indptr[i]:indptr[i+1]] for i in range(len(self.model_list))]
+
+            # delete finished reqs
+            dp_inp_lens_for_models = [tuple(vs[inds]) for vs, inds in zip(dp_inp_lens_for_models, valid_indices_for_models)]
+            remaining_lens_for_models = [tuple(vs[inds]) for vs, inds in zip(remaining_lens_for_models, valid_indices_for_models)]
+
+            # print(self.model.model_name, f"new inp_lens:{inp_lens[valid_indices]}, new remaining_lens:{remaining_lens[valid_indices]}")
+            # print(f"valid_indices_for_models: {valid_indices_for_models}")
+
+            # NOTE: we store the valid_indices as well
+            cache_stop_time_info[stop_iter_i] = \
+                [(tuple(dp_inp_lens_for_models), tuple(remaining_lens_for_models), valid_indices_for_models), \
+                 valid_throughput]
+
+            new_inp_out_lens_list_for_models.append(cache_stop_time_info[stop_iter_i][0])
+            valid_throughput_list.append(valid_throughput)
+            stop_iter_i_list.append(stop_iter_i)
+
+            # print(f"stop_iter_i: {stop_iter_i}, stop time info: {self.cache_stop_time_info[stop_iter_i]}")
+            
+            # print(f"stop_iter_i: {stop_iter_i}, len(cumsum_latencys): {len(cumsum_latencys)}")
+            # print(f"new_inp_out_lens: {cache_stop_time_info[stop_iter_i][0]}")
+            
+            # return self.cache_stop_time_info[stop_iter_i], stop_iter_i
+            # # return (tuple(inp_lens[valid_indices]), tuple(remaining_lens[valid_indices])), valid_throughput
+
+
+        return (new_inp_out_lens_list_for_models, valid_throughput_list), stop_iter_i_list
+
+
+
+
+
+
+    # data parallel + model-level pipeline
+    def update_fake_schedule_output_after_an_infer_stage(
+            self, 
+            old_inp_lens_list: List[List[int]], 
+            new_inp_out_lens_list: List[List[List[int]]], 
+            new_inp_lens_merged: List[int],
+            new_out_lens_merged: List[int],
+            new_inp_seq_ids_merged: List[int],
+            stop_iter_i_list: List[int], 
+            cost_table: CostTable, 
+            ):
+        '''
+            This function is called when the exec plan is selected to run for an infer stage.
+            Update:
+                _FAKE_SCHEDULING_RES[model_name, exec_plan, new_inp_lens, new_out_lens]
+            NOTE:
+                we only call this function when after an infer stage, all the requests are available.
+            NOTE: 
+                1. ``new_inp_lens_merged`` is already sorted by seq ids.
+                2. we only do update when there are unfinished requests.
+        '''
+        def to_tuple(vs):
+            return tuple([tuple(_) for _ in vs])
+
+        # print(f"in update_fake_schedule_output_after_an_infer_stage")
+        # print(f"in / out seqlens: {self.model.get_inp_out_seqlens()}")
+
+        # check whether all the input requests are available after this stage is finished
+        # in the case where models are fused vertically, all the input requests are available only if 
+        # all the models but the last one has finished and the last one's other inputs are available
+        if sum([len(model.get_inp_seq_ids()) for model in self.model_list[:-1]]) == 0:
+            # all the models but the last one has finished
+            last_inp_available_time = max(\
+                [max(self.dp_arrive_times_list_for_models[dp_id][-1]) \
+                 for dp_id in range(self.dp_size)])
+            stop_time = max([cumsum_latencys[stop_iter_i] if len(cumsum_latencys) > 0 else 0 \
+                             for cumsum_latencys, stop_iter_i in \
+                                zip(self.cumsum_latencys_list, stop_iter_i_list)])
+            if last_inp_available_time > stop_time:
+                # there are input not available after this stage finishes
+                return
+        else:
+            # there are models except the last one not finished
+            return
+
+
+        cumsum_latencys_list = [list() for _ in range(self.dp_size)]
+        cum_rng_nums_list_for_models = [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        rng_starts_list_for_models = [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        rng_ends_list_for_models = [[list() for model in self.model_list] for _ in range(self.dp_size)]
+        is_prefill_steps_list = [list() for _ in range(self.dp_size)]
+        # finish_times_merged = np.asarray([-1]*self.model.ori_tot_inp_num)
+        finish_times_list_for_models = [[list() for model in self.model_list] for _ in range(self.dp_size)]
+
+
+        # exec_plan_0 = self.fused_exec_plans[0]
+
+        for dp_id in range(self.dp_size):
+            
+            old_inp_lens_for_models = old_inp_lens_list[dp_id]
+            old_inp_lens = old_inp_lens_for_models[-1]
+            # new_inp_lens, new_out_lens, new_inp_seq_ids = new_inp_out_lens_list[dp_id]
+            stop_iter_i = stop_iter_i_list[dp_id]
+
+            # 1. update the infer metadata after the infer stage
+            (cumsum_latencys_list[dp_id], cum_rng_nums_list_for_models[dp_id][-1], 
+                rng_starts_list_for_models[dp_id][-1], rng_ends_list_for_models[dp_id][-1], is_prefill_steps_list[dp_id], 
+                finish_times_list_for_models[dp_id][-1], alive_old_indices) = \
+                    fake_scheduling.update_fake_FCFS_schedule_metadata(
+                        old_inp_lens, # new_inp_lens,
+                        self.cumsum_latencys_list[dp_id], self.cum_rng_nums_list_for_models[dp_id][-1], 
+                        self.rng_starts_list_for_models[dp_id][-1], self.rng_ends_list_for_models[dp_id][-1], 
+                        self.is_prefill_steps_list[dp_id],
+                        self.infer_args.max_num_batched_tokens, stop_iter_i,
+                        cost_table, 
+                        model_name=self.model.model_path, 
+                        exec_plan=self.get_key_single_dp_worker(), sample_config=self.model.sample_config, 
+                        trust_remote_code=self.model.trust_remote_code, revision=self.model.revision
+                        )
+            
+            # dp_seq_ids = self.dp_seq_ids_list[dp_id]
+            # finish_times_merged[dp_seq_ids[alive_old_indices]] = finish_times_of_alive_seqs
+            # finish_times_list[dp_id] = finish_times_of_alive_seqs
+            assert (np.nonzero(new_inp_out_lens_list[dp_id][2][-1])[0] == alive_old_indices).all()
+
+
+
+
+
+        new_key = (self.model.model_name, self.get_key(), (to_tuple(new_inp_lens_merged), to_tuple(new_out_lens_merged)), \
+                   tuple([tuple([-1 - self.extra_cost]*len(new_inps)) for new_inps in new_inp_lens_merged]))
+        # print(f"update fake scheduling: new_key: {new_key}")
+        _FAKE_SCHEDULING_RES[new_key] = \
+            cumsum_latencys_list, cum_rng_nums_list_for_models, rng_starts_list_for_models, rng_ends_list_for_models, \
+                is_prefill_steps_list, finish_times_list_for_models
+            # finish_times_merged, new_inp_seq_ids_merged
+
+
+
+
+
+    # def get_key(self):
+    #     # the key of a exec plan is (tp, gpu_ratio, wldeg, cache_gpu_num)
+    #     # data parallel
+    #     # ==> (tp, gpu_ratio, wldeg, cache_gpu_num, dp_size)
+    #     return self.fused_exec_plans[0].get_key()
+    #     # return (self.num_worker, self.mem_per_comp_gpu, self.wld_degree, self.cache_gpu_num, self.dp_size)
+    
+    # def get_key_single_dp_worker(self):
+    #     # the key of the exec plan for a data parallel worker is (tp, gpu_ratio, wldeg, cache_gpu_num)
+    #     return self.fused_exec_plans[0].get_key_single_dp_worker()
+    #     # return (self.num_worker, self.mem_per_comp_gpu, self.wld_degree, self.cache_gpu_num)
+
+
+    def __str__(self) -> str:
+        return f"{[str(model) for model in self.model_list]}, "\
+            f"{self.get_key()}"
+        # return f"{str(self.model)}, "\
+        #     f"{self.get_key()}"
+            # f"tp:{self.num_worker}, wld:{self.wld_degree}, "\
+            # f"cache_gpu:{self.cache_gpu_num}, mem_r:{self.mem_per_comp_gpu}, "\
+            # f"param_byte_per_comp_gpu:{self.param_byte_per_comp_gpu}, param_byte_per_cache_gpu:{self.param_byte_per_cache_gpu}"
+
+
+
+
+
+
+
+
+
+
+
+
+
 class MyExecPlanGroup:
     """ My execution plan group definition. """
     def __init__(
@@ -983,6 +2239,9 @@ class MyExecPlanGroup:
         check_gap: int,
         sort_input: bool,
     ) -> None:
+        
+        print(f"building exec plan group: {[str(_) for _ in exec_plans]}\n", flush=True)
+
         self.exec_plans = exec_plans
         self.throughput = None
         self.infer_stage_latency = None
@@ -997,7 +2256,8 @@ class MyExecPlanGroup:
         self.valid_throughputs: List[float] = list()
         # self.extra_prepare_costs: Dict[MyExecPlan, float] = dict()
         # self.tmp_remaining_lens_list: List[List[int]] = list()
-        self.tmp_inp_out_lens_list: List[Tuple[List[int], List[int]]] = list()
+        self.tmp_inp_out_lens_list: \
+            List[Union[Tuple[List[int], List[int], List[int]],  Tuple[List[int], List[int], List[int]]]] = list()
         self.tmp_remaining_decode_flops_after_infer_stage: List[float] = list()
         self.tmp_stop_iter_i_list: List[int] = list()
         self.compute_infer_stage_data(cost_table=cost_table, 
@@ -1006,6 +2266,12 @@ class MyExecPlanGroup:
 
 
 
+    def get_involved_base_model_num(self):
+        return sum([len(exec_plan.get_base_model_ids()) for exec_plan in self.exec_plans])
+
+
+    def get_involved_fused_models(self):
+        return [exec_plan.model for exec_plan in self.exec_plans if isinstance(exec_plan, MyVerticalFusedExecPlan)]
 
 
     # data parallel
@@ -1064,16 +2330,35 @@ class MyExecPlanGroup:
             NOTE:
                 This function is wrong because a model's input models may be finished (so not in the current plan group)
         """
+        def get_mapped_model_ids_in_group(node_mapping, model_ids):
+            """
+                Get the mapped values of the input model_ids accoding to the node mapping.
+                I.e., get the corresponding model ids in the new system when accepting the newly fused models.
+                NOTE: only get the mapped model id if the id is in the current exec plan group.
+            """
+            # print(f"node_mapping: {node_mapping}, model_ids: {model_ids}")
+            return set([node_mapping[i] for i in model_ids if i in node_mapping])
+
         model_exec_plan_mapping: Dict[int, MyExecPlan] = \
             {exec_plan.model.model_id:exec_plan for exec_plan in self.exec_plans}
         
-        all_model_ids = set(model_exec_plan_mapping.keys())
+        # get the model_id mapping from base model id to fused/base model id (or from fuse to fuse)
+        node_mapping = {exec_plan.model.model_id:exec_plan.model.model_id for exec_plan in self.exec_plans}
+        node_mapping.update({ori:exec_plan.model.model_id \
+                             for exec_plan in self.exec_plans for ori in exec_plan.model.get_base_model_ids() })
 
-        inp_model_ids_dict: Dict[MyExecPlan, List[int]] = defaultdict(list)
+        # the model ids are in the new system with newly fused models
+        # all_model_ids = set(model_exec_plan_mapping.keys())
+
+        inp_model_ids_dict: Dict[MyExecPlan, List[int]] = dict()
+
+        # print(f"all exec plans in this group:\n")
+        # print(f"{[(exec_plan.model.model_id, exec_plan.model.get_base_model_ids(), exec_plan.get_key()) for exec_plan in self.exec_plans]}")
 
         # get self.inp_exec_plan_dict
         for exec_plan in self.exec_plans:
-            inp_model_ids_this_stage = set.intersection(set(exec_plan.model.input_model_ids), all_model_ids)
+            inp_model_ids_this_stage = get_mapped_model_ids_in_group(node_mapping, exec_plan.model.input_model_ids)
+            # inp_model_ids_this_stage = set.intersection(set(mapped_inp_model_ids), all_model_ids)
             inp_exec_plans_this_stage = [model_exec_plan_mapping[model_id] for model_id in inp_model_ids_this_stage]
             self.inp_exec_plan_dict[exec_plan] = inp_exec_plans_this_stage
             inp_model_ids_dict[exec_plan] = inp_model_ids_this_stage
@@ -1098,24 +2383,147 @@ class MyExecPlanGroup:
 
 
 
-    def _get_arrive_times(self, exec_plan: MyExecPlan):
+    def _get_arrive_times_base_model_limited_version(self, inp_seq_ids: List[int], inp_exec_plans: List[MyExecPlan]):
         """
             Compute the input arrive times for this exec plan.
             NOTE: the finish_times are in the order of model.inp_seq_ids. [感觉这个影响不会太大？]
         """
-        inp_seq_ids: List[int] = exec_plan.model.get_inp_seq_ids()
-        inp_exec_plans = self.inp_exec_plan_dict[exec_plan]
+        # inp_seq_ids: List[int] = exec_plan.model.get_inp_seq_ids()
+        # inp_exec_plans = self.inp_exec_plan_dict[exec_plan]
 
         # print(f"inp_exec_plans: {[str(exec_plan) for exec_plan in inp_exec_plans]}")
 
+        # 这个地方很奇怪，因为inp_plan 可能是个fused plan
+        # NOTE：但是我们只支持线性的依赖关系 (linear dependency) 的model vertical fusion，
+        # 所以可以直接假设依赖的是inp_plan里的最后一个base plan。
+        # 要支持别的更复杂的情况也不是不行。
+
+        # print(f"in _get_arrive_times_base_model: inp_seq_ids: {inp_seq_ids}")
+
         if len(inp_exec_plans) > 0:
-            finish_times = np.asarray([inp_plan.get_finish_times_merged(inp_seq_ids) + inp_plan.extra_cost \
+            # NOTE: here we directly use inp_plan.get_exec_plans()[-1]
+            finish_times = np.asarray([inp_plan.get_finish_times_merged(inp_seq_ids) \
+                                       + inp_plan.extra_cost \
                                     for inp_plan in inp_exec_plans])
             finish_times = np.max(finish_times, axis=0)
         else:
             # no input exec plan, i.e., all inputs are available at the beginning
             finish_times = np.asarray([-1]*len(inp_seq_ids))
         return finish_times
+
+
+
+    # support vertical fusion of models
+    def _get_arrive_times_limited_version(self, exec_plan: MyExecPlan):
+
+        """
+            NOTE: 我们现在假设只支持自环的vertical fuse, i.e., fused 的models作为整体，其input与第一个model的input相同，
+            其output与最后一个model的output相同。
+        """
+
+        print("base model information: ", [(model.model_name, model.model_id, model.get_base_model_ids(), isinstance(model, MyFusedModelInfor)) for model in exec_plan.get_base_models()])
+
+        inp_seq_ids: List[int] = exec_plan.get_base_models()[0].get_inp_seq_ids()
+        inp_exec_plans = self.inp_exec_plan_dict[exec_plan]
+        
+        finish_times_list = [self._get_arrive_times_base_model(inp_seq_ids, inp_exec_plans)] + \
+            [self._get_arrive_times_base_model(model.get_inp_seq_ids(), []) for model in exec_plan.get_base_models()[1:]]
+        
+        if isinstance(exec_plan, MyVerticalFusedExecPlan):
+            # print(f"is MyVerticalFusedExecPlan: finish_times_list: {finish_times_list}")
+
+            return finish_times_list
+        else:
+            # print(f"is Basic exec plan: finish_times_list: {finish_times_list}")
+
+            return finish_times_list[0]
+
+
+
+
+    def _get_arrive_times_base_model(self, inp_seq_ids: List[int], inp_info: List[Tuple[MyExecPlan, int]]):
+        """
+            Compute the input arrive times for this exec plan.
+            NOTE: the finish_times are in the order of model.inp_seq_ids. [感觉这个影响不会太大？]
+            Input:
+                inp_info: list of tuple (inp exec plan, the base model id in the inp exec plan)
+        """
+        # inp_seq_ids: List[int] = exec_plan.model.get_inp_seq_ids()
+        # inp_exec_plans = self.inp_exec_plan_dict[exec_plan]
+
+        # print(f"inp_exec_plans: {[str(exec_plan) for exec_plan in inp_exec_plans]}")
+
+        # 这个地方很奇怪，因为inp_plan 可能是个fused plan
+        # NOTE：但是我们只支持线性的依赖关系 (linear dependency) 的model vertical fusion，
+        # 所以可以直接假设依赖的是inp_plan里的最后一个base plan。
+        # 要支持别的更复杂的情况也不是不行。
+
+        # print(f"in _get_arrive_times_base_model: inp_seq_ids: {inp_seq_ids}")
+        # print(f"inp_info: {[(_[0].model.model_id, _[0].model.get_base_model_ids(), _[1]) for _ in inp_info]}")
+
+        if len(inp_info) > 0:
+            # NOTE: here we directly use inp_plan.get_exec_plans()[-1]
+            finish_times = np.asarray([inp_plan.get_finish_times_merged(inp_seq_ids, model_ind) \
+                                       + inp_plan.extra_cost \
+                                    for inp_plan, model_ind in inp_info])
+
+            # print(f"the original finish_times lists we get: {finish_times}")
+
+            finish_times = np.max(finish_times, axis=0)
+        else:
+            # no input exec plan, i.e., all inputs are available at the beginning
+            finish_times = np.asarray([-1]*len(inp_seq_ids))
+        return finish_times
+
+
+
+    # support vertical fusion of models
+    def _get_arrive_times(self, exec_plan: MyExecPlan):
+
+        """
+            NOTE: 这个版本支持fused model中各个base model存有自己的output，都可以被外部的model利用。
+        """
+
+        print("base model information: ", [(model.model_name, model.model_id, model.get_base_model_ids(), isinstance(model, MyFusedModelInfor)) for model in exec_plan.get_base_models()])
+
+        inp_exec_plans = self.inp_exec_plan_dict[exec_plan]
+        in_exec_plans_base_model_ids = [in_exec_plan.get_base_model_ids() for in_exec_plan in inp_exec_plans]
+        print(f"in_exec_plans_base_model_ids: {in_exec_plans_base_model_ids}")
+        finish_times_list: List[List[float]] = list()
+
+        # get the inp arrive times for each base model of the exec_plan
+        for base_model in exec_plan.get_base_models():
+            
+            inp_info: List[MyExecPlan, int] = list()
+
+            print(f"base_model: {base_model.get_base_model_ids()} its input model ids: {base_model.input_model_ids}")
+
+            # 1. get the inp plans and the corresponding base model ids in the inp plans that this base model depends on
+            for in_model_id in base_model.inp_base_model_ids:
+                for i, model_ids in enumerate(in_exec_plans_base_model_ids):
+                    if in_model_id in model_ids:
+                        for j, model_id in enumerate(model_ids):
+                            if in_model_id == model_id:
+                                inp_info.append((inp_exec_plans[i], j))
+            
+            # 2. get the inp arrive times
+            inp_seq_ids: List[int] = base_model.get_inp_seq_ids()
+            finish_times_list.append(self._get_arrive_times_base_model(inp_seq_ids, inp_info))
+
+        
+        if isinstance(exec_plan, MyVerticalFusedExecPlan):
+            # print(f"is MyVerticalFusedExecPlan: finish_times_list: {finish_times_list}")
+
+            return finish_times_list
+        else:
+            # print(f"is Basic exec plan: finish_times_list: {finish_times_list}")
+
+            return finish_times_list[0]
+
+
+
+
+
 
 
 
@@ -1133,7 +2541,7 @@ class MyExecPlanGroup:
                 (5) the total latency of the current infer stage.
         '''
 
-        print(f"INIT plan group: {[str(exec_plan) for exec_plan in self.exec_plans]}")
+        print(f"INIT plan group: {[(str(exec_plan), exec_plan.model.model_id, isinstance(exec_plan, MyVerticalFusedExecPlan)) for exec_plan in self.exec_plans]}")
 
         # 0. Compute the extra preparation time.
         self.comp_extra_prepare_costs(cost_table, last_stage_exec_plans)
@@ -1154,6 +2562,7 @@ class MyExecPlanGroup:
         latency = min(latencys)
 
         print(f"stage latency: {latency}")
+        print(f"{[exec_plan.model.get_base_model_ids() for exec_plan in self.exec_plans]}")
 
         # 2. Update the infer progress of each model involved.
         # for exec_plan in self.exec_plans:
@@ -1172,6 +2581,8 @@ class MyExecPlanGroup:
             self.tmp_stop_iter_i_list.append(stop_iter_i)
         
         self.infer_stage_latency = latency
+
+        print(f"throughput: {self.get_throughput()}")
 
 
     def get_throughput_no_data_parallel(self):
@@ -1244,15 +2655,63 @@ class MyExecPlanGroup:
         # return tuple(sorted([(exec_plan.model.model_name, exec_plan.model.model_id, inp_out_lens) \
         #                      for exec_plan, inp_out_lens \
         #                         in zip(self.exec_plans, self.tmp_inp_out_lens_list)]))
-        return tuple(sorted([(
-            exec_plan.model.model_name, exec_plan.model.model_id, 
-            tuple(np.concatenate([inps for inps, outs, indices in inp_out_lens])), 
-            tuple(np.concatenate([outs for inps, outs, indices in inp_out_lens])) 
-            ) for exec_plan, inp_out_lens \
+        
+        # print(f"self.tmp_inp_out_lens_list: {self.tmp_inp_out_lens_list}")
+        # print([str(exec_plan) for exec_plan in self.exec_plans])
+
+        def get_model_state(exec_plan, inp_out_lens):
+            if isinstance(exec_plan, MyVerticalFusedExecPlan):
+                print(f"MyVerticalFusedExecPlan")
+                return (
+                [exec_plan.model.model_name]*len(exec_plan.model.get_base_model_ids()), 
+                tuple(exec_plan.model.get_base_model_ids()), 
+                tuple([tuple(_) for _ in exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)[0]]),
+                tuple([tuple(_) for _ in exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)[1]]),
+                )
+                return (
+                exec_plan.model.model_name, tuple(exec_plan.model.get_base_model_ids()), 
+                tuple(np.concatenate([tuple(np.concatenate(inps)) for inps, outs, indices in inp_out_lens])), 
+                tuple(np.concatenate([tuple(np.concatenate(outs)) for inps, outs, indices in inp_out_lens])) 
+                )
+            elif isinstance(exec_plan, MyExecPlan):
+                print(f"MyExecPlan")
+                return (
+                [exec_plan.model.model_name], 
+                tuple(exec_plan.model.get_base_model_ids()), 
+                [tuple(exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)[0])], 
+                [tuple(exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)[1])] 
+                )
+                return (
+                exec_plan.model.model_name, tuple(exec_plan.model.get_base_model_ids()), 
+                tuple(np.concatenate([inps for inps, outs, indices in inp_out_lens])), 
+                tuple(np.concatenate([outs for inps, outs, indices in inp_out_lens])) 
+                )
+
+        ret = list()
+        for exec_plan, inp_out_lens in zip(self.exec_plans, self.tmp_inp_out_lens_list):
+            states = get_model_state(exec_plan, inp_out_lens)
+            names, model_ids, inp_lens, out_lens = states
+            ret.extend(zip(names, model_ids, inp_lens, out_lens))
+
+        return tuple(sorted(ret))
+        
+        return tuple(sorted([get_model_state(exec_plan, inp_out_lens) for exec_plan, inp_out_lens \
                 in zip(self.exec_plans, self.tmp_inp_out_lens_list)]))
+
+
+        # return tuple(sorted([(
+        #     exec_plan.model.model_name, tuple(exec_plan.model.get_base_model_ids()), 
+        #     tuple(np.concatenate([inps for inps, outs, indices in inp_out_lens])), 
+        #     tuple(np.concatenate([outs for inps, outs, indices in inp_out_lens])) 
+        #     ) for exec_plan, inp_out_lens \
+        #         in zip(self.exec_plans, self.tmp_inp_out_lens_list)]))
     
     def get_model_states_before_infer_stage(self):
-        return tuple(sorted([(exec_plan.model.get_state()) for exec_plan in self.exec_plans]))
+        ret = list()
+        for exec_plan in self.exec_plans:
+            ret.extend([model.get_state() for model in exec_plan.get_base_models()])
+        return tuple(sorted(ret))
+        # return tuple(sorted([(exec_plan.model.get_state()) for exec_plan in self.exec_plans]))
     
 
     def update_model_inp_out_lens_no_data_parallel(self, cost_table: CostTable):
@@ -1293,16 +2752,19 @@ class MyExecPlanGroup:
         # print(f"WHEN APPLY A PLAN GROUP: {self}")
 
         # formally change the model's remaining seq lens
-        for exec_plan, inp_out_lens, stop_iter_i in zip(self.exec_plans, self.tmp_inp_out_lens_list, self.tmp_stop_iter_i_list):
+        for exec_plan, inp_out_lens, stop_iter_i in \
+            zip(self.exec_plans, self.tmp_inp_out_lens_list, self.tmp_stop_iter_i_list):
             # old_inp_lens, _ = exec_plan.model.get_inp_out_seqlens()
-            old_inp_lens = exec_plan.dp_inp_lens_list
+            old_inp_lens = exec_plan.get_dp_inp_lens_list_for_models()
 
             # we sort the inps by their seq ids
             # merged_inp_out_lens = merge_inp_out_lens_of_data_parallel_workers(inp_out_lens)
             merged_inp_out_lens = exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)
             
-            # print(f"inp_out_lens: {inp_out_lens}")
-            # print(f"merged_inp_out_lens: {merged_inp_out_lens}")
+            print(f"UPDATE MODELS AFTER SELECTING AN EXEC PLAN-------------\n")
+            print(f"exec_plan: {str(exec_plan)}, model_ids: {exec_plan.model.get_base_model_ids()}")
+            print(f"inp_out_lens: {inp_out_lens}")
+            print(f"merged_inp_out_lens: {merged_inp_out_lens}")
 
             # exec_plan.model.update_inp_out_seqlens(*inp_out_lens, cost_table)
             exec_plan.model.update_inp_out_seqlens(*merged_inp_out_lens, cost_table)
@@ -1392,6 +2854,9 @@ class MyExecPlanGroupSeq:
 
     def get_tmp_only_comp_throughput_after_adding_a_plan_group(self, plan_group: MyExecPlanGroup):
         flops = sum([group.get_throughput()*group.get_infer_stage_latency() for group in self.plan_group_seq+[plan_group]])
+        
+        print("DEBUG: ", [group.valid_throughputs for group in self.plan_group_seq+[plan_group]])
+        
         latency = sum([group.get_throughput()*group.get_infer_stage_latency()/group.get_comp_throughput_only() \
                        for group in self.plan_group_seq+[plan_group]])        
         return flops / latency
@@ -1435,14 +2900,18 @@ class MyModelSystem:
         model_list: List[MyModelInfor],
         out_edge_dict: Dict[int, List[int]],
         # parameters for inp/out lens correction
-        cost_table: CostTable, inp_merger, outlen_generator
+        cost_table: CostTable, inp_merger, outlen_generator, 
+        need_correct_inp_out_lens: bool,
     ) -> None:
-        # here we have model_list[i].model_id = i
-        self.model_list = model_list
+        # here we have self.model_list[i].model_id = i --> change to use model dict now
+        self.model_dict: Dict[int, MyModelInfor] = {model.model_id: model for model in model_list}
         # model-level pipeline
         self.all_level_model_ids: List[List[int]] = list()
         # here we use edge_dict[i] to store the output edges of model i
         self.out_edge_dict = defaultdict(list, out_edge_dict)
+        self.cost_table = cost_table
+        self.inp_merger = inp_merger
+        self.outlen_generator = outlen_generator
         # # generate inp_edge_dict for use
         # self.inp_edge_dict = defaultdict(list)
         # for inp in out_edge_dict:
@@ -1451,29 +2920,172 @@ class MyModelSystem:
 
         
         # set the inp_edges information for each LLM
+        for model in self.model_dict.values():
+            model.input_model_ids = list()
         for inp in out_edge_dict:
             for out in out_edge_dict[inp]:
-                self.model_list[out].input_model_ids.append(inp)
+                self.model_dict[out].input_model_ids.append(inp)
 
         print(f"out_edge_dict: {out_edge_dict}")
-        for model in self.model_list:
-            print(f"inp model ids of model {model.model_id}: {model.input_model_ids}")
+        for model_id, model in self.model_dict.items():
+            print(f"inp model ids of model {model_id} = {model.get_base_model_ids()}: {model.input_model_ids}")
         print("original inp/out lens of each model: ")
-        for model in self.model_list:
-            print(f"{model.model_id}")
+        for model_id, model in self.model_dict.items():
+            print(f"{model_id}")
             print(f"{model.get_inp_out_seqlens()[0]}")
             print(f"{model.get_inp_out_seqlens()[1]}")
 
         # correct inp/out lens of models considering LLM dependency
         # TODO: 这个地方可以优化一下，一步到位生成所有模型的正确的inp/out lens
-        self._get_inp_out_lens_considering_LLM_dependency(
-            cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator)
+        if need_correct_inp_out_lens:
+            self._get_inp_out_lens_considering_LLM_dependency(
+                cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator)
         
         print("correct inp/out lens of each model: ")
-        for model in self.model_list:
-            print(f"{model.model_id}")
+        for model_id, model in self.model_dict.items():
+            print(f"{model_id}")
             print(f"{model.get_inp_out_seqlens()[0]}")
             print(f"{model.get_inp_out_seqlens()[1]}")
+
+
+
+
+    def check_finish_states_accuracy(self):
+        for model in self.model_dict.values():
+            print(f"model {model.model_id}, inp/out_lens: {model.get_inp_out_seqlens()}")
+        for model in self.model_dict.values():
+            inp_model_states = [self.model_dict[i].is_finished() for i in model.input_model_ids]
+            if model.is_finished() and (False in inp_model_states):
+                assert False
+
+
+
+
+
+
+
+
+    def fuse_similar_models_in_a_chain(
+            self,
+            tot_gpu_num, byte_per_gpu, cost_table: CostTable,
+            # baseline: str, 
+            check_gap: int, sort_input: bool,
+            similar_threshold: float):
+        """
+            This function tries to fuse models in a chain (these models can be fused vertically) which has similar performance given the same GPU resources.
+            Output: a new model system with fused models.
+
+            NOTE: call this function before the search starts.
+        """
+
+        print(f"\n\nTRYING FUSING SOME MODELS AT THE BEGINNING!\n\n")
+
+        # NOTE: assume self.get_all_level_models is already called right before this function is called.
+
+        visit_model_level = -1
+        
+        # { the model id: the comp throughputs of different tp_size setting for the model }
+        comp_throughputs_dict: Dict[int, List[float]] = dict()
+        # { the first model id in the fused model: all the model ids in the fused model }
+        fused_models: Dict[int, List[int]] = dict()
+
+        while True:
+            visit_model_level += 1
+            cand_models = self.get_models_at_given_level(visit_model_level)
+            if len(cand_models) == 0:
+                break
+
+            for to_fuse_model in cand_models:
+                
+                # 1. compute its comp throughput vector
+                exec_plans = get_possible_exec_plans(to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours')
+                plan_groups = [MyExecPlanGroup([exec_plan], cost_table=cost_table, last_stage_exec_plans=[],
+                                                check_gap=check_gap, sort_input=sort_input,) for exec_plan in exec_plans]
+                comp_throughput_vecs = np.asarray([plan_group.get_comp_throughput_only() for plan_group in plan_groups])
+
+
+                is_fused: bool = False
+                # 2. check whether this model can be fused vertically
+                # to_fuse_inp_model_ids must only contain base model ids
+                to_fuse_inp_model_ids = to_fuse_model.input_model_ids
+                for first_model_id, model_ids_fused in fused_models.items():
+                    fused_model_inp_base_model_ids = self.model_dict[first_model_id].inp_base_model_ids
+                    if _meet_vertical_fuse_condition(to_fuse_inp_model_ids, model_ids_fused, fused_model_inp_base_model_ids):
+                        # this model can be fused topologically
+
+                        # 3. check whether the comp_throughput_vecs is similar enough
+                        diff = np.abs((comp_throughput_vecs-comp_throughputs_dict[first_model_id])/comp_throughputs_dict[first_model_id])
+                        if (diff < similar_threshold).all():
+                            # we can directly fuse this model with model_ids_fused
+                            fused_models[first_model_id].append(to_fuse_model.model_id)
+                            is_fused = True
+                            break
+            
+
+                # there is no fused model to join
+                if not is_fused:
+                    comp_throughputs_dict[to_fuse_model.model_id] = comp_throughput_vecs
+                    fused_models[to_fuse_model.model_id] = [to_fuse_model.model_id]
+            
+        
+        
+        print(f"\n\n FINISH FUSING SOME MODELS AT THE BEGINNING!\n\n")
+        print(f"comp_throughputs_dict: {comp_throughputs_dict}")
+        print(f"fused_models: {fused_models}")
+        
+        
+        # generate a new model system with the fused models
+        fused_model_objs = list()
+        for model_ids in fused_models.values():
+            if len(model_ids) > 1:
+                fused_model_objs.append( MyFusedModelInfor([self.model_dict[model_id] for model_id in model_ids]) )
+        
+        return self.gen_new_model_sys_with_fused_models(fused_model_objs)
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def gen_new_model_sys_with_fused_models(self, fused_model_list: List[MyFusedModelInfor]):
+        node_mapping = {ori:fused_model.model_id for fused_model in fused_model_list for ori in fused_model.get_base_model_ids()}
+        # NOTE: we need to support the case where we fuse some models at the beginning before the search process
+        #       i.e., we may fuse two fused models into a bigger fused model
+        for model_id, model in self.model_dict.items():
+            base_model_ids = model.get_base_model_ids()
+            if base_model_ids[0] in node_mapping:
+                assert False not in [node_mapping[_] == node_mapping[base_model_ids[0]] for _ in base_model_ids]
+                node_mapping[model_id] = node_mapping[base_model_ids[0]]
+
+        # now node_mapping's keys contains all models in the old model system that are fused into models in ``fused_model_list``
+        new_model_dict = {model_id:model for model_id, model in self.model_dict.items() if model_id not in node_mapping}
+        new_model_dict.update({model.model_id:model for model in fused_model_list})
+        
+        for model_id in self.model_dict:
+            if model_id not in node_mapping:
+                node_mapping[model_id] = model_id
+        new_out_edge_dict = defaultdict(set)
+        for src, tgts in self.out_edge_dict.items():
+            new_out_edge_dict[node_mapping[src]].update([node_mapping[tgt] for tgt in tgts])
+        for k in new_out_edge_dict:
+            # we need to delete the self circle introduced in by fusing models
+            new_out_edge_dict[k] = list(new_out_edge_dict[k].difference({k}))
+
+        
+        new_model_sys = MyModelSystem(new_model_dict.values(), new_out_edge_dict, self.cost_table, self.inp_merger, self.outlen_generator,
+                                      need_correct_inp_out_lens=False)
+        return new_model_sys
+
 
 
 
@@ -1495,19 +3107,55 @@ class MyModelSystem:
             Update:
                 update the input and output seq lengths of all LLMs in the system.
         """
+
+        def get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id):
+            outputs = self.model_dict[inp_model_id].get_inp_out_seqlens()[1]
+            outputs_inds = self.model_dict[inp_model_id].get_inp_seq_ids()
+
+            # we need to consider the case where the inp seq id is not the output of the model
+            # for example: a model after the chain summary, it depends on different model stages in the summary chain
+            #           the total inp seq ids will be the full set of inp seq ids, but they are outputs of different model stages
+
+            return get_infor_given_seq_ids(
+                values=outputs, 
+                seq_ids_we_have=outputs_inds, 
+                seq_ids_requested=inp_seq_ids, 
+                default_value=0)
+            
+            inds = np.searchsorted(outputs_inds, inp_seq_ids)
+            
+            # we need to consider the case where the inp seq id is not the output of the model
+            # for example: a model after the chain summary, it depends on different model stages in the summary chain
+            #           the total inp seq ids will be the full set of inp seq ids, but they are outputs of different model stages
+            ret = np.zeros(len(inp_seq_ids),dtype=inp_seq_ids.dtype)
+            valid_indices1 = inds<len(outputs_inds)
+            valid_indices2 = (outputs_inds[inds[valid_indices1]] == inp_seq_ids[valid_indices1])
+            inds = inds[valid_indices1][valid_indices2]
+            ret_inds = np.arange(len(ret))[valid_indices1][valid_indices2]
+            ret[ret_inds] = np.asarray(outputs)[inds]
+            
+            return ret
+            return np.asarray(outputs)[inds]
+
         # sort the models by the topological order first
         self.get_all_level_models()
         for model_ids in self.all_level_model_ids:
             for model_id in model_ids:
-                model = self.model_list[model_id]
+                model = self.model_dict[model_id]
                 if len(model.input_model_ids) == 0:
                     # we do not need to change the inp seq lengths of this model
                     continue
                 ori_inp_lens = model.get_inp_out_seqlens()[0]
+                # NOTE: all the inp seq ids are sorted
+                inp_seq_ids = model.get_inp_seq_ids()
                 new_inp_lens = inp_merger(
                     [ori_inp_lens] + \
-                        [self.model_list[inp_model_id].get_inp_out_seqlens()[1] for inp_model_id in model.input_model_ids]
+                        [get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id) for inp_model_id in model.input_model_ids]
                         )
+                # new_inp_lens = inp_merger(
+                #     [ori_inp_lens] + \
+                #         [self.model_dict[inp_model_id].get_inp_out_seqlens()[1] for inp_model_id in model.input_model_ids]
+                #         )
                 new_out_lens = outlen_generator(model.model_name, new_inp_lens)
                 model.update_inp_out_seqlens(new_inp_lens, new_out_lens, model.get_inp_seq_ids(), cost_table)
 
@@ -1530,13 +3178,13 @@ class MyModelSystem:
                 (model.model_id in running_model_ids)
 
         to_run: List[MyModelInfor] = list()
-        for model in self.model_list:
+        for model in self.model_dict.values():
             if is_finished_or_running(model, running_model_ids):
                 continue
 
             # inps = self.inp_edge_dict[model.model_id]
             inps = model.input_model_ids
-            inps_status = [is_finished_or_running(self.model_list[inp], running_model_ids) for inp in inps]
+            inps_status = [is_finished_or_running(self.model_dict[inp], running_model_ids) for inp in inps]
             if False in inps_status:
                 continue
 
@@ -1572,7 +3220,7 @@ class MyModelSystem:
     def get_models_at_given_level(self, level_num: int):
         if level_num >= len(self.all_level_model_ids):
             return list()
-        return [self.model_list[model_id] for model_id in self.all_level_model_ids[level_num]]
+        return [self.model_dict[model_id] for model_id in self.all_level_model_ids[level_num]]
 
 
 
@@ -1587,9 +3235,13 @@ class MyModelSystem:
 
         runnable_exec_plans: List[List[MyExecPlan]] = list()
         running_model_ids: List[int] = [exec_plan.model.model_id for exec_plan in running_plan_group]
+        # we need to support fused models
+        for exec_plan in running_plan_group:
+            running_model_ids.extend(exec_plan.model.get_base_model_ids())
+        
         for model, exec_plans in zip(cand_models, cand_exec_plans):
             inps = model.input_model_ids
-            inps_status = [is_finished_or_running(self.model_list[inp], running_model_ids) for inp in inps]
+            inps_status = [is_finished_or_running(self.model_dict[inp], running_model_ids) for inp in inps]
             if False in inps_status:
                 continue
 
@@ -1606,13 +3258,16 @@ class MyModelSystem:
             Update: self.all_level_model_ids
         """
         self.all_level_model_ids = list()
-        visited: List[bool] = np.asarray([False] * len(self.model_list))
+        # visited: List[bool] = np.asarray([False] * len(self.model_dict))
+        visited: Dict[int, bool] = {model_id: False for model_id in self.model_dict}
 
-        while sum(visited) < len(self.model_list):
+        # while sum(visited) < len(self.model_dict):
+        while False in visited.values():
             # get the model ids on this level
-            newly_visited: List[bool] = np.asarray([False] * len(self.model_list))
+            # newly_visited: List[bool] = np.asarray([False] * len(self.model_dict))
+            newly_visited: Dict[int, bool] = {model_id: False for model_id in self.model_dict}
             new_model_ids: List[int] = list()
-            for model in self.model_list:
+            for model in self.model_dict.values():
                 if visited[model.model_id]:
                     continue
                 if model.is_finished():
@@ -1623,7 +3278,8 @@ class MyModelSystem:
                     continue
                 newly_visited[model.model_id] = True
                 new_model_ids.append(model.model_id)
-            visited = visited + newly_visited
+            # visited = visited + newly_visited
+            visited = {k: visited[k] or newly_visited[k] for k in visited}
             if len(new_model_ids) > 0:
                 self.all_level_model_ids.append(new_model_ids)
 
@@ -1632,13 +3288,15 @@ class MyModelSystem:
 
 
     def get_model_num(self)->int:
-        return len(self.model_list)
+        return len(self.model_dict)
 
 
 
 
-    def get_not_finished_model_num(self) -> int:
-        not_finished_model_num = sum([not model.is_finished() for model in self.model_list])
+    def get_not_finished_base_model_num(self) -> int:
+        not_finished_model_num = sum([not base_model.is_finished() \
+                                      for model in self.model_dict.values() \
+                                        for base_model in model.get_base_models()])
         return not_finished_model_num
 
 
@@ -1646,50 +3304,67 @@ class MyModelSystem:
         """
             Return True if all the models in the system is finished.
         """
-        # return False not in [model.is_finished() for model in self.model_list]
-        return self.get_not_finished_model_num() == 0
+        # return False not in [model.is_finished() for model in self.model_dict.values()]
+        return self.get_not_finished_base_model_num() == 0
 
 
 
-    def get_model_states(self):
+    # def get_model_states(self):
+    #     '''
+    #         Get the current inference progress of the given list of models.
+    #         NOTE: the returned progress should be able to be added to a set.
+    #     '''
+    #     return tuple(sorted([model.get_state() for model in self.model_dict.values()]))
+
+    def get_base_model_states(self):
         '''
             Get the current inference progress of the given list of models.
             NOTE: the returned progress should be able to be added to a set.
         '''
-        return tuple(sorted([model.get_state() for model in self.model_list]))
+        return tuple(sorted([base_model.get_state() for model in self.model_dict.values() \
+                             for base_model in model.get_base_models()]))
     
     
     def get_model_inp_out_lens(self):
-        ori_inp_out_lens_list = [model.get_inp_out_seqlens() for model in self.model_list]
+        ori_inp_out_lens_list = [model.get_inp_out_seqlens() for model in self.model_dict.values()]
         return ori_inp_out_lens_list
     
     def get_model_remaining_decode_flops(self):
-        ori_remaining_decode_flops_list = [model.get_remaining_flops() for model in self.model_list]
+        ori_remaining_decode_flops_list = [model.get_remaining_flops() for model in self.model_dict.values()]
         return ori_remaining_decode_flops_list
 
     def get_model_inp_seq_ids(self):
-        ori_inp_seq_ids_list = [model.get_inp_seq_ids() for model in self.model_list]
+        ori_inp_seq_ids_list = [model.get_inp_seq_ids() for model in self.model_dict.values()]
         return ori_inp_seq_ids_list
 
 
+    def get_model_inp_model_ids(self):
+        ori_inp_model_ids_list = [model.input_model_ids for model in self.model_dict.values()]
+        return ori_inp_model_ids_list
+
+
+    
+    
     def recover_model_state(
             self,
             inp_seq_ids_list: List[List[int]],
             inp_out_lens_list: List[Tuple[List[int], List[int]]], 
-            cost_table: CostTable, remaining_decode_flops_list: List[float]):
+            cost_table: CostTable, remaining_decode_flops_list: List[float],
+            inp_model_ids_list: List[List[int]]):
         # for model, inp_out_lens in zip(model_list, inp_out_lens_list):
         # for i in range(len(self.model_list)):
         #     model = self.model_list[i]
         #     inp_out_lens = inp_out_lens_list[i]
         #     remaining_decode_flops = remaining_decode_flops_list[i]
         #     model.update_inp_out_seqlens(*inp_out_lens, cost_table, remaining_decode_flops)
-        for model, inp_seq_ids, inp_out_lens, remaining_decode_flops in \
-            zip(self.model_list,inp_seq_ids_list,inp_out_lens_list,remaining_decode_flops_list):
+        for model, inp_seq_ids, inp_out_lens, remaining_decode_flops, inp_model_ids in \
+            zip(self.model_dict.values(),inp_seq_ids_list,inp_out_lens_list,remaining_decode_flops_list,inp_model_ids_list):
             model.update_inp_out_seqlens(*inp_out_lens, inp_seq_ids, cost_table, remaining_decode_flops)
+            model.input_model_ids = inp_model_ids
 
 
     def print_model_list(self):
-        print(f"model_list: {[str(model) for model in self.model_list]}")
+        print(f"model_list: {[(str(model), model.model_id, model.get_base_model_ids()) for model in self.model_dict.values()]}")
 
 
 
@@ -1700,7 +3375,8 @@ class MyModelSystem:
         check_gap: int, sort_input: bool,
         last_stage_exec_plans: List[MyExecPlan],
         cost_table: CostTable,
-        tot_gpu_num = 4, byte_per_gpu=80*(1024**3))->List[MyExecPlanGroup]:
+        tot_gpu_num = 4, byte_per_gpu=80*(1024**3),
+        top_k=float('inf'),)->List[MyExecPlanGroup]:
         """
             Get the candidate plan groups following the last_stage_exec_plans.
             NOTE: here we only ensure the validity of the candidate plan groups;
@@ -1709,6 +3385,10 @@ class MyModelSystem:
         # running_model_ids are models running in this exec stage
         tot_plan_groups = [[]]
         new_plan_groups = [[]]
+
+        uniq_exec_plan_mapping = dict()
+        # stores the best plan group given a set of models and the GPU num to use --> to add pruning in the plan group generation process
+        good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]] = dict()
 
         # we first divide the unfinished model into different levels
         self.get_all_level_models()
@@ -1728,7 +3408,7 @@ class MyModelSystem:
             for model in cand_models:
                 exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline)
                 exec_plans_list.append(exec_plans)
-                # print(f"can exec_plans: {[str(plan) for plan in exec_plans]}")
+                print(f"model finished? {model.is_finished()}, model_id: {model.get_base_model_ids()}, can exec_plans: {[str(plan) for plan in exec_plans]}")
 
             # print(f"New Round get_candidate_plan_groups ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
@@ -1738,10 +3418,16 @@ class MyModelSystem:
 
                 runnable_exec_plans_list = self.get_runnable_plans_from_cand_plans(cand_plan_group, cand_models, exec_plans_list)
 
+                # print(f"runnable_exec_plans_list:  ----------------------")
+                # for plans in runnable_exec_plans_list:
+                #     print(f"{len(plans)}, {[str(plan) for plan in plans]}")
+                
+                # print(f"root cand_plan_group: ------------------------")
+                # print(f"{len(cand_plan_group)}, {[str(plan) for plan in cand_plan_group]}")
                 
                 # 2. second combine exec plans for different models into a group
                 plan_groups = [cand_plan_group]
-                _append_exec_plan(plan_groups, runnable_exec_plans_list, 0, tot_gpu_num, byte_per_gpu)
+                _append_exec_plan(plan_groups, runnable_exec_plans_list, 0, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping)
                 # plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans) \
                 #             for plan_group in plan_groups if len(plan_group) > 0]
                 
@@ -1749,7 +3435,24 @@ class MyModelSystem:
                     # no new model is added to cand_plan_group
                     tot_plan_groups.extend(plan_groups)
                 else:
-                    tmp_new_plan_groups.extend(plan_groups[1:])
+                    # we first update the good_plan_group_dict
+                    print(f"the groups we found a round: ")
+                    for plan_group in plan_groups[1:]:
+                        print([str(plan) for plan in plan_group])
+                    good_plan_group_keys = [_update_good_plan_group_dict(
+                        cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
+                        plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
+                        ) for plan_group in plan_groups[1:]]
+                    good_plan_group_keys = [_ for _ in good_plan_group_keys if _ != None]
+                    to_compare = sorted([_[0] for _ in good_plan_group_dict.values()], reverse=True)[top_k-1] if top_k <= len(good_plan_group_dict) else -1
+                    good_plan_groups = [good_plan_group_dict[_][1].exec_plans for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]
+                    # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[_ for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]}")
+                    print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in _] for _ in good_plan_groups]}")
+                    # 
+                    # good_plan_groups = [_ for _ in good_plan_groups if len(_)!=0]
+                    tmp_new_plan_groups.extend(good_plan_groups)
+                    # 
+                    # tmp_new_plan_groups.extend(plan_groups[1:])
 
                 # print(f"tot_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tot_plan_groups]}")
                 # print(f"tmp_new_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tmp_new_plan_groups]}")
@@ -1774,9 +3477,12 @@ class MyModelSystem:
 
 
         # convert plan_groups to MyExecPlanGroup objects
-        plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
-                        check_gap=check_gap, sort_input=sort_input,) \
-                    for plan_group in tot_plan_groups if len(plan_group) > 0]
+        # plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
+        #                 check_gap=check_gap, sort_input=sort_input,) \
+        #             for plan_group in tot_plan_groups if len(plan_group) > 0]
+
+        plan_groups = [_[1] for _ in good_plan_group_dict.values()]
+
         return plan_groups
 
 
@@ -1883,11 +3589,38 @@ class MyModelSystem:
 
 
     def remaining_models_are_on_the_last_layer(self)->bool:
-        remaining_model_ids = [model.model_id for model in self.model_list if not model.is_finished()]
+        remaining_model_ids = [model_id for model_id, model in self.model_dict.items() if not model.is_finished()]
         output_model_num = sum([len(self.out_edge_dict[model_id]) for model_id in remaining_model_ids])
-        return (output_model_num == 0)
+        fused_model_num = sum([isinstance(self.model_dict[model_id], MyFusedModelInfor) for model_id in remaining_model_ids])
+        return (output_model_num == 0) and (fused_model_num == 0)
 
 
+
+
+
+
+def get_infor_given_seq_ids(
+        values, seq_ids_we_have: List[int], seq_ids_requested: List[int], default_value):
+    """
+        1. ``values`` containing the values of corresponding to the ``seq_ids_we_have``;
+        2. default_value: the value assigned to the requested seq ids which are not in seq_ids_we_have;
+    """
+    # we need to consider the case where the inp seq id is not the output of the model
+    # for example: a model after the chain summary, it depends on different model stages in the summary chain
+    #           the total inp seq ids will be the full set of inp seq ids, but they are outputs of different model stages
+    values = np.asarray(values)
+    seq_ids_we_have = np.asarray(seq_ids_we_have)
+    seq_ids_requested = np.asarray(seq_ids_requested)
+    # 
+    ret = np.full(len(seq_ids_requested), default_value, dtype=values.dtype)
+    inds = np.searchsorted(seq_ids_we_have, seq_ids_requested)
+    valid_indices1 = inds<len(seq_ids_we_have)
+    valid_indices2 = (seq_ids_we_have[inds[valid_indices1]] == seq_ids_requested[valid_indices1])
+    inds = inds[valid_indices1][valid_indices2]
+    ret_inds = np.arange(len(ret))[valid_indices1][valid_indices2]
+    ret[ret_inds] = np.asarray(values)[inds]
+    # 
+    return ret
 
 
 
@@ -1957,6 +3690,7 @@ def _get_possible_exec_plans(
     # 1. do not need to generate exec plans for finished models
     # if model.left_flops_per_token == 0:
     if model.is_finished():
+        print(f"model: {model}, model is finished")
         return exec_plans
     
     
@@ -2018,6 +3752,9 @@ def _get_possible_exec_plans(
                         param_byte_per_comp_gpu, param_byte_per_cache_gpu,
                         gpu_cache_byte_per_block, infer_args, tot_gpu_mem_byte=byte_per_gpu)
                     
+                    if isinstance(model, MyFusedModelInfor):
+                        exec_plan = MyVerticalFusedExecPlan(model, exec_plan)
+                    
                     # print(f"gen an exec plan: {str(exec_plan)}")
 
                     # check whether exec_plan is valid
@@ -2038,6 +3775,9 @@ def _get_possible_exec_plans(
                                 num_worker, wld_degree, cache_gpu_num, mem_per_comp_gpu, dp_size,
                                 param_byte_per_comp_gpu, param_byte_per_cache_gpu,
                                 gpu_cache_byte_per_block, infer_args, tot_gpu_mem_byte=byte_per_gpu)
+                            
+                            if isinstance(model, MyFusedModelInfor):
+                                exec_plan = MyVerticalFusedExecPlan(model, exec_plan)
                             
                             # do not need to call is_valid_exec_plan for dp_size
                             exec_plans.append(exec_plan)
@@ -2412,13 +4152,218 @@ def is_valid_exec_plan_combination(exec_plans: List[MyExecPlan], tot_gpu_num, by
 
 
 
+def _can_be_fused_vertically_linear_dependency(plan_group: List[MyExecPlan], to_fuse: MyExecPlan):
+    """
+        The condition to do vertical fusion:
+        1. linear dependency: model 1 -> model 2.
+        2. about the same model, has the same exec setting.
+        3. the models in both plans have not been started.
+    """
+
+    to_fuse_inp_model_ids = to_fuse.model.input_model_ids
+    for plan_i, plan in enumerate(plan_group):
+        if (len(to_fuse_inp_model_ids) == 1) and (to_fuse_inp_model_ids[0] == plan.get_base_model_ids()[-1]):
+            # to_fuse directly depend on the last exec_plan in the plan (which may be fused)
+            if plan.model.get_name() == to_fuse.model.get_name():
+                # the two plan are about the same model
+                if plan.get_key() == to_fuse.get_key():
+                    # the two plan has the same exec setting
+                    
+                    # check whether these models have been started
+                    if plan.models_not_started() and to_fuse.models_not_started():
+                        # we can fuse them vertically
+
+                        print(f"in generate fused model:\n")
+                        print([(_.model_id, _) for _ in plan.get_base_models()+[to_fuse.model]])
+
+                        to_fuse_models = sorted(plan.get_base_models()+[to_fuse.model], \
+                                                key=lambda model: model.model_id)
+                        
+                        print([(_.model_id, _) for _ in to_fuse_models])
+
+                        fused_model = MyFusedModelInfor(to_fuse_models)
+                        fused = MyVerticalFusedExecPlan(fused_model, to_fuse)
+                        return [plan_group[:plan_i]+[fused]+plan_group[plan_i+1:]]
+    return []
 
 
-def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_per_gpu):
+
+
+
+
+def _get_path_key(plan_group:List[MyExecPlan], exec_plan):
+    """
+        Get the information of all models that exec_plan depends directly or indirectly on in the current plan_group.
+    """
+    inp_model_ids = sorted(exec_plan.model.input_model_ids)
+    key = list()
+    for inp in inp_model_ids:
+        for plan in plan_group:
+            if (inp == plan.model.model_id) or (inp in plan.model.get_base_model_ids()):
+                # key.append((inp, tuple(plan.model.get_base_model_ids()), plan.get_key() ))
+                # NOTE: it seems we do not need to store the model_id itself in the key
+                key.append(( tuple(plan.model.get_base_model_ids()), plan.get_key() ))
+                break
+    # add the key part for exec_plan
+    # key.append(( exec_plan.model.model_id, tuple(exec_plan.model.get_base_model_ids()), exec_plan.get_key() ))
+    key.append(( tuple(exec_plan.model.get_base_model_ids()), exec_plan.get_key() ))
+    return tuple(key)
+
+
+
+def _update_good_plan_group_dict(
+        cost_table: CostTable,
+        check_gap: int, sort_input: bool,
+        last_stage_exec_plans: List[MyExecPlan],
+        plan_group: List[MyExecPlan], good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]], 
+    ) -> Optional[Tuple[List[int], int]]:
+    """
+        Return None if the given plan group is not good enough, else return the input plan_group key.
+    """
+
+    # 1. get MyExecPlanGroup based on plan_group
+    group_obj = MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
+                    check_gap=check_gap, sort_input=sort_input,)
+    
+    # 2. get key in good_plan_group_dict
+    # NOTE: here we regard fused models and base models as the same if their base model sets are the same
+    # NOTE: 更保守一点的话，感觉可以把 fused model和base model 不认为包含的base model相同就是初始状态相同，这个应该也OK。
+    # NOTE：两种都可以试试，感觉？先试试只要base model相同就相同的版本吧，先这么试试吧，实在不行也可以每个几轮prune一次，而不是每一轮都prune一次。
+    base_model_ids = sorted(np.concatenate([exec_plan.model.get_base_model_ids() for exec_plan in group_obj.exec_plans]))
+    tot_gpu_num = get_tot_worker_num(group_obj.exec_plans)
+    key = ( tuple(base_model_ids),  tot_gpu_num)
+
+    # 3. check whether this plan group is good
+    ret = key
+    if key not in good_plan_group_dict:
+        good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
+    else:
+        if (group_obj.get_throughput() > good_plan_group_dict[key][0]) or \
+            ( (group_obj.get_throughput() == good_plan_group_dict[key][0]) \
+             and (len(group_obj.exec_plans) < len(good_plan_group_dict[key][1].exec_plans)) ):
+            # if 1. the throughput of the new group obj is larger OR 
+            # 2. (2.1) their throughputs are the same and (2.2) the new group has fewer exec plans, 
+            # i.e., we prefer fusing models rather than model-level pipeline parallelism.
+            good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
+        else:
+            ret = None
+
+    return ret
+
+
+
+
+
+def _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids: List[int], model_ids_fused: List[int], fused_model_inp_base_model_ids: List[int]):
+    """
+        NOTE: we assume after vertical fusion, 
+            the input models of the fused model is the same as the input models of the FIRST BASE model in the fused model.
+        INPUT:
+            1. to_fuse_inp_base_model_ids: the input base model ids of the model (may already be a fused model) to be fused.
+            2. model_ids_fused: the base model ids of the fused model we want to add more models to.
+            3. fused_model_inp_base_model_ids: the input base model ids of the fused model we want to add more models to.
+    """
+    cond1 = (len(to_fuse_inp_base_model_ids) == 1) and \
+        (to_fuse_inp_base_model_ids[0] == model_ids_fused[-1])
+    # cond2 is wrong, because we may fuse some models in the chain starting from the middle of the chain
+    # cond2 = (sorted(to_fuse_inp_base_model_ids) == sorted(model_ids_fused))
+    cond2 = sorted(to_fuse_inp_base_model_ids) == sorted(fused_model_inp_base_model_ids+model_ids_fused)
+    return (cond1 or cond2)
+
+
+
+def _can_be_fused_vertically(plan_group: List[MyExecPlan], to_fuse: MyExecPlan, uniq_exec_plan_mapping):
+    """
+        The condition to do vertical fusion:
+        1. supported dependency:
+            (a) linear dependency: model 1 -> model 2.
+            (b) model i depends on all models before it: (model 1, ..., model i-1) -> model i.
+        2. about the same model, has the same exec setting.
+        3. the models in both plans have not been started.
+    """
+
+    # NOTE: to fuse successfully, plan and to_fuse must not have been started, so to_fuse.model.input_model_ids == to_fuse.model.input_base_model_ids here
+    # NOTE: in the case where we fuse some models in the beginning before the search, the above assumption does not hold
+    # NOTE: ==> we check whether the first base model of to_fuse can be fused to a plan, if can, then even if to_fuse is a fused model, all its base models can be fused
+    # successfully
+    # to_fuse_inp_model_ids = to_fuse.model.input_model_ids
+    to_fuse_inp_base_model_ids = to_fuse.get_base_models()[0].inp_base_model_ids
+    for plan_i, plan in enumerate(plan_group):
+        # cond1 = (len(to_fuse_inp_model_ids) == 1) and \
+        #     (to_fuse_inp_model_ids[0] == plan.get_base_model_ids()[-1])
+        # cond2 = (sorted(to_fuse_inp_model_ids) == sorted(plan.get_base_model_ids()))
+        # # if (len(to_fuse_inp_model_ids) == 1) and (to_fuse_inp_model_ids[0] == plan.get_base_model_ids()[-1]):
+        # if cond1 or cond2:
+        print(f"in _can_be_fused_vertically: to_fuse_inp_model_ids: {to_fuse_inp_base_model_ids}, to_fuse_base_model_ids: {to_fuse.get_base_model_ids()}, model_ids_fused: {plan.get_base_model_ids()}")
+        if _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids, 
+                                         model_ids_fused=plan.get_base_model_ids(), 
+                                         fused_model_inp_base_model_ids=plan.get_base_models()[0].inp_base_model_ids):
+            # to_fuse directly depend on the last exec_plan in the plan (which may be fused)
+            if plan.model.get_name() == to_fuse.model.get_name():
+                # the two plan are about the same model
+                if plan.get_key() == to_fuse.get_key():
+                    # the two plan has the same exec setting
+                    
+                    # check whether these models have been started
+                    if plan.models_not_started() and to_fuse.models_not_started():
+                        # we can fuse them vertically
+
+                        # print(f"in generate fused model:\n")
+                        # print([(_.model_id, _) for _ in plan.get_base_models()+[to_fuse.model]])
+
+                        # to_fuse_models = sorted(plan.get_base_models()+[to_fuse.model], \
+                        #                         key=lambda model: model.model_id)
+                        # NOTE: seems here we should not sort the base models but keep them in the dependency order
+                        # to_fuse_models = plan.get_base_models()+[to_fuse.model]
+                        # NOTE: to support the case where we fuse some models at the beginning before the search process
+                        to_fuse_models = plan.get_base_models()+to_fuse.get_base_models()
+                        
+                        # print([(_.model_id, _) for _ in to_fuse_models])
+
+                        # -------------------------------------------------------------------------------------------------
+                        # check whether there is available fused exec plan to reuse
+                        path_key = _get_path_key(plan_group, plan)[:-1]
+                        path_key = path_key+( (tuple(plan.model.get_base_model_ids()+to_fuse.model.get_base_model_ids()), to_fuse.get_key() ) ,)
+                        # print(f"plan group: {[str(plan) for plan in plan_group]}")
+                        # print(f"path_key: {path_key}")
+                        fused = None
+                        if path_key in uniq_exec_plan_mapping:
+                            # print(f"reuse fused exec plan")
+                            fused = uniq_exec_plan_mapping[path_key]
+                            # print(f"Reuse exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+                        else:
+                            # print(f"generate new exec plan")
+                            fused_model = MyFusedModelInfor(to_fuse_models)
+                            fused = MyVerticalFusedExecPlan(fused_model, to_fuse)
+                            uniq_exec_plan_mapping[path_key] = fused
+                            # print(f"New exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+
+                        # -------------------------------------------------------------------------------------------------
+                                        
+                        # fused_model = MyFusedModelInfor(to_fuse_models)
+                        # fused = MyVerticalFusedExecPlan(fused_model, to_fuse)
+                        return [plan_group[:plan_i]+[fused]+plan_group[plan_i+1:]]
+    return []
+
+
+
+
+
+
+
+
+
+
+
+
+# support vertical fusion of models
+def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping):
     '''
     Get all the possible exec plans with depth-first search.
     The initial plan_groups is [[]], i.e., containing a group with no exec plan.
     All plan groups are valid if they are put into plan_groups and returned.
+    NOTE:
+        1. here we use good plen group to add pruning the plan group generation process.
     '''
     # stop condition
     if depth_i == len(exec_plans_list):
@@ -2427,20 +4372,42 @@ def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_p
     new_plan_groups = list()
     for plan_group in plan_groups:
         # try to append the exec plans for the current model (depth_i) to the plan group
-        if get_tot_worker_num(plan_group) == tot_gpu_num:
-            # no model can be added
-            continue
+
         for exec_plan in exec_plans_list[depth_i]:
-            tmp_plan_group = plan_group + [exec_plan]
+
+            # check whether we need to copy a new exec plan
+            path_key = _get_path_key(plan_group, exec_plan)
+            # print(f"path_key: {path_key},    exec_plan: {str(exec_plan)}")
+            exec_plan_to_use = None
+            if path_key in uniq_exec_plan_mapping:
+                exec_plan_to_use = uniq_exec_plan_mapping[path_key]
+                # print(f"Reuse exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+            else:
+                # exec_plan_to_use = copy.deepcopy(exec_plan)
+                exec_plan_to_use = exec_plan.copy_the_plan()
+                uniq_exec_plan_mapping[path_key] = exec_plan_to_use
+                # print(f"New exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+
+
+            # support vertical fusion
+            # check whether this plan can be fused vertically with its inp exec plan
+            new_plan_groups = new_plan_groups+_can_be_fused_vertically(plan_group, exec_plan_to_use, uniq_exec_plan_mapping)
+
+            if get_tot_worker_num(plan_group) == tot_gpu_num:
+                # no model can be added
+                continue
+
+            tmp_plan_group = plan_group + [exec_plan_to_use]
             # check valid
-            # print(f"plan group: {[str(_) for _ in tmp_plan_group]}")
+            # print(f"uniq_exec_plan_mapping: {[(k,str(v)) for k,v in uniq_exec_plan_mapping.items()]}")
+            # print(f"checking plan group: {[str(_) for _ in tmp_plan_group]}")
             if is_valid_exec_plan_combination(tmp_plan_group, tot_gpu_num, byte_per_gpu):
                 new_plan_groups.append(tmp_plan_group)
 
                 # print(f"valid")
 
     plan_groups.extend(new_plan_groups)
-    _append_exec_plan(plan_groups, exec_plans_list, depth_i+1, tot_gpu_num, byte_per_gpu)
+    _append_exec_plan(plan_groups, exec_plans_list, depth_i+1, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping)
 
 
 
@@ -2516,7 +4483,8 @@ def get_one_stage_exec_plans_sorted(
         last_stage_exec_plans: List[MyExecPlan],
         cost_table: CostTable,
         model_sys: MyModelSystem, 
-        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3)):
+        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
+        top_k=float('inf')):
     '''
     Get a set of exec plans which can work corrently on the given multi-GPU environment.
     '''
@@ -2537,24 +4505,27 @@ def get_one_stage_exec_plans_sorted(
     
     # allow models with dependency to be selected into the same group
     plan_groups = model_sys.get_candidate_plan_groups(
-        gen_execplans_baseline, check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num, byte_per_gpu)
+        gen_execplans_baseline, check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num, byte_per_gpu, top_k)
     
 
-    print(f"in get_one_stage_exec_plans_sorted: the plan groups we generated: ")
-    for plan_group in plan_groups:
-        print(f"{len(plan_group)}, {str(plan_group)}")
+    # print(f"in get_one_stage_exec_plans_sorted: the plan groups we generated: ")
+    # for plan_group in plan_groups:
+    #     print(f"{len(plan_group)}, {str(plan_group)}")
 
 
-
+    # print(f"\nfinish plan group gen\n")
 
     # 2. delete plan_groups which do not occupy all comp gpus when there are models not executed
     # also for cases where there are idle comp resources, check whether increase comp resources can improve throughput, if yes, delete it.
     # TODO (jingzhi) it seems not_finished_model_num is not used
     # not_finished_model_num = sum([not model.is_finished() for model in model_list])
-    not_finished_model_num = model_sys.get_not_finished_model_num()
+    not_finished_model_num = model_sys.get_not_finished_base_model_num()
     useful_plan_groups = list()
     idle_comp_plan_groups = dict() # {models executed: (best_throughput, best_plan_group)}
     # comp_throughput_given_plan_groups(plan_groups, gpu_name)
+
+
+    # print(f"\nfinish plan group gen 2\n")
 
     # 2.1 first delete inefficient plan groups for each possible set of involved models
     for plan_group in plan_groups:
@@ -2562,6 +4533,9 @@ def get_one_stage_exec_plans_sorted(
         # print(f"check redundancy 1 of: {str(plan_group)}")
 
         key = plan_group.get_model_states_before_infer_stage()
+
+        # print(f"before key: {key}")
+
         if key not in idle_comp_plan_groups:
             # print(f"new key (before infer stage): {key}")
             idle_comp_plan_groups[key] = (plan_group.get_throughput(), plan_group)
@@ -2569,6 +4543,9 @@ def get_one_stage_exec_plans_sorted(
             # print(f"old key (before infer stage): {key}")
             if plan_group.get_throughput() > idle_comp_plan_groups[key][0]:
                 idle_comp_plan_groups[key] = (plan_group.get_throughput(), plan_group)
+
+
+    # print(f"\nfinish plan group gen 3\n")
 
     plan_groups: List[MyExecPlanGroup] = [plan_group for _, plan_group in idle_comp_plan_groups.values()]
     idle_comp_plan_groups = dict() # {models executed: (best_throughput, best_plan_group)}
@@ -2580,7 +4557,7 @@ def get_one_stage_exec_plans_sorted(
 
 
         # 1. if there are models available but the comp gpus are not fully utilized
-        if (not_finished_model_num > len(plan_group)) and (get_tot_worker_num(plan_group.exec_plans)<tot_gpu_num):
+        if (not_finished_model_num > plan_group.get_involved_base_model_num()) and (get_tot_worker_num(plan_group.exec_plans)<tot_gpu_num):
             continue
 
         # print(f"check redundancy 2 -- fully resource utilization!")
@@ -2596,6 +4573,7 @@ def get_one_stage_exec_plans_sorted(
         # the key of a plan group now is [(model_i name, model_i remaining seqlens)]
         key = plan_group.get_model_states_after_infer_stage(cost_table)
         
+        # print(f"after key: {key}")
         
         # print(f"key of plan group: {key}")
         # if key in idle_comp_plan_groups:
@@ -2626,6 +4604,8 @@ def get_one_stage_exec_plans_sorted(
         #     print(f"inefficient plan group: {str(plan_group)}")
 
     
+    # print(f"\nfinish plan group gen 5\n")
+
     # TODO (jingzhi) strange, the check below seems to be useless
     # 3. delete redundant plan_groups (in case there are models that are the same)
     # uniq_plan_groups_strs = set()
@@ -2784,6 +4764,7 @@ def get_one_stage_exec_plans_sorted_greedy_baseline_adapted_from_MuxServe(
 def get_total_model_flops(model_list: List[MyModelInfor], cost_table: CostTable):
     flops = 0
     for model in model_list:
+        assert not isinstance(model, MyFusedModelInfor)
         i = fake_scheduling.comp_flops_from_seqlens(
             model.inp_lens, model.out_lens, only_decode=False, cost_table=cost_table, 
             model_path=model.model_path, trust_remote_code=model.trust_remote_code, revision=model.revision)
@@ -2850,7 +4831,8 @@ def _get_best_model_schedule(
         curr_group_seq: MyExecPlanGroupSeq, 
         best_group_seq: MyExecPlanGroupSeq, 
         uniq_model_states: dict,
-        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3)):
+        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3),
+        top_k=float('inf'),):
     '''
     Input: 
         model_list: (model_name, flops_per_token, (layer_num, param_byte_per_layer, extra_param_byte)).
@@ -2863,8 +4845,8 @@ def _get_best_model_schedule(
         return
 
 
-    print(f"CURRENT PLAN GROUP SEQ: {str(curr_group_seq)}")
-    print(f"CURRENT BEST PLAN GROUP SEQ: {str(best_group_seq)}")
+    print(f"CURRENT PLAN GROUP SEQ: {str(curr_group_seq)}, {[[_.model.get_base_model_ids() for _ in plan_group.exec_plans] for plan_group in curr_group_seq.plan_group_seq if plan_group!=None]}")
+    print(f"CURRENT BEST PLAN GROUP SEQ: {str(best_group_seq)}, {[[_.model.get_base_model_ids() for _ in plan_group.exec_plans] for plan_group in best_group_seq.plan_group_seq if plan_group!=None]}")
 
 
 
@@ -2878,7 +4860,7 @@ def _get_best_model_schedule(
     if len(curr_group_seq.plan_group_seq) > model_sys.get_model_num():
         # assert False, f'{[model.left_flops_per_token for model in model_list]},'\
         #             f'{[[str(_) for _ in group] for group in curr_group_seq]}'
-        assert False, f'{[[str(_) for _ in group] for group in curr_group_seq]}'
+        assert False, f'{[[str(_) for _ in group.exec_plans] for group in curr_group_seq.plan_group_seq]}'
 
 
     print(f"finish step 1:      curr depth is within limit")
@@ -2907,7 +4889,8 @@ def _get_best_model_schedule(
     print(f"finish step 2")
 
     # 2. get the model states before the current infer stage, check its redundancy
-    model_states = model_sys.get_model_states()
+    # model_states = model_sys.get_model_states()
+    model_states = model_sys.get_base_model_states()
 
 
     if model_states in uniq_model_states:
@@ -2916,9 +4899,11 @@ def _get_best_model_schedule(
         # return
 
         # only when the latency of the current group seq is higher, we do not check it further
-        if curr_group_seq.get_tot_time() >= uniq_model_states[model_states]:
+        if curr_group_seq.get_tot_time() > uniq_model_states[model_states]:
 
             print(f"the state has been checked and curr is not the best choice for it")
+            print(f"model_states: {model_states}")
+            print(f"uniq_model_states: {uniq_model_states}")
 
             return
         else:
@@ -2941,7 +4926,7 @@ def _get_best_model_schedule(
         gen_execplans_baseline,
         check_gap, sort_input,
         curr_group_seq.get_last_stage_exec_plans(),
-        cost_table, model_sys, gpu_name, tot_gpu_num, byte_per_gpu)
+        cost_table, model_sys, gpu_name, tot_gpu_num, byte_per_gpu, top_k)
     # # ori_left_flops = [model.get_left_flops_per_token() for model in model_list]
     # # ori_left_seqlens = [model.get_remaining_seqlens() for model in model_list]
     # ori_inp_out_lens_list = [model.get_inp_out_seqlens() for model in model_list]
@@ -2949,6 +4934,8 @@ def _get_best_model_schedule(
     ori_inp_out_lens_list = model_sys.get_model_inp_out_lens()
     ori_remaining_decode_flops_list = model_sys.get_model_remaining_decode_flops()
     ori_inp_seq_ids_list = model_sys.get_model_inp_seq_ids()
+    ori_inp_model_ids_list = model_sys.get_model_inp_model_ids()
+    ori_model_sys = model_sys
 
     
     # 3.1 pruning rule: if using the highest throughput in plan_groups still cannot beat best_group_seq, skip all of them
@@ -2958,8 +4945,11 @@ def _get_best_model_schedule(
     # 按照各个阶段来对比throughput。最general的写法应该是这样的，但是感觉好复杂啊。可以按照一个model距离起始点的所有路径长度是否一致
     # 来对原始的system进行阶段分割。但是这样好像也没用，还是没法做原来的early pruning。还是简单对进入到最后一个阶段的plan group seq 
     # 进行early pruning吧。。。。。搜索算法之后可以想办法再优化。
+    tot_ori_remaining_decode_flops = sum([\
+        sum(flops) if isinstance(flops, list) else flops \
+         for flops in ori_remaining_decode_flops_list])
     if (model_sys.remaining_models_are_on_the_last_layer()) \
-        and ((sum(ori_remaining_decode_flops_list) / plan_groups[0].get_comp_throughput_only() \
+        and ((tot_ori_remaining_decode_flops / plan_groups[0].get_comp_throughput_only() \
               + curr_group_seq.get_tot_time()) >= best_group_seq.get_tot_time()):
         
         print(f"using the highest throughput in plan_groups still cannot beat best_group_seq")
@@ -2972,7 +4962,7 @@ def _get_best_model_schedule(
 
     # 4. try each candidate plan group and do depth-first search.
     for plan_group in plan_groups:
-        # print(f"plan_group: {plan_group}")
+        print(f"trying adding plan_group: {plan_group}, models are finished? {[plan.model.is_finished() for plan in plan_group.exec_plans]}")
         if len(plan_group) == 0:
             continue
 
@@ -2985,19 +4975,41 @@ def _get_best_model_schedule(
                  < best_group_seq.get_valid_throughput()):
             continue
 
+        # we first recover the ori model sys
+        model_sys = ori_model_sys
+        
         # update the remaining workload of all models after this stage
         # recover_model_state(model_list, ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+        
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
         model_sys.recover_model_state(
-            ori_inp_seq_ids_list,ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+            ori_inp_seq_ids_list,ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list,
+            ori_inp_model_ids_list)
+        
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
+        # we need to update model_sys as we may introduce fused model nodes
+        model_sys = model_sys.gen_new_model_sys_with_fused_models(
+            fused_model_list=plan_group.get_involved_fused_models())
+
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
+        print(f"plan_group model objects: {[(plan.model.model_id, plan.model) for plan in plan_group.exec_plans]}")
+
+        # check inp out len accuracy
+        model_sys.check_finish_states_accuracy()
+
         # comp_time = update_model_state(plan_group, gpu_name)
         plan_group.update_model_inp_out_lens(cost_table)
+
+        # check inp out len accuracy
+        model_sys.check_finish_states_accuracy()
+
         curr_group_seq.append_plan_group(plan_group)
         curr_group_seq.append_exec_time(plan_group.get_infer_stage_latency())
         _get_best_model_schedule(
             gen_execplans_baseline,
             check_gap, sort_input,
             cost_table,
-            model_sys, curr_group_seq, best_group_seq, uniq_model_states, gpu_name, tot_gpu_num, byte_per_gpu)
+            model_sys, curr_group_seq, best_group_seq, uniq_model_states, gpu_name, tot_gpu_num, byte_per_gpu, top_k)
         curr_group_seq.pop_one_stage()
     # print(f"best_group_seq: {best_group_seq}")
 
@@ -3080,7 +5092,7 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
         # return
 
         # only when the latency of the current group seq is higher, we do not check it further
-        if curr_group_seq.get_tot_time() >= uniq_model_states[model_states]:
+        if curr_group_seq.get_tot_time() > uniq_model_states[model_states]:
 
             print(f"the state has been checked and curr is not the best choice for it")
 
@@ -3170,7 +5182,7 @@ def _get_best_model_schedule_dispatcher(
         curr_group_seq: MyExecPlanGroupSeq, 
         best_group_seq: MyExecPlanGroupSeq, 
         uniq_model_states: dict,
-        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3)):
+        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), top_k=float('inf'),):
     '''
     Input: 
         model_list: (model_name, flops_per_token, (layer_num, param_byte_per_layer, extra_param_byte)).
@@ -3186,7 +5198,7 @@ def _get_best_model_schedule_dispatcher(
             curr_group_seq, 
             best_group_seq, 
             uniq_model_states,
-            gpu_name, tot_gpu_num, byte_per_gpu)
+            gpu_name, tot_gpu_num, byte_per_gpu, top_k)
     else:
         _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
             gen_execplans_baseline,
@@ -3378,12 +5390,16 @@ def get_model_info_objs(
         data_byte: int,
         inp_lens: List[int],
         model_paths: List[str], 
+        inp_seq_ids_dict: Dict[int, int],
         outlen_generator,
         # edge_dict: Dict[int, List[int]],
         sample_config: Tuple[float, float, float, float], 
         trust_remote_code:bool, revision:Optional[str] = None):
     '''
         Get the list of MyModelInfor objects for the given model paths.
+        NOTE: 
+            inp_seq_ids_dict: stores the ids of the inp seqs each model needs to answer. 
+                Support the chain summary case where each LLM stage has different number of inp reqs.
     '''
     # out_lens_dict = {model_path: output_length_sampler.sample_out_len_for_given_model(
     #         model=model_path[model_path.find('/')+1:], inp_lens=inp_lens) for model_path in set(model_paths)}
@@ -3402,6 +5418,7 @@ def get_model_info_objs(
                 data_byte, # the number of bytes to store a value in model weights or intermediate tensors
                 inp_lens,
                 out_lens=out_lens_dict[model_path],
+                inp_seq_ids=inp_seq_ids_dict[model_id]
                 # input_model_ids=edge_dict[model_id],
             ) for model_id, model_path in enumerate(model_paths)]
 
@@ -3450,19 +5467,19 @@ def get_best_model_schedule(
         check_gap: int, sort_input: bool,
         model_paths: List[str], 
         # 
-        num_prompts, inp_generator, inp_merger, outlen_generator,
+        num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
         # 
         out_edge_dict: Dict[int, List[int]],
         sample_config: Tuple[float, float, float, float],
         trust_remote_code:bool=True, revision:Optional[str] = None,
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
         data_byte=2,
-        max_group_seq_num=float('inf')):
+        max_group_seq_num=float('inf'), top_k=float('inf'), similar_threshold: float=0.1):
     """
         NOTE: ``inp_generator``, ``inp_merger``, ``outlen_generator`` are 3 functions about model inp/out lens.
     """
 
-    global _MAX_SEQ_NUM, _CHECKED_SEQ_NUM
+    global _MAX_SEQ_NUM, _CHECKED_SEQ_NUM, _MODEL_ID
     _MAX_SEQ_NUM = max_group_seq_num
     _CHECKED_SEQ_NUM = 0
 
@@ -3480,23 +5497,41 @@ def get_best_model_schedule(
     # 3.  initialize model info objects and the model system object
     model_list: List[MyModelInfor] = get_model_info_objs(
         cost_table,
-        data_byte, inp_lens, model_paths, outlen_generator, sample_config, trust_remote_code, revision)
+        data_byte, inp_lens, model_paths, inp_seq_ids_dict, outlen_generator, sample_config, trust_remote_code, revision)
     
     model_sys = MyModelSystem(model_list=model_list, out_edge_dict=out_edge_dict, 
-                              cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator)
+                              cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator,
+                              need_correct_inp_out_lens=True)
+
+    _MODEL_ID = len(model_list)
+    # 1. correct the model ori remaining decoding flops
+    # 2. set the inp_base_model_ids
+    for model in model_sys.model_dict.values():
+        model.ori_tot_remaining_decode_flops = model.remaining_decode_flops
+        model.inp_base_model_ids = model.input_model_ids
+
+    # 3. directly fuse some models vertically to reduce the total model number in the system for faster and better search
+    model_sys = model_sys.fuse_similar_models_in_a_chain(
+            tot_gpu_num, byte_per_gpu, cost_table,
+            check_gap, sort_input,
+            similar_threshold)
 
     total_flops = get_total_model_flops(model_list, cost_table)
     curr_group_seq = MyExecPlanGroupSeq(total_flops, [], [])
     best_group_seq = MyExecPlanGroupSeq(total_flops, [None], [float('inf')])    
 
+
+    time_before_search = time.perf_counter()
+
     _get_best_model_schedule_dispatcher(
         search_method_baseline,
         gen_execplans_baseline, 
         check_gap, sort_input,
-        cost_table, model_sys, curr_group_seq, best_group_seq, dict(), gpu_name, tot_gpu_num, byte_per_gpu)
+        cost_table, model_sys, curr_group_seq, best_group_seq, dict(), gpu_name, tot_gpu_num, byte_per_gpu, top_k)
     
     time2 = time.perf_counter()
     print(f"Total search time: {time2 - time1}")
+    print(f"Total time for preparation before search: {time_before_search - time1}")
     print(f"Best group seq: {str(best_group_seq)}")
 
     return best_group_seq
@@ -3637,6 +5672,47 @@ def get_dependent_exec_plans_for_each_plan(
 
 
 
+def get_arxiv_data_set_chunks(file_name: str, chunk_size: int):
+    """
+        Just used to check the dataset used in Parrot's experiments.
+    """
+    from langchain.document_loaders import TextLoader
+    from langchain.text_splitter import CharacterTextSplitter
+    from transformers import AutoTokenizer
+    # 
+    loader = TextLoader(f"../workloads/arxiv-march-2023/arxiv-sampled/{file_name}.txt")
+    docs = loader.load()
+    # 
+    tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    # 
+    text_splitter = CharacterTextSplitter.from_huggingface_tokenizer(
+        tokenizer=tokenizer,
+        chunk_size=chunk_size,
+        chunk_overlap=0,
+        separator=" ",
+    )
+    split_docs = text_splitter.split_documents(docs)
+    # 
+    return len(split_docs) # [doc.page_content for doc in split_docs]
+
+
+
+'''
+res = dict()
+for i in range(10):
+    res[i] = list()
+    for bs in [512, 1024, 1536, 2048]:
+        chunk_num = get_arxiv_data_set_chunks(f"article_{i}", bs)
+        for ol in [25, 50, 75, 100]:
+            res[i].append(chunk_num*ol)
+
+
+            
+'''
+
+
+
+
         
 '''
 我们的整体计算逻辑如下：
@@ -3706,6 +5782,9 @@ if __name__ == "__main__":
     # inp_generator = get_inplens
     # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
     # outlen_generator = output_length_sampler.sample_out_len_for_given_model
+    # inp_seq_ids_dict = defaultdict(list)
+    # inp_seq_ids_dict.update({i:list(range(req_num)) for i in range(len(model_paths))})
+
 
     # inp/out len generator functions for the map-reduce or chain summary scenario
     # map-reduce
@@ -3718,20 +5797,124 @@ if __name__ == "__main__":
     # model_paths = model_paths + ['NousResearch/Llama-2-13b-hf']
     # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
     # # 
-    # inp_generator = lambda : [512]*req_num
+    # inp_generator = lambda req_num: [chunk_size]*req_num
     # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
     # outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+    # inp_seq_ids_dict = defaultdict(list)
+    # inp_lens = np.asarray(inp_generator(req_num))
+    # inp_seq_ids_dict.update({i:list(range(sum(inp_lens>chunk_size*(i-1)))) for i in range(len(model_paths)-1)})
+    # inp_seq_ids_dict.update({len(model_paths)-1:list(range(req_num))})
+
 
 
     # # chain summary
-    req_num = 1000
+    req_num = 100
     chunk_size = 512
-    model_paths = ['NousResearch/Llama-2-13b-hf'] * (20000 // chunk_size)
-    out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
-    # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
-    inp_generator = lambda : [512]*req_num
+    max_length = chunk_size*5 # 20000
+    model_paths = ['NousResearch/Llama-2-13b-hf'] * (max_length // chunk_size)
+    print(f"model_paths: {model_paths}")
+    # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+    out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+    inp_generator = lambda req_num: [chunk_size]*req_num
     inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
     outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+    inp_seq_ids_dict = defaultdict(list)
+    # inp_lens = np.asarray(inp_generator(req_num))
+    inp_lens = np.asarray([chunk_size]*int(0.2*req_num)+[2*chunk_size]*int(0.2*req_num)\
+                          +[3*chunk_size]*int(0.2*req_num)+[4*chunk_size]*int(0.2*req_num)\
+                            +[5*chunk_size]*int(0.2*req_num))
+    inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
+    print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+    # add another model after the chain summary
+    model_paths.append('NousResearch/Llama-2-7b-hf')
+    out_edge_dict[3].append(5)
+    out_edge_dict[4] = [5]
+    inp_seq_ids_dict[5] = sorted(set(inp_seq_ids_dict[3] + inp_seq_ids_dict[4]))
+
+    print(f"\nreal model_paths: {model_paths}")
+    print(f"\nreal out_edge_dict: {out_edge_dict}")
+    print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+
+
+
+    # # chain summary
+    req_num = 100
+    chunk_size = 512
+    max_length = chunk_size*50 # 20000
+    model_paths = ['NousResearch/Llama-2-13b-hf'] * (max_length // chunk_size)
+    print(f"model_paths: {model_paths}")
+    # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+    out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+    inp_generator = lambda req_num: [chunk_size]*req_num
+    inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+    outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+    inp_seq_ids_dict = defaultdict(list)
+    # inp_lens = np.asarray(inp_generator(req_num))
+    inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
+    inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
+    print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+
+    # add another chain in parallel with the first chain
+    first_chain_len = len(model_paths)
+    model_paths.extend(['NousResearch/Llama-2-7b-hf'] * (max_length // chunk_size))
+    print(f"model_paths: {model_paths}")
+    # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+    out_edge_dict.update({i:[i+1] for i in range(first_chain_len, len(model_paths)-1)})
+    # inp_generator = lambda req_num: [chunk_size]*req_num
+    # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+    # outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+    # inp_seq_ids_dict = defaultdict(list)
+    # inp_lens = np.asarray(inp_generator(req_num))
+    inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
+    inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*(i-first_chain_len))))) for i in range(first_chain_len,len(model_paths))})
+    print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+
+    print(f"\nreal model_paths: {model_paths}")
+    print(f"\nreal out_edge_dict: {out_edge_dict}")
+    print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+
+
+
+
+
+
+
+
+
+
+    # # # 一组简单的测试
+    # req_num = 20
+    # chunk_size = 512
+    # # max_length = chunk_size*5 # 20000
+    # model_paths = ['NousResearch/Llama-2-13b-hf']
+    # print(f"model_paths: {model_paths}")
+    # # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+    # # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+    # out_edge_dict = {}
+    # inp_generator = lambda req_num: [chunk_size*5]*req_num
+    # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+    # outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+    # inp_seq_ids_dict = defaultdict(list)
+    # # inp_lens = np.asarray(inp_generator(req_num))
+    # inp_lens = np.asarray([2*chunk_size]*req_num)
+    # inp_seq_ids_dict.update({i:list(range(req_num)) for i in range(len(model_paths))})
+    # print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+
+
+    # print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+
+    # print(f"\nreal model_paths: {model_paths}")
+    # print(f"\nreal out_edge_dict: {out_edge_dict}")
+    # print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+
+
+
+
+
+
 
 
 
@@ -3747,13 +5930,15 @@ if __name__ == "__main__":
         check_gap,
         sort_input,
         model_paths, 
-        num_prompts=req_num, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        num_prompts=req_num, inp_seq_ids_dict=inp_seq_ids_dict, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         out_edge_dict=out_edge_dict,
         sample_config=(1, 1, -1, 0),
         trust_remote_code=True, revision=None,
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
         data_byte=2,
         max_group_seq_num=100, # float('inf'),
+        top_k=100, 
+        similar_threshold=0.1
     )
 
 

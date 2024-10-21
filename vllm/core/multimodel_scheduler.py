@@ -54,7 +54,23 @@ class LLM_COMMUNICATOR:
                 this variable will be RESET every time the model is restarted.
             5. in ``in_edge_dict_with_dummy_inp_nodes``, we use NEGATIVE model_ids to represent DUMMY inp nodes.
     """
-    def __init__(self, model_num: int, in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]]):
+    def __init__(
+            self, model_num: int, 
+            in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]],
+            # 
+            base_model_ids_dict: Dict[int, List[int]],
+            inp_req_ids: Dict[int, Dict[int, List[int]]],
+            out_req_id_mapping: Dict[int, Dict[int, Dict[int, Tuple[int, int]]]],
+            new_out_req_part_num: Dict[int, int],
+            independent_srcs: Dict[int, bool],
+            ):
+        """
+            NOTE:
+                1. The input parameters: 
+                    in_edge_dict_with_dummy_inp_nodes, inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs are all
+                    about original base models.
+                2. model_num: the number of models in the system which may contain fused models
+        """
         # prepare a request pipe for each model in the LLM system
         # the output may be str or List[int] (i.e., token ids directly); we also record the seq id of each seq
         # self.output_pool: Dict[int, Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]] = {model_id: list() for model_id in range(model_num)}
@@ -72,12 +88,65 @@ class LLM_COMMUNICATOR:
         self._unavailable_req_nums: Dict[int, int] = dict()
         self._ungened_out_req_nums: Dict[int, int] = dict()
 
+        
+        # ----------------- support fused models (horizontal and vertical fusion) ----------------------------------------------------
+        
+        # {fused_model_id: [base model ids]}
+        self.base_model_ids_dict: Dict[int, List[int]] = base_model_ids_dict
+
+        # store the req ids to be fetched from each inp model {to_model_id: {from_model_id: req_ids}}
+        # NOTE: not every model has information stored in this dict, 
+        # e.g., the models taking in all reqs from a from_model; the models which will process the reqs from a from_model before doing inference
+        # init at the beginning
+        # NOTE: req_ids is a set
+        self.inp_req_ids: Dict[int, Dict[int, List[int]]] = inp_req_ids
+
+        # store they way to reorganize out reqs from a model {model_id: {out_req_id: (new_out_req_id, ind)}}
+        # NOTE: not every model has information stored in this dict, 
+        # this is only used in the case of horizontal fusion, e.g., map reduce, where we different req ids are supporsed to be concat to be a new req
+        # init at the beginning
+        self.out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]] = out_req_id_mapping
+        # stores how many ori out req can constitute a new out req {model_id: {new_out_req_id: tot_part_num}}
+        self.new_out_req_part_num: Dict[int, Dict[int, int]] = new_out_req_part_num
+        # stores the out reqs before merge them into new out reqs if necessary {model_id: {new_out_req_id: (#available out parts, )}}
+        self._meta_output_pool: Dict[int, Union[Dict[int, Tuple[int, List[str]]], Dict[int, Tuple[int, List[List[int]]]]]] = dict()
+        self._init_meta_output_pool()
+
+        # stores whether a base model's input sources are independent, if independent, they will not be fused before inference
+        self._independent_srcs: Dict[int, bool] = independent_srcs
+
+        # used for the fused models, to store currently each req belongs to which base model: {fused_model_id: {req_id: base_model_id}}
+        self.out_req_model_id_mapping: Dict[int, Dict[int, int]] = defaultdict(dict)
+
+
         # we need two kinds of locks: 
         # (1) lock for adding reqs to output_pool,
         # (2) lock for fetching reqs.
         # NOTE: for dummpy inp nodes, their model ids are negative numbers
+        # NOTE: one lock for each model (base model or fused model)
         self._add_req_locks: List[Lock] = [Lock() for _ in range(model_num)]
         self._fetch_req_locks: List[Lock] = [Lock() for _ in range(model_num)]
+
+
+
+    def fuse_inp_srcs(self, src_seqs):
+        ret = src_seqs[0]
+        for src in src_seqs[1:]:
+            ret += src
+        return ret
+
+
+
+
+    def _init_meta_output_pool(self):
+        """
+            Init self._meta_output_pool according to self.out_req_id_mapping, self.new_out_req_part_num.
+        """
+        for model_id in self.new_out_req_part_num:
+            self._meta_output_pool[model_id] = dict()
+            for new_out_req_id, tot_part_num in self.new_out_req_part_num[model_id].items():
+                self._meta_output_pool[model_id][new_out_req_id] = [0, [None for _ in range(tot_part_num)]]
+    
 
 
 
@@ -130,6 +199,68 @@ class LLM_COMMUNICATOR:
 
 
 
+
+    def _process_outputs(self, model_id: int, seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]):
+        """
+            Process the outputs, e.g., concat different ori seqs into new out seqs.
+            May be called when horizontally fusing models, e.g., Map-reduce Summary.
+        """
+        ret = list()
+        for req_id, req_content in seqs:
+            new_out_id, ind = self.out_req_id_mapping[model_id][req_id]
+            self._meta_output_pool[model_id][new_out_id][1][ind] = req_content
+            self._meta_output_pool[model_id][new_out_id][0] = self._meta_output_pool[model_id][new_out_id][0] + 1
+            if self._meta_output_pool[model_id][new_out_id][0] == len(self._meta_output_pool[model_id][new_out_id][1]):
+                # this new out req is ready
+                new_out_content = self.fuse_inp_srcs(self._meta_output_pool[model_id][new_out_id][1])
+                ret.append((new_out_id, new_out_content))
+        return ret
+
+
+
+
+
+    def add_seqs_base_model(self, model_id: int, seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]):
+        """
+            Send newly generated outputs to the model communicator.
+            We all sort the input outputs by their req id.
+            We may also consider to sort them by their lengths instead. 
+            --> better not? because if there are more than one inp models for a target model, only receiving all outputs from 
+            the input models can we obtain a complete input req for the target model.
+
+            INPUT:
+                seqs: list of (req_id, req_content); req_content may be generated text or generated token ids.
+            Modify:
+                self.output_pool, self._ungened_out_req_nums
+            NOTE: 
+                1. ensure the input ``seqs`` only contains seqs which have not been added before.
+                2. need lock here, as there may be multiple dp workers: one lock for one model.
+            NOTE:
+                1. this function is only for base models.
+        """
+
+        to_add = seqs        
+        # # sort the seqs by their seq ids ==> we do not need to sort here, because we will sort when adding them to fused_inp_queues.
+        # to_add = sorted(to_add, key=lambda x: int(x.request_id))
+
+        with self._get_correct_lock(model_id, self._add_req_locks, read_only=False):
+
+            if model_id in self.new_out_req_part_num:
+                to_add = self._process_outputs(model_id=model_id, seqs=seqs)
+
+            self.output_pool[model_id].extend(to_add)
+            # update self._ungened_out_req_nums
+            self._ungened_out_req_nums[model_id] = self._ungened_out_req_nums[model_id] - len(to_add)
+        
+        # below is the old version which does not sort the seqs ----------------------
+        # if contain_old_seqs:
+        #     old_num = len(self.output_pool[model_id])
+        #     self.output_pool[model_id].extend(seqs[old_num:])
+        # else:
+        #     self.output_pool[model_id].extend(seqs)
+
+
+
     def add_seqs(self, model_id: int, seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]):
         """
             Send newly generated outputs to the model communicator.
@@ -145,39 +276,68 @@ class LLM_COMMUNICATOR:
             NOTE: 
                 1. ensure the input ``seqs`` only contains seqs which have not been added before.
                 2. need lock here, as there may be multiple dp workers: one lock for one model.
+            NOTE:
+                1. this function is only for base models.
         """
+        if model_id not in self.base_model_ids_dict:
+            self.add_seqs_base_model(model_id=model_id, seqs=seqs)
+        else:
+            # 1. group seqs by base model ids
+            base_model_seqs_dict = defaultdict(list)
+            for seq in seqs:
+                req_id = seq[0]
+                base_model_id = self.out_req_model_id_mapping[model_id][req_id]
+                base_model_seqs_dict[base_model_id].append(seq)
+            
+            # 2. add seqs to each base model
+            for base_model_id, base_model_seqs in base_model_seqs_dict.items():
+                self.add_seqs_base_model(model_id=base_model_id, seqs=base_model_seqs)
 
-        to_add = seqs        
-        # # sort the seqs by their seq ids ==> we do not need to sort here, because we will sort when adding them to fused_inp_queues.
-        # to_add = sorted(to_add, key=lambda x: int(x.request_id))
 
-        with self._get_correct_lock(model_id, self._add_req_locks, read_only=False):
-            self.output_pool[model_id].extend(to_add)
-            # update self._ungened_out_req_nums
-            self._ungened_out_req_nums[model_id] = self._ungened_out_req_nums[model_id] - len(to_add)
-        
-        # below is the old version which does not sort the seqs ----------------------
-        # if contain_old_seqs:
-        #     old_num = len(self.output_pool[model_id])
-        #     self.output_pool[model_id].extend(seqs[old_num:])
-        # else:
-        #     self.output_pool[model_id].extend(seqs)
-        
+
     
-    def _get_fused_inp_queues(self, to_model_id: int):
+
+    def _get_selected_outputs(
+            self, from_model_id: int, to_model_id: int,
+    ):
+        """
+            Try to fetch available outputs from the model whose id is ``model_id``, 
+            where the ids of the outputs are in req_ids_requested.
+            NOTE: 1. assume the corresponding lock has been obtained.
+        """
+        end = len(self.output_pool[from_model_id])
+        start = self._read_output_nums[(from_model_id, to_model_id)]
+        self._read_output_nums[(from_model_id, to_model_id)] = end
+        
+        if (to_model_id in self.inp_req_ids) and (from_model_id in self.inp_req_ids[to_model_id]):
+            inp_req_ids = self.inp_req_ids[to_model_id][from_model_id]
+            ret = [req for req in self.output_pool[from_model_id][start:end] if req[0] in inp_req_ids]
+            return ret
+        else:
+            # return all the avaliable reqs
+            return self.output_pool[from_model_id][start:end]
+    
+        
+
+
+
+
+
+
+
+
+
+
+    def _get_fused_inp_queues_limited_version(self, to_model_id: int):
         """
             Update self.fused_inp_queues based on the new outputs from inp models of the to_model.
             Modify:
                 self._read_output_nums, self._available_srcs, self.fused_inp_queues, self._unavailable_req_nums
             NOTE:
                 1. need lock here, as there may be multiple dp workers: one lock for one model.
+            NOTE:
+                1. this version does not support model horizontal fusion.
         """
-        
-        def fuse_inp_srcs(src_seqs):
-            ret = src_seqs[0]
-            for src in src_seqs[1:]:
-                ret += src
-            return ret
 
         if self._unavailable_req_nums[to_model_id] == 0:
             # if all inp reqs have been fetched, directly return
@@ -216,9 +376,71 @@ class LLM_COMMUNICATOR:
                             new_complete_req_ids.append(req[0])
                 self._read_output_nums[(from_model_id, to_model_id)] = end
             new_complete_req_ids = sorted(new_complete_req_ids)
-            reqs = [(req_id, fuse_inp_srcs(self._available_srcs[to_model_id][req_id])) for req_id in new_complete_req_ids]
+            reqs = [(req_id, self.fuse_inp_srcs(self._available_srcs[to_model_id][req_id])) for req_id in new_complete_req_ids]
             self.fused_inp_queues[to_model_id].extend(reqs)
             self._unavailable_req_nums[to_model_id] = self._unavailable_req_nums[to_model_id] - len(reqs)
+
+
+
+
+
+
+    def _get_fused_inp_queues(self, to_model_id: int):
+        """
+            Update self.fused_inp_queues based on the new outputs from inp models of the to_model.
+            Modify:
+                self._read_output_nums, self._available_srcs, self.fused_inp_queues, self._unavailable_req_nums
+            NOTE:
+                1. need lock here, as there may be multiple dp workers: one lock for one model.
+                2. this version support model horizontal fusion, i.e., the reqs from different models may not be fused together.
+        """
+
+        if self._unavailable_req_nums[to_model_id] == 0:
+            # if all inp reqs have been fetched, directly return
+            return
+
+        # we need first update self.fused_inp_queues
+        inps = self.in_edge_dict_with_dummy_inp_nodes[to_model_id]
+        if (len(inps) == 1) or (self._independent_srcs[to_model_id]):
+            # first get a lock
+            reqs = list()
+            for from_model_id in inps:
+                with self._get_correct_lock(from_model_id, self._add_req_locks, read_only=True):
+                    reqs.extend( 
+                        self._get_selected_outputs(from_model_id=from_model_id, to_model_id=to_model_id) )
+                    
+            # sort the reqs by their req ids
+            reqs = sorted(reqs, key=lambda x: x[0])
+            self.fused_inp_queues[to_model_id].extend(reqs)
+            self._unavailable_req_nums[to_model_id] = self._unavailable_req_nums[to_model_id] - len(reqs)
+        else:
+            # there are more than one inp src for the to_model
+            new_complete_req_ids = list()
+            inp_src_num = len(inps)
+            for inp_i, from_model_id in enumerate(inps):
+                
+                # first get a lock
+                with self._get_correct_lock(from_model_id, self._add_req_locks, read_only=True):
+
+                    reqs = self._get_selected_outputs(from_model_id=from_model_id, to_model_id=to_model_id)
+
+                    for req in reqs:
+                        if req[0] not in self._available_srcs[to_model_id]:
+                            self._available_srcs[to_model_id][req[0]] = [0, [None for _ in range(inp_src_num)]]
+                        self._available_srcs[to_model_id][req[0]][0] += 1
+                        self._available_srcs[to_model_id][req[0]][1][inp_i] = req[1]
+                        if self._available_srcs[to_model_id][req[0]][0] == inp_src_num:
+                            new_complete_req_ids.append(req[0])
+            new_complete_req_ids = sorted(new_complete_req_ids)
+            reqs = [(req_id, self.fuse_inp_srcs(self._available_srcs[to_model_id][req_id])) for req_id in new_complete_req_ids]
+            self.fused_inp_queues[to_model_id].extend(reqs)
+            self._unavailable_req_nums[to_model_id] = self._unavailable_req_nums[to_model_id] - len(reqs)
+
+
+
+
+
+
 
 
 
@@ -247,8 +469,21 @@ class LLM_COMMUNICATOR:
 
 
 
+    def _update_out_req_model_id_mapping(
+            self, fused_model_id: int, base_model_id: int,
+            reqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], 
+    ) -> None:
+        
+        if fused_model_id not in self.base_model_ids_dict:
+            # this is not a fused model
+            return
+        
+        new_mapping = {req[0]:base_model_id for req in reqs}
+        self.out_req_model_id_mapping[fused_model_id].update(new_mapping)
 
-    def get_seqs(self, to_model_id: int, dp_id: int, dp_size: int
+
+
+    def get_seqs_base_model(self, fused_model_id: int, to_model_id: int, dp_id: int, dp_size: int
         ) -> Tuple[Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], bool]:
         """
             Get the available inp reqs for a specific dp worker.
@@ -261,6 +496,9 @@ class LLM_COMMUNICATOR:
             NOTE:
                 1. When the dp worker cannot get available reqs, reorganize the fused_inp_queue and assign reqs to the worker again.
                 2. need lock here, as there may be multiple dp workers: one lock for one model.
+                3. ``to_model_id`` is the id of a base model.
+            NOTE:
+                1. this function is for a base model.
         """    
 
         with self._get_correct_lock(to_model_id, self._fetch_req_locks, read_only=False):
@@ -283,6 +521,8 @@ class LLM_COMMUNICATOR:
                     if len(self.fused_inp_queues[to_model_id])>0:
                         ret = [self.fused_inp_queues[to_model_id][0]]
                         self.fused_inp_queues[to_model_id] = self.fused_inp_queues[to_model_id][1:]
+                        
+                        self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
                         return ret, possible_to_get_future_reqs
                     else:
                         if self._unavailable_req_nums[to_model_id] == 0:
@@ -292,10 +532,56 @@ class LLM_COMMUNICATOR:
                         return [], possible_to_get_future_reqs
                 else:
                     # run the normal get_seq process
-                    return self._get_seqs(to_model_id, dp_id, dp_size), possible_to_get_future_reqs
+                    ret = self._get_seqs(to_model_id, dp_id, dp_size), possible_to_get_future_reqs
+
+                    self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
+                    return ret
 
             else:
+                self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
                 return ret, possible_to_get_future_reqs
+
+
+
+
+
+
+    def get_seqs(self, to_model_id: int, dp_id: int, dp_size: int
+        ) -> Tuple[Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], bool]:
+        """
+            Get the available inp reqs for a specific dp worker.
+            Update:
+                self.fetched_fused_inp_start, self.fused_inp_queues
+            Output:
+                1. ret: the reqs assigned to the dp worker
+                2. possible_to_get_future_reqs: whether it is possible for the dp worker to get more new available reqs in the future
+                    True if there are/will be remaining available inp reqs for this model.
+            NOTE:
+                1. When the dp worker cannot get available reqs, reorganize the fused_inp_queue and assign reqs to the worker again.
+                2. need lock here, as there may be multiple dp workers: one lock for one model.
+                3. ``to_model_id`` is the id of a base model.
+            NOTE:
+                1. this function is for any model: fused or base models.
+        """ 
+        base_model_ids = list() 
+        if to_model_id not in self.base_model_ids_dict:
+            base_model_ids = [to_model_id]
+        else:
+            base_model_ids = self.base_model_ids_dict[to_model_id]
+
+        possible_to_get_future_reqs = False
+        ret = list()
+        for base_model_id in base_model_ids:
+            tmp_ret, tmp_possible_to_get_future_reqs = \
+                self.get_seqs_base_model(fused_model_id=to_model_id, to_model_id=base_model_id, dp_id=dp_id, dp_size=dp_size)
+            ret.extend(tmp_ret)
+            if tmp_possible_to_get_future_reqs:
+                possible_to_get_future_reqs = True
+        
+        return ret, possible_to_get_future_reqs
+
+
+
 
     
 
@@ -574,17 +860,17 @@ class SHARED_CONTECT():
 
     
     @classmethod
-    def set_execution_plan(cls, setting, model_ids=list()) -> None:
+    def set_execution_plan(cls, setting, shared_ids=list()) -> None:
         '''
             If model_ids is given, only change the setting for specific models
         '''
         iter_range = None
-        if len(model_ids) == 0:
+        if len(shared_ids) == 0:
             iter_range = range(len(cls.shared_setting))
         else:
             iter_range = list()
-            for model_i in model_ids:
-                iter_range.extend(range(cls.execution_plan_size * model_i, cls.execution_plan_size * (model_i+1)))
+            for shared_id in shared_ids:
+                iter_range.extend(range(cls.execution_plan_size * shared_id, cls.execution_plan_size * (shared_id+1)))
         
         # print(f"setting: {setting}, len(setting): {len(setting)}  len(shared_setting): {len(cls.shared_setting)} iter_range:{iter_range}")
         
@@ -682,7 +968,7 @@ class SHARED_CONTECT():
 
 
     @classmethod
-    def wait_all_models_to_finish_prepare_for_reschedule(cls, model_ids: List[int]) -> None:
+    def wait_all_models_to_finish_prepare_for_reschedule(cls, shared_ids: List[int]) -> None:
         assert os.environ['RUN_MULTI_MODEL'] == 'True'
         # wait for all the models to finish
 
@@ -690,15 +976,15 @@ class SHARED_CONTECT():
 
         # for event in cls.events[2:]:
         #     event.wait()
-        for model_id in model_ids:
-            cls.events[2+model_id].wait()
+        for shared_id in shared_ids:
+            cls.events[2+shared_id].wait()
 
         print(f"event list status in waiting all to finish 2: {[event.is_set() for event in cls.events[2:]]}")
 
 
 
     @classmethod
-    def wait_all_models_to_finish_preparation_before_init_LLM(cls, model_ids: List[int]) -> None:
+    def wait_all_models_to_finish_preparation_before_init_LLM(cls, shared_ids: List[int]) -> None:
         '''
             Call this function in the multi-model scheduler process.
         '''
@@ -709,8 +995,8 @@ class SHARED_CONTECT():
 
         # for event in cls.events[2:]:
         #     event.wait()
-        for model_id in model_ids:
-            cls.events[2+model_id].wait()
+        for shared_id in shared_ids:
+            cls.events[2+shared_id].wait()
 
         print(f"event list status in waiting all to finish 2: {[event.is_set() for event in cls.events[2:]]}")
 
@@ -732,7 +1018,7 @@ class SHARED_CONTECT():
 
 
     @classmethod
-    def start_specific_models(cls, model_ids) -> None:
+    def start_specific_models(cls, shared_ids) -> None:
         '''
             (1) set the started_status;
             (2) clear the finishing_preparation_for_reschedule event;
@@ -740,9 +1026,9 @@ class SHARED_CONTECT():
 
         assert os.environ['RUN_MULTI_MODEL'] == 'True'
         # if model event is set, this model will not be started
-        for model_id in model_ids:
-            cls.started_status[model_id].set()
-            cls.events[2+model_id].clear()
+        for shared_id in shared_ids:
+            cls.started_status[shared_id].set()
+            cls.events[2+shared_id].clear()
 
         print(f"event list status in start_specific_models--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
 
@@ -759,9 +1045,9 @@ class SHARED_CONTECT():
 
 
     @classmethod
-    def query_finish_status(cls, model_id) -> None:
+    def query_finish_status(cls, shared_id) -> None:
         assert os.environ['RUN_MULTI_MODEL'] == 'True'
-        return cls.shared_finish_status[model_id]
+        return cls.shared_finish_status[shared_id]
 
 
 
@@ -796,12 +1082,12 @@ class SHARED_CONTECT():
 
 
     @classmethod
-    def stop_specific_models(cls, model_ids: List[int]) -> bool:
+    def stop_specific_models(cls, shared_ids: List[int]) -> bool:
         '''
         Call this function in the model scheduler process.
         '''
-        for model_id in model_ids:
-            cls.started_status[model_id].clear()
+        for shared_id in shared_ids:
+            cls.started_status[shared_id].clear()
 
 
 
