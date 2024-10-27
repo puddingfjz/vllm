@@ -161,31 +161,32 @@ class InferenceArgs:
 def start_a_model_inference_child_process(
         communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, shared_id: int, model: str = "huggyllama/llama-7b", 
         return_str=True, req_num=None):
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = gpus
-
-    # TODO: some models do not support dynamic model weight loading now
-    os.environ['USE_VLLM']='False'
-    os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'True'
-    if use_vllm:
-        os.environ['USE_VLLM']='True'
-        os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False'
-      
-    # os.environ['RUN_MULTI_MODEL'] = 'True'
-    # NOTE: the dataset, ignore_eos, and fixed_output_len does not matter here
-    args = InferenceArgs(model, req_num)
-
-    # set os.environ['CUDA_VISIBLE_DEVICES'] before importing benchmark_throughput
-    # benchmark_throughput.SHARED_CONTECT.shared_setting = SHARED_CONTECT.shared_setting
-    # set shared id for each model
-    SHARED_CONTECT.shared_id = shared_id
-    SHARED_CONTECT.communicator = communicator
-    SHARED_CONTECT.return_str = return_str
-    SHARED_CONTECT.tot_req_num_remained = req_num
-    print(f"SHARED_CONTECT.shared_id: {SHARED_CONTECT.shared_id}")
-    print(f"SHARED_CONTECT.tot_req_num_remained: {SHARED_CONTECT.tot_req_num_remained}")
-    # benchmark_throughput.main(args)
     try:
+        print(f"in running start_a_model_inference_child_process")
+        import os
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpus
+
+        # TODO: some models do not support dynamic model weight loading now
+        os.environ['USE_VLLM']='False'
+        os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'True'
+        if use_vllm:
+            os.environ['USE_VLLM']='True'
+            os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False'
+        
+        # os.environ['RUN_MULTI_MODEL'] = 'True'
+        # NOTE: the dataset, ignore_eos, and fixed_output_len does not matter here
+        args = InferenceArgs(model, req_num)
+
+        # set os.environ['CUDA_VISIBLE_DEVICES'] before importing benchmark_throughput
+        # benchmark_throughput.SHARED_CONTECT.shared_setting = SHARED_CONTECT.shared_setting
+        # set shared id for each model
+        SHARED_CONTECT.shared_id = shared_id
+        SHARED_CONTECT.communicator = communicator
+        SHARED_CONTECT.return_str = return_str
+        SHARED_CONTECT.tot_req_num_remained = req_num
+        print(f"SHARED_CONTECT.shared_id: {SHARED_CONTECT.shared_id}")
+        print(f"SHARED_CONTECT.tot_req_num_remained: {SHARED_CONTECT.tot_req_num_remained}")
+        # benchmark_throughput.main(args)
         benchmark_throughput.main(args)
     except Exception as e:
         print(f"Exception in running benchmark_throughput.main(): {e}")
@@ -197,15 +198,18 @@ def start_a_model_inference_child_process(
 
 # start a model for inference
 def start_a_model_inference(
-        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, model_id: int, 
-        ignore_eos: bool, fixed_output_len: int,
-        model: str = "huggyllama/llama-7b", 
+        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, model_id: int, model: str = "huggyllama/llama-7b", 
         return_str=True, req_num=None):
     # use a child process to run benchmark_throughput.main so that the cuda memory can be released completely when finishing inference
+    print(f"in running start_a_model_inference")
     with ProcessPoolExecutor(max_workers=1) as executor:
-        executor.submit(start_a_model_inference_child_process, communicator, use_vllm, gpus, model_id, 
-                        ignore_eos, fixed_output_len,
-                        model, return_str, req_num)
+        try:
+            print(f"in running start_a_model_inference 1")
+            executor.submit(start_a_model_inference_child_process, communicator, use_vllm, gpus, model_id, 
+                            model, return_str, req_num)
+        except Exception as e:
+            print(f"Exception in running start_a_model_inference: {e}")
+            print(traceback.format_exc())
 
 
 
@@ -544,7 +548,7 @@ def initialize_SHARED_CONTECT(
         gpu_order_we_set: List[int],
         model_id_shared_id_mapping: Dict[int, int],
         new_out_edge_dict: Dict[int, List[int]],
-        sampling_args: Dict[int, Tuple[bool, int, int]]
+        sampling_args_dict: Dict[int, Tuple[bool, int, int]]
     ) -> Tuple[List[MyExecPlanState], int, List[MyExecPlanState]]:
     '''
         Update: (1) SHARED_CONTECT events, shared_finish_status, shared_setting
@@ -569,7 +573,7 @@ def initialize_SHARED_CONTECT(
     check_out_gaps = Array('i', [int(1e9)]*new_model_num) # 'd' is for double
     SHARED_CONTECT.check_out_gaps = check_out_gaps
     SHARED_CONTECT.check_in_gap = check_gap
-    SHARED_CONTECT.sampling_args = sampling_args
+    SHARED_CONTECT.sampling_args_dict = sampling_args_dict
 
     
     # set the initial execution plan
@@ -1188,7 +1192,19 @@ def get_return_str_list_version(out_edge_dict: Dict[int, List[int]], model_id: i
     return (True in [tgt != model_paths[out] for out in outs])
 
 
-def get_return_str(new_out_edge_dict: Dict[int, List[int]], model_id: int, model_path_dict: Dict[int, str])->bool:
+def get_return_str(
+        new_out_edge_dict: Dict[int, List[int]], model_id: int, model_path_dict: Dict[int, str],
+        # new_in_edge_dict_with_dummy_nodes: Dict[int, List[int]], 
+        # independent_srcs: Dict[int,bool]
+        )->bool:
+    """
+        NOTE: 1. we also need to consider the other inputs of the output nodes of model_id, because different input sources 
+            may need to be concatenated. 
+            Currently, we return str if two input sources need to be concat, even if they use the same tokenizer.
+            # TODO: 这个地方还要改
+            2. each base model has its own ``return_str``. [暂时还没有实现这一点]
+    """
+    return True
     outs = new_out_edge_dict[model_id]
     tgt = model_path_dict[model_id]
     return (True in [tgt != model_path_dict[out] for out in outs])
@@ -1338,7 +1354,7 @@ async def main_with_preemption(
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]],
         check_gap: int, sort_input: bool,
         num_prompts: int, 
-        sampling_args: Dict[int, SamplingParams],
+        sampling_args_dict: Dict[int, SamplingParams],
         # 
         inp_seq_ids_dict, 
         inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
@@ -1423,7 +1439,7 @@ async def main_with_preemption(
         gpu_order_we_set=gpu_order_we_set,
         model_id_shared_id_mapping=model_id_shared_id_mapping,
         new_out_edge_dict=new_out_edge_dict,
-        sampling_args=sampling_args,)
+        sampling_args_dict=sampling_args_dict,)
     first_stage_model_ids = [exec_plan_state.exec_plan.model.model_id for exec_plan_state in launched_exec_plan_states]
 
 
@@ -1475,6 +1491,7 @@ async def main_with_preemption(
 
             # for model_id, model_path in enumerate(model_paths):
             for model_id, model_path in new_model_path_dict.items():
+                print(f"init process for {model_id, model_path}")
                 shared_id = model_id_shared_id_mapping[model_id]
                 tot_req_num = sum([base_req_num_dict[base_model_id] for base_model_id in model_dict[model_id].get_base_model_ids()])
                 tasks.append(
@@ -1836,7 +1853,7 @@ def get_schedule_setting(test_case:str):
     
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
-    sampling_args = dict()
+    sampling_args_dict = dict()
     if test_case == 'general':
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
@@ -1904,7 +1921,7 @@ def get_schedule_setting(test_case:str):
 
         req_num = 10
         chunk_size = 512
-        max_length = chunk_size*5 # 20000
+        max_length = chunk_size*50 # 20000
         model_paths = ['NousResearch/Llama-2-13b-hf'] * (max_length // chunk_size)
         print(f"model_paths: {model_paths}")
         # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
@@ -1916,7 +1933,8 @@ def get_schedule_setting(test_case:str):
         inp_generator = lambda req_num: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
-        node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size)\
+        # here ``None`` means we use our own dummpy request dataset
+        node_dataset_chunk_mapping = {-(i+1): (None, i, chunk_size)\
                                       for i in range(len(model_paths))}
         
         inp_seq_ids_dict = defaultdict(list)
@@ -1929,10 +1947,10 @@ def get_schedule_setting(test_case:str):
         print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
         # add another model after the chain summary
         model_paths.append('NousResearch/Llama-2-7b-hf')
-        in_edge_dict_with_dummy_inp_nodes[5] = [3, 4]
+        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
         # out_edge_dict[3].append(5)
         # out_edge_dict[4] = [5]
-        inp_seq_ids_dict[5] = sorted(set(inp_seq_ids_dict[3] + inp_seq_ids_dict[4]))
+        inp_seq_ids_dict[len(model_paths)-1] = sorted(set(inp_seq_ids_dict[len(model_paths)-2] + inp_seq_ids_dict[len(model_paths)-3]))
 
         print(f"\nreal model_paths: {model_paths}")
         print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
@@ -1961,8 +1979,8 @@ def get_schedule_setting(test_case:str):
             "use_beam_search":False,
             "ignore_eos":False, # False, # True (original),
             "max_tokens":int(1e9)}
-        sampling_args = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths)-1)}
-        sampling_args.update({len(model_paths)-1:SamplingParams(**sampling_args2)})
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths)-1)}
+        sampling_args_dict.update({len(model_paths)-1:SamplingParams(**sampling_args1)})
 
 
 
@@ -1975,7 +1993,7 @@ def get_schedule_setting(test_case:str):
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
 
 
 
@@ -1991,7 +2009,7 @@ if __name__ == "__main__":
     test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args = \
+             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \
         get_schedule_setting(test_case=test_case)
     
     asyncio.run(main_with_preemption(
@@ -2005,7 +2023,7 @@ if __name__ == "__main__":
         check_gap=check_gap, sort_input=sort_input,
         num_prompts=num_prompts, 
         # 
-        sampling_args=sampling_args,
+        sampling_args_dict=sampling_args_dict,
         # 
         inp_seq_ids_dict=inp_seq_ids_dict, 
         inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 

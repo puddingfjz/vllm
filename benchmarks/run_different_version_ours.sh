@@ -427,6 +427,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py > test_end2end_sche
 # test end2end schedule performance with multi-level model system (data parallel + model-level pipeline)
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_0929_4gpu_1.log
 CUDA_VISIBLE_DEVICES=0,1 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-chainSummary-1.log
+CUDA_VISIBLE_DEVICES=1,2 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-chainSummary-3.log
+
+
 
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1003_2gpu_1-chainSummary-1.log
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1009_2gpu_1-chainSummary-1.log

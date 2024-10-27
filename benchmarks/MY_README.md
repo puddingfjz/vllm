@@ -232,6 +232,12 @@ pip install numpy==1.26.3
 # pip tmp空间不足的时候
 export TMPDIR=$HOME/tmp
 
+
+# create some folds
+mkdir my_dummy_requests
+mkdir test_search
+mkdir test_end2end_schedule
+
 5. =====================================================
 安装完之后重新进入环境的步骤
 screen -h 5000000 -S vllm
