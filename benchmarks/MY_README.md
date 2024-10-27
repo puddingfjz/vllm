@@ -154,7 +154,8 @@ export HF_DATASETS_CACHE="/export/data/jingzhi/.cache/huggingface"
 
 
 # 如果需要获得huggingface的access token
-输入命令：huggingface-hub login
+#pip install "huggingface_hub[cli]"
+输入命令：huggingface-hub login  或者 huggingface-cli login
 然后输入token
 
 
@@ -217,10 +218,19 @@ conda deactivate
 4. 下载并编译vllm
 # 需要更新 pyarrow
 pip3 install -U pyarrow 
+# 下载 einops
+pip install einops
 
 # 编译vllm
 git clone https://github.com/puddingfjz/vllm.git
+cd vllm
 pip3 install -e . 
+
+# 指定numpy, torch版本
+pip install numpy==1.26.3
+
+# pip tmp空间不足的时候
+export TMPDIR=$HOME/tmp
 
 5. =====================================================
 安装完之后重新进入环境的步骤

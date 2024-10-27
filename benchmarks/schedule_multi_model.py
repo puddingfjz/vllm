@@ -30,6 +30,7 @@ from multiprocessing import Array, Event
 
 
 from vllm.core.multimodel_scheduler import SHARED_CONTECT, LLM_COMMUNICATOR, MyManager
+from vllm.sampling_params import SamplingParams
 import benchmark_throughput
 
 import time
@@ -84,13 +85,16 @@ class InferenceArgs:
     """Arguments for vLLM single model inference."""
     def __init__(self, 
         model:str="huggyllama/llama-7b", 
-        num_prompts: int = 1000
+        num_prompts: int = 1000,
+        dataset: str = "ShareGPT_V3_unfiltered_cleaned_split.json",
+        ignore_eos: bool = False, 
+        fixed_output_len: int = None,
         # tensor_parallel_size:int=1
     ) -> None:
         self.backend: str = "vllm"
-        self.dataset: str = "ShareGPT_V3_unfiltered_cleaned_split.json"
+        self.dataset: str = dataset
         self.input_len: int = None
-        self.output_len: int = None
+        self.output_len: int = fixed_output_len
         self.model: str = model
         self.tokenizer: str = None
         self.quantization = None
@@ -114,7 +118,7 @@ class InferenceArgs:
         # TODO: setting temperature
         self.temperature: float = 1.0
         # TODO: setting ignore_eos
-        self.ignore_eos: bool = False
+        self.ignore_eos: bool = ignore_eos
 
         if self.tokenizer is None:
             self.tokenizer = self.model
@@ -168,6 +172,7 @@ def start_a_model_inference_child_process(
         os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False'
       
     # os.environ['RUN_MULTI_MODEL'] = 'True'
+    # NOTE: the dataset, ignore_eos, and fixed_output_len does not matter here
     args = InferenceArgs(model, req_num)
 
     # set os.environ['CUDA_VISIBLE_DEVICES'] before importing benchmark_throughput
@@ -177,6 +182,8 @@ def start_a_model_inference_child_process(
     SHARED_CONTECT.communicator = communicator
     SHARED_CONTECT.return_str = return_str
     SHARED_CONTECT.tot_req_num_remained = req_num
+    print(f"SHARED_CONTECT.shared_id: {SHARED_CONTECT.shared_id}")
+    print(f"SHARED_CONTECT.tot_req_num_remained: {SHARED_CONTECT.tot_req_num_remained}")
     # benchmark_throughput.main(args)
     try:
         benchmark_throughput.main(args)
@@ -190,11 +197,15 @@ def start_a_model_inference_child_process(
 
 # start a model for inference
 def start_a_model_inference(
-        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, model_id: int, model: str = "huggyllama/llama-7b", 
+        communicator: LLM_COMMUNICATOR, use_vllm: bool, gpus: str, model_id: int, 
+        ignore_eos: bool, fixed_output_len: int,
+        model: str = "huggyllama/llama-7b", 
         return_str=True, req_num=None):
     # use a child process to run benchmark_throughput.main so that the cuda memory can be released completely when finishing inference
     with ProcessPoolExecutor(max_workers=1) as executor:
-        executor.submit(start_a_model_inference_child_process, communicator, use_vllm, gpus, model_id, model, return_str, req_num)
+        executor.submit(start_a_model_inference_child_process, communicator, use_vllm, gpus, model_id, 
+                        ignore_eos, fixed_output_len,
+                        model, return_str, req_num)
 
 
 
@@ -533,6 +544,7 @@ def initialize_SHARED_CONTECT(
         gpu_order_we_set: List[int],
         model_id_shared_id_mapping: Dict[int, int],
         new_out_edge_dict: Dict[int, List[int]],
+        sampling_args: Dict[int, Tuple[bool, int, int]]
     ) -> Tuple[List[MyExecPlanState], int, List[MyExecPlanState]]:
     '''
         Update: (1) SHARED_CONTECT events, shared_finish_status, shared_setting
@@ -557,6 +569,7 @@ def initialize_SHARED_CONTECT(
     check_out_gaps = Array('i', [int(1e9)]*new_model_num) # 'd' is for double
     SHARED_CONTECT.check_out_gaps = check_out_gaps
     SHARED_CONTECT.check_in_gap = check_gap
+    SHARED_CONTECT.sampling_args = sampling_args
 
     
     # set the initial execution plan
@@ -1064,6 +1077,19 @@ def get_out_edge_dict_from_in_edge_dict_with_inp_nodes(
 
 
 
+def _get_dummy_requests():
+    import json
+    with open(f"./my_dummy_requests/my_dummy_requests.json", 'r') as f:
+        dataset = json.load(f)
+    return dataset
+
+
+def _init_dummy_requests(inp_lens: List[int]):
+    import json
+    with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
+        requests = ["hi" * (input_len - 1) for input_len in inp_lens]
+        json.dump(requests, f)
+
 
 
 def init_prompts_for_the_model_system(
@@ -1074,7 +1100,7 @@ def init_prompts_for_the_model_system(
     """
         Sample input dataset for the model system.
         INPUT:
-            node_dataset_partition_mapping: {model_id: (dataset_name, chunk_id, chunk_size)}
+            node_dataset_chunk_mapping: {model_id: (dataset_name, chunk_id, chunk_size)}
         NOTE: we also set the total number of requests each model needs to do inference for.
         OUTPUT:
             req_num_dict: the number of req to answer for each model.
@@ -1093,6 +1119,11 @@ def init_prompts_for_the_model_system(
     datasets = set([v[0] for v in node_dataset_chunk_mapping.values()])
     dataset_dict = dict()
     for dataset in datasets:
+        if dataset == None:
+            requests = _get_dummy_requests()
+            inp_prompts = [(i, req) for i, req in enumerate(requests)]
+            dataset_dict[dataset] = inp_prompts
+            continue
         requests = benchmark_throughput.sample_requests(
             dataset, args.num_prompts, tokenizer,args.output_len)
         inp_prompts = [(i, req[0]) for i, req in enumerate(requests)]
@@ -1103,9 +1134,13 @@ def init_prompts_for_the_model_system(
     for model_id, (dataset, chunk_id, chunk_size) in node_dataset_chunk_mapping.items():
         inp_prompts = dataset_dict[dataset]
         to_add = inp_prompts
-        if chunk_size > 0:
-            to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
-        
+        if dataset != None:
+            if chunk_size > 0:
+                to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
+        else:
+            if chunk_size > 0:
+                to_add = [(i, req[(chunk_id*chunk_size-1)*2:((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
+
         # communicator.add_seqs(model_id, to_add)
         prompts_dict[model_id] = to_add
         req_num_dict[model_id] = len(to_add)
@@ -1303,6 +1338,7 @@ async def main_with_preemption(
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]],
         check_gap: int, sort_input: bool,
         num_prompts: int, 
+        sampling_args: Dict[int, SamplingParams],
         # 
         inp_seq_ids_dict, 
         inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
@@ -1372,6 +1408,7 @@ async def main_with_preemption(
     print(f"\nnew_in_edge_dict_with_dummy_inp_nodes: {new_in_edge_dict_with_dummy_inp_nodes}")
     print(f"new_out_edge_dict: {new_out_edge_dict}")
     print(f"model_id_shared_id_mapping: {model_id_shared_id_mapping}")
+    print(f"new_model_path_dict: {new_model_path_dict}")
 
     print("\n\n\n\n\nfinish searching!\n\n\n\n\n", flush=True)
     # TODO: setting tot_gpu_num
@@ -1385,7 +1422,8 @@ async def main_with_preemption(
         model_driver_worker_gpu_i=model_driver_worker_gpu_i, 
         gpu_order_we_set=gpu_order_we_set,
         model_id_shared_id_mapping=model_id_shared_id_mapping,
-        new_out_edge_dict=new_out_edge_dict)
+        new_out_edge_dict=new_out_edge_dict,
+        sampling_args=sampling_args,)
     first_stage_model_ids = [exec_plan_state.exec_plan.model.model_id for exec_plan_state in launched_exec_plan_states]
 
 
@@ -1397,11 +1435,11 @@ async def main_with_preemption(
 
         print(f"\nTIMESTAMP 2: {time.perf_counter()}\n")
 
-        base_model_ids_dict = {model_id:model.get_base_model_ids() for model_id, model in model_dict.items()}
+        shared_id_2_base_model_ids_dict = {model_id_shared_id_mapping[model_id]:model.get_base_model_ids() for model_id, model in model_dict.items()}
         communicator: LLM_COMMUNICATOR = manager.Communicator(
             new_model_num, # len(model_paths), 
             in_edge_dict_with_dummy_inp_nodes,
-            base_model_ids_dict,
+            shared_id_2_base_model_ids_dict,
             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
             )
 
@@ -1409,6 +1447,8 @@ async def main_with_preemption(
         # NOTE: stores the req num of base models (for fused models, store req num for the base models inside)
         base_req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
                                                          num_prompts)
+
+        print(f"base_req_num_dict: {base_req_num_dict}")
 
 
         print(f"\nTIMESTAMP 3: {time.perf_counter()}\n")
@@ -1456,6 +1496,7 @@ async def main_with_preemption(
             SHARED_CONTECT.wait_all_models_to_finish_preparation_before_init_LLM(shared_ids=range(new_model_num))
             # start the first stage models
             # SHARED_CONTECT.start_specific_models(first_stage_model_ids)
+            print(f"[model_id_shared_id_mapping[_] for _ in first_stage_model_ids]: {[model_id_shared_id_mapping[_] for _ in first_stage_model_ids]}")
             SHARED_CONTECT.start_specific_models([model_id_shared_id_mapping[_] for _ in first_stage_model_ids])
 
 
@@ -1795,6 +1836,7 @@ def get_schedule_setting(test_case:str):
     
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
+    sampling_args = dict()
     if test_case == 'general':
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
@@ -1842,7 +1884,7 @@ def get_schedule_setting(test_case:str):
         # leave it later: for the case where we horizontally fuse all ``map`` models
         out_req_id_mapping = {}
         new_out_req_part_num = {}
-        independent_srcs = {}
+        independent_srcs = {i:False for i in range(len(model_paths))}
 
     elif test_case == 'chain-summary':
         # # chain summary
@@ -1860,7 +1902,7 @@ def get_schedule_setting(test_case:str):
         #                               for i in range(len(model_paths))}
 
 
-        req_num = 1000
+        req_num = 10
         chunk_size = 512
         max_length = chunk_size*5 # 20000
         model_paths = ['NousResearch/Llama-2-13b-hf'] * (max_length // chunk_size)
@@ -1887,7 +1929,7 @@ def get_schedule_setting(test_case:str):
         print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
         # add another model after the chain summary
         model_paths.append('NousResearch/Llama-2-7b-hf')
-        in_edge_dict_with_dummy_inp_nodes[5] = [-6, 3, 4]
+        in_edge_dict_with_dummy_inp_nodes[5] = [3, 4]
         # out_edge_dict[3].append(5)
         # out_edge_dict[4] = [5]
         inp_seq_ids_dict[5] = sorted(set(inp_seq_ids_dict[3] + inp_seq_ids_dict[4]))
@@ -1899,7 +1941,29 @@ def get_schedule_setting(test_case:str):
         
         # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
         inp_req_ids = dict()
-        independent_srcs = dict()
+        independent_srcs = {i:False for i in range(len(model_paths))}
+
+        # we need to prepare the dummpy requests here
+        _init_dummy_requests(inp_lens)
+        sampling_args1 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":True, # False, # True (original),
+            "max_tokens":50}
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths)-1)}
+        sampling_args.update({len(model_paths)-1:SamplingParams(**sampling_args2)})
+
 
 
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
@@ -1911,7 +1975,7 @@ def get_schedule_setting(test_case:str):
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args
 
 
 
@@ -1927,7 +1991,7 @@ if __name__ == "__main__":
     test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs = \
+             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args = \
         get_schedule_setting(test_case=test_case)
     
     asyncio.run(main_with_preemption(
@@ -1940,6 +2004,9 @@ if __name__ == "__main__":
         node_dataset_chunk_mapping=node_dataset_chunk_mapping,
         check_gap=check_gap, sort_input=sort_input,
         num_prompts=num_prompts, 
+        # 
+        sampling_args=sampling_args,
+        # 
         inp_seq_ids_dict=inp_seq_ids_dict, 
         inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,

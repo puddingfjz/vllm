@@ -11,6 +11,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import Counter
 
 
+# <jingzhi> support multimodel scheduling
+from vllm.core.multimodel_scheduler import SHARED_CONTECT
+
+
 class LLM:
     """An LLM for generating texts from given prompts and sampling parameters.
 
@@ -303,7 +307,9 @@ class LLM:
     def _add_new_available_reqs(
         self, 
         new_inps:Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], 
-        sampling_parameters, sort_inps) -> None:
+        # sampling_parameters, 
+        sort_inps,
+        req_base_model_ids: List[int]) -> None:
         """
             Check whether there are newly available input reqs.
             Update: the waiting list of reqs.
@@ -311,25 +317,37 @@ class LLM:
                 new_inps: list of (req_id, req_content)
                 sampling_parameters is a dict containing values for [n, temperature, top_p, use_beam_search, ignore_eos, max_tokens]
                 sort_inps: if True, we will sort the inp seqs by their lengths every time.
+                req_base_model_ids: the corresponding base model each req belongs to.
+                    if this model is a base model, req_base_model_ids=[base_model_id]; else, len(req_base_model_ids)=len(new_inps)
 
         """
         if len(new_inps) == 0:
             # there is no new input
             return
 
-        if sampling_parameters['ignore_eos']:
-            assert sampling_parameters['max_tokens'] != None
-        else:
-            # we can set the max token as the max_model_len because it is also a stop condition
-            sampling_parameters['max_tokens'] = self.llm_engine.model_config.max_model_len
+        # if sampling_parameters['ignore_eos']:
+        #     assert sampling_parameters['max_tokens'] != None
+        # else:
+        #     # we can set the max token as the max_model_len because it is also a stop condition
+        #     sampling_parameters['max_tokens'] = self.llm_engine.model_config.max_model_len
 
-        sampling_params = SamplingParams(**sampling_parameters)
+        # sampling_params = SamplingParams(**sampling_parameters)
+
         if sort_inps:
-            new_inps = sorted(new_inps, key=lambda inp: len(inp[1]), reverse=True)
+            if len(req_base_model_ids) == len(new_inps):
+                # this model is a fused model, or len(new_inps) == 1
+                order = sorted(range(len(new_inps)), key=lambda i: len(new_inps[i][1]), reverse=True)
+                new_inps = [new_inps[i] for i in order]
+                req_base_model_ids = [req_base_model_ids[i] for i in order]
+            else:
+                new_inps = sorted(new_inps, key=lambda inp: len(inp[1]), reverse=True)
+                assert len(req_base_model_ids) == 1
+                req_base_model_ids = req_base_model_ids * len(new_inps)
 
         
         if isinstance(new_inps[0][1], str):
-            for req_id, prompt in new_inps:
+            for (req_id, prompt), base_model_id in zip(new_inps, req_base_model_ids):
+                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id)
                 self._add_request(
                     prompt=prompt,
                     prompt_token_ids=None,
@@ -337,7 +355,8 @@ class LLM:
                     request_id=req_id,
                 )
         else:
-            for req_id, prompt_token_ids in new_inps:
+            for (req_id, prompt_token_ids), base_model_id in zip(new_inps, req_base_model_ids):
+                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id)
                 self._add_request(
                     prompt=None,
                     prompt_token_ids=prompt_token_ids,
@@ -383,7 +402,7 @@ class LLM:
         import os
 
         # <jingzhi> support multimodel scheduling
-        from vllm.core.multimodel_scheduler import SHARED_CONTECT
+        # from vllm.core.multimodel_scheduler import SHARED_CONTECT
         import time
 
 
@@ -422,26 +441,48 @@ class LLM:
             #     (SHARED_CONTECT.check_in and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0)):
             # <jingzhi> change the condition to check new seqs: 
             # (1) it is possible to get future reqs and (2) has no pending (waiting+swapped) reqs
+
+            # print(f"{SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}: len(self.llm_engine.scheduler.running): {len(self.llm_engine.scheduler.running)}")
+
             if possible_to_get_future_reqs and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0):
                 # TODO: 先实现一个naive的版本，不检查目前的资源使用还能不能容纳新的request --> 目前的版本是如果没有waiting的req就一直check
+
+                # print(f"try to get new reqs: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}")
 
                 # NOTE: when all the requests are finished, we must (1) wait for new requests to continue the inference 
                 # or (2) break the loop when there is a stop signal
                 has_unfinished_requests = self.llm_engine.has_unfinished_requests()
                 while not (SHARED_CONTECT.should_reschedule() and (os.environ['NO_PREEMPT'] == 'False')):
+
+                    # print(f"try to get new reqs 111: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}")
+
                     if has_unfinished_requests and (step_i % SHARED_CONTECT.check_in_gap != 0):
                         # when there are running reqs, we check every check_in_gap steps
                         break
 
-                    new_inps, possible_to_get_future_reqs = \
+                    new_inps, possible_to_get_future_reqs, req_base_model_ids = \
                         SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
-                    self._add_new_available_reqs(new_inps, sampling_parameters, sort_inps)
+
+                    # print(f"try to get new reqs 222: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}, new_inps: {new_inps}, possible_to_get_future_reqs: {possible_to_get_future_reqs}")
+                    print(f"GET SEQS for model shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  FROM THE POOL:")
+                    for _ in new_inps:
+                        print(_)
+                    with open(f"./test_end2end_schedule/model_IO.log", 'a') as file:
+                        for _ in new_inps:
+                            file.write(f"Get: shared id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}: {str(_)}\n")
+
+                    self._add_new_available_reqs(new_inps, sort_inps, req_base_model_ids)
+
+
+                    # print(f"try to get new reqs 333: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}, self.llm_engine.scheduler.waiting: {self.llm_engine.scheduler.waiting}")
                     
                     if not possible_to_get_future_reqs:
+                        # print(f"Break after get seqs: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id} possible_to_get_future_reqs: {possible_to_get_future_reqs}")
                         break
                     
                     if (len(new_inps) == 0) and (not has_unfinished_requests):
                         # we query the communicator every 1 second
+                        # print(f"Sleep after get seqs: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id} len(new_inps): {len(new_inps)}, has_unfinished_requests: {has_unfinished_requests}")
                         time.sleep(1)
                     else:
                         break
@@ -451,6 +492,9 @@ class LLM:
             # check whether we need to stop the inference process
             if (not possible_to_get_future_reqs) and (not self.llm_engine.has_unfinished_requests()):
                 # (1) not possible to get reqs in the future and (2) all assigned reqs have been finished
+                # print(f"All requests have been finished!")
+                # print(f"possible_to_get_future_reqs: {possible_to_get_future_reqs}")
+                # print(f"self.llm_engine.has_unfinished_requests(): {self.llm_engine.has_unfinished_requests()}")
                 break
 
 
@@ -458,6 +502,7 @@ class LLM:
             step_i+=1
             print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}")
             print(f"step i: {step_i}", flush=True)
+            # print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  possible_to_get_future_reqs: {possible_to_get_future_reqs}  self.llm_engine.has_unfinished_requests(): {self.llm_engine.has_unfinished_requests()}")
 
 
             # <jingzhi> For DEBUG
@@ -504,14 +549,24 @@ class LLM:
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
+
+                    print(f"finish one req: model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}, output.request_id: {output.request_id}")
+
+
                     if use_tqdm:
                         pbar.update(1)
             
-            # send the outputs to the model communicator every check_out_gap steps
+            # send the outputs to the model communicator every check_out_gap steps or when all current reqs are finished
             # <jingzhi> multi-level LLM system
-            if step_i % SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id] == 0:
+            # print(f"SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id]: {SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id]}")
+            if (step_i % SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id] == 0) or (not self.llm_engine.has_unfinished_requests()):
+                
+                # print(f"writing results back!  SHARED_CONTECT.shared_id: {SHARED_CONTECT.shared_id}------------------")
                 output_num_sent_out, new_outputs = \
                     self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
+                
+                # print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, new_outputs: {new_outputs}------------------")
+
                 SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
 
 
