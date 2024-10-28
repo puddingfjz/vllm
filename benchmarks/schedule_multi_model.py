@@ -1102,11 +1102,12 @@ def init_prompts_for_the_model_system(
         communicator: LLM_COMMUNICATOR,
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]], 
         in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]], 
-        num_prompts: int):
+        num_prompts: int, independent_srcs):
     """
         Sample input dataset for the model system.
         INPUT:
             node_dataset_chunk_mapping: {model_id: (dataset_name, chunk_id, chunk_size)}
+            independent_srcs: stores whether each model's different input sources are independent, or need to be concatenated to be an input.
         NOTE: we also set the total number of requests each model needs to do inference for.
         OUTPUT:
             req_num_dict: the number of req to answer for each model.
@@ -1164,7 +1165,10 @@ def init_prompts_for_the_model_system(
         for tgt, srcs in in_edge_dict_with_dummy_inp_nodes.items():
             print(f"tgt, srcs: {tgt, srcs}", flush=True)
             if set(srcs).issubset(visited):
-                req_num_dict[tgt] = min([req_num_dict[src] for src in srcs])
+                if independent_srcs[tgt]:
+                    req_num_dict[tgt] = sum([req_num_dict[src] for src in srcs])
+                else:
+                    req_num_dict[tgt] = min([req_num_dict[src] for src in srcs])
                 visited.append(tgt)
                 print(f"visited: {visited}", flush=True)
 
@@ -1464,7 +1468,7 @@ async def main_with_preemption(
         # set inputs for dummy inp nodes in the system
         # NOTE: stores the req num of base models (for fused models, store req num for the base models inside)
         base_req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
-                                                         num_prompts)
+                                                         num_prompts, independent_srcs)
 
         print(f"base_req_num_dict: {base_req_num_dict}")
 
@@ -1893,24 +1897,72 @@ def get_schedule_setting(test_case:str):
         # 如果input sequence的长度差别很大的话，可能会导致chunk的数量差别很大，可能会有很多个LLM instance，但是每个instance的inp workload数量不一样，这样会有影响吗？
         # 试试再说吧
         # TODO: 还有一个问题，我们现在判断redundancy不会把相同的model但是不同instance看成是相同的，这样可能会导致大量redundancy。
+        # req_num = 10
+        # chunk_size = 512
+        # model_paths = ['NousResearch/Llama-2-13b-hf'] * (20000 // chunk_size)
+        # model_paths = model_paths + ['NousResearch/Llama-2-13b-hf']
+        # # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
+        # in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths)-1)}
+        # in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = list(range(len(model_paths)-1))
+        # # 
+        # inp_generator = lambda req_num: [512]*req_num
+        # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
+        # outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
+        # node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size) \
+        #                               for i in range(len(model_paths)-1)}
+        
+
+
+        # NOTE: we have changed the computation graph to directly horizontally fuse all ``map`` models together
         req_num = 10
         chunk_size = 512
-        model_paths = ['NousResearch/Llama-2-13b-hf'] * (20000 // chunk_size)
-        model_paths = model_paths + ['NousResearch/Llama-2-13b-hf']
+        model_paths = ['NousResearch/Llama-2-13b-hf'] * 2
         # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
-        in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths)-1)}
-        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = list(range(len(model_paths)-1))
+        in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
         # 
         inp_generator = lambda req_num: [512]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
-        node_dataset_chunk_mapping = {-(i+1): ("ShareGPT_V3_unfiltered_cleaned_split.json", i, chunk_size) \
-                                      for i in range(len(model_paths)-1)}
-        
+        node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
+
+        inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
+
         # leave it later: for the case where we horizontally fuse all ``map`` models
-        out_req_id_mapping = {}
-        new_out_req_part_num = {}
+        out_req_id_mapping = {0: dict()}
+        tot_req_num = 0
+        inp_seq_ids_dict = {1:[]}
+        for i, inp_len in enumerate(inp_lens):
+            chunk_num = (inp_len+chunk_size-1)//chunk_size
+            out_req_id_mapping[0].update({chunk_i+tot_req_num:(i, chunk_i) for chunk_i in range(chunk_num) })
+            tot_req_num += chunk_num
+            inp_seq_ids_dict[1].append(tot_req_num-1)
+
+        inp_seq_ids_dict.update({0:list(out_req_id_mapping[0].keys())})
+
+
+        new_out_req_part_num = { 0: { i:(inp_len+chunk_size-1)//chunk_size for i, inp_len in enumerate(inp_lens)} }
         independent_srcs = {i:False for i in range(len(model_paths))}
+
+        # we need to prepare the dummpy requests here
+        _init_dummy_requests([chunk_size]*tot_req_num)
+
+        sampling_args1 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":True, # False, # True (original),
+            "max_tokens":50}
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths))}
 
     elif test_case == 'chain-summary':
         # # chain summary
@@ -1956,7 +2008,8 @@ def get_schedule_setting(test_case:str):
         print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
         # add another model after the chain summary
         model_paths.append('NousResearch/Llama-2-7b-hf')
-        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
+        # in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
+        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [19, 49]
         # out_edge_dict[3].append(5)
         # out_edge_dict[4] = [5]
         inp_seq_ids_dict[len(model_paths)-1] = sorted(set(inp_seq_ids_dict[len(model_paths)-2] + inp_seq_ids_dict[len(model_paths)-3]))
@@ -1969,6 +2022,7 @@ def get_schedule_setting(test_case:str):
         # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
         inp_req_ids = dict()
         independent_srcs = {i:False for i in range(len(model_paths))}
+        independent_srcs[len(model_paths)-1] = True
 
         # we need to prepare the dummpy requests here
         _init_dummy_requests(inp_lens)

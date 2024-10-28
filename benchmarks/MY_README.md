@@ -234,6 +234,7 @@ export TMPDIR=$HOME/tmp
 
 
 # create some folds
+cd benchmarks
 mkdir my_dummy_requests
 mkdir test_search
 mkdir test_end2end_schedule

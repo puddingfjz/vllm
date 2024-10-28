@@ -622,6 +622,8 @@ class LLM_COMMUNICATOR:
                             # we set possible_to_get_future_reqs to False
                             possible_to_get_future_reqs = False
 
+                        assert self._unavailable_req_nums[to_model_id] >= 0, f"assert self._unavailable_req_nums[to_model_id] >= 0 wrong: {self._unavailable_req_nums[to_model_id]}"
+
                         # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
 
                         return [], possible_to_get_future_reqs
