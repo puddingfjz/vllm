@@ -885,8 +885,10 @@ def _try_to_load_exec_plans(
 def _has_model_finished(
         plan_state_group_list:List[List[MyExecPlanState]],
         stage_i: int,
+        model_id_shared_id_mapping: Dict[int, int],
     )-> bool:
-    finished = [i for i in plan_state_group_list[stage_i] if SHARED_CONTECT.query_finish_status(i.exec_plan.model.model_id)]
+    finished = [i for i in plan_state_group_list[stage_i] \
+                if SHARED_CONTECT.query_finish_status(model_id_shared_id_mapping[i.exec_plan.model.model_id])]
     return len(finished) > 0
 
 def _get_the_next_round_exec_plan_schedule(
@@ -992,7 +994,7 @@ def _get_the_next_round_exec_plan_schedule(
         if new_target_stage_i < len(plan_state_group_list):
             # there are stages left
             new_candidate_exec_plan_states = plan_state_group_list[new_target_stage_i]
-            if _has_model_finished(plan_state_group_list, target_stage_i):
+            if _has_model_finished(plan_state_group_list, target_stage_i, model_id_shared_id_mapping):
                 # to_launch, new_candidate_exec_plan_states, model_ids_to_stop, new_launch, new_target_stage_i = \
                 to_launch, new_candidate_exec_plan_states, new_target_stage_i = \
                     _get_the_next_round_exec_plan_schedule(
@@ -1534,14 +1536,21 @@ async def main_with_preemption(
                 print(f"MAIN PROCESS: total time to launch processes (just the value of iter 0 is useful) {model_schedule_iter}: {start_waiting-start}s ---abs: {start_waiting}", flush=True)
 
                 # 1. get models that need to be stopped
-                launched_exec_plan_states, candidate_exec_plan_states, model_ids_to_stop, new_launch, new_target_stage_i = \
-                    get_the_next_round_exec_plan_schedule(
-                        launched_exec_plan_states, candidate_exec_plan_states,
-                        new_target_stage_i,
-                        tot_gpu_num, plan_state_group_list,
-                        model_driver_worker_gpu_i,
-                        model_id_shared_id_mapping,
-                    )
+                try:
+                    launched_exec_plan_states, candidate_exec_plan_states, model_ids_to_stop, new_launch, new_target_stage_i = \
+                        get_the_next_round_exec_plan_schedule(
+                            launched_exec_plan_states, candidate_exec_plan_states,
+                            new_target_stage_i,
+                            tot_gpu_num, plan_state_group_list,
+                            model_driver_worker_gpu_i,
+                            model_id_shared_id_mapping,
+                        )
+                except Exception as e:
+                    print(f"Exception in running benchmark_throughput.main(): {e}")
+                    print(traceback.format_exc())
+                
+                print(f"new_launch: {new_launch}")
+                print(f"model_ids_to_stop: {model_ids_to_stop}")
                 
 
                 # 2. stop the models

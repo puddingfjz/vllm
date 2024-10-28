@@ -467,6 +467,9 @@ class LLM_COMMUNICATOR:
             # sort the reqs by their req ids
             reqs = sorted(reqs, key=lambda x: x[0])
             self.fused_inp_queues[to_model_id].extend(reqs)
+
+            # print(f"self.fused_inp_queues[to_model_id]: {to_model_id}: {self.fused_inp_queues[to_model_id]}")
+
             self._unavailable_req_nums[to_model_id] = self._unavailable_req_nums[to_model_id] - len(reqs)
         else:
             # there are more than one inp src for the to_model
@@ -498,6 +501,9 @@ class LLM_COMMUNICATOR:
             new_complete_req_ids = sorted(new_complete_req_ids)
             reqs = [(req_id, self.fuse_inp_srcs(self._available_srcs[to_model_id][req_id][1])) for req_id in new_complete_req_ids]
             self.fused_inp_queues[to_model_id].extend(reqs)
+
+            # print(f"self.fused_inp_queues[to_model_id]: {to_model_id}: {self.fused_inp_queues[to_model_id]}")
+
             self._unavailable_req_nums[to_model_id] = self._unavailable_req_nums[to_model_id] - len(reqs)
 
 
@@ -621,12 +627,12 @@ class LLM_COMMUNICATOR:
                         return [], possible_to_get_future_reqs
                 else:
                     # run the normal get_seq process
-                    ret = self._get_seqs(to_model_id, dp_id, dp_size), possible_to_get_future_reqs
+                    ret = self._get_seqs(to_model_id, dp_id, dp_size)
 
-                    print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
+                    # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
 
                     self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
-                    return ret
+                    return ret, possible_to_get_future_reqs
 
             else:
 
@@ -1181,6 +1187,7 @@ class SHARED_CONTECT():
     @classmethod
     def query_finish_status(cls, shared_id) -> None:
         assert os.environ['RUN_MULTI_MODEL'] == 'True'
+        # print(f"query_finish_status: shared_id: {shared_id} ")
         return cls.shared_finish_status[shared_id]
 
 
