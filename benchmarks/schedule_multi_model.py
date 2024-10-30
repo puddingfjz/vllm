@@ -422,7 +422,9 @@ def search_best_scheduling(
         out_edge_dict: Dict[int, List[int]],
         check_gap: int, sort_input: bool,
         num_prompts: int, 
-        inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
+        inp_seq_ids_dict, 
+        out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]],
+        inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num: int = 4,
         max_group_seq_num: int = 100,
@@ -444,6 +446,7 @@ def search_best_scheduling(
         model_paths, 
         num_prompts,
         inp_seq_ids_dict,
+        out_req_id_mapping,
         inp_generator,
         inp_merger,
         outlen_generator,
@@ -1102,7 +1105,8 @@ def init_prompts_for_the_model_system(
         communicator: LLM_COMMUNICATOR,
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]], 
         in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]], 
-        num_prompts: int, independent_srcs):
+        num_prompts: int, 
+        inp_seq_ids_dict: Dict[int, List[int]]):
     """
         Sample input dataset for the model system.
         INPUT:
@@ -1141,12 +1145,14 @@ def init_prompts_for_the_model_system(
     for model_id, (dataset, chunk_id, chunk_size) in node_dataset_chunk_mapping.items():
         inp_prompts = dataset_dict[dataset]
         to_add = inp_prompts
+        print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)}, to_add[0]: {to_add[0]}")
+
         if dataset != None:
             if chunk_size > 0:
                 to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
         else:
             if chunk_size > 0:
-                to_add = [(i, req[(chunk_id*chunk_size-1)*2:((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
+                to_add = [(i, req[max(0,(chunk_id*chunk_size-1)*2):((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
 
         # communicator.add_seqs(model_id, to_add)
         prompts_dict[model_id] = to_add
@@ -1154,6 +1160,7 @@ def init_prompts_for_the_model_system(
     
 
     print(f"req_num_dict: {req_num_dict}", flush=True)
+    print(f"to_add: {to_add}")
 
     # set the req number for each non-dummy model node
     tot_node_num = len(req_num_dict) + len(in_edge_dict_with_dummy_inp_nodes)
@@ -1165,10 +1172,11 @@ def init_prompts_for_the_model_system(
         for tgt, srcs in in_edge_dict_with_dummy_inp_nodes.items():
             print(f"tgt, srcs: {tgt, srcs}", flush=True)
             if set(srcs).issubset(visited):
-                if independent_srcs[tgt]:
-                    req_num_dict[tgt] = sum([req_num_dict[src] for src in srcs])
-                else:
-                    req_num_dict[tgt] = min([req_num_dict[src] for src in srcs])
+                # if independent_srcs[tgt]:
+                #     req_num_dict[tgt] = sum([req_num_dict[src] for src in srcs])
+                # else:
+                #     req_num_dict[tgt] = min([req_num_dict[src] for src in srcs])
+                req_num_dict[tgt] = len(inp_seq_ids_dict[tgt])
                 visited.append(tgt)
                 print(f"visited: {visited}", flush=True)
 
@@ -1410,7 +1418,9 @@ async def main_with_preemption(
         out_edge_dict,
         check_gap, sort_input,
         num_prompts, 
-        inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
+        inp_seq_ids_dict, 
+        out_req_id_mapping,
+        inp_generator, inp_merger, outlen_generator,
         # 
         tot_gpu_num = tot_gpu_num, 
         max_group_seq_num = max_group_seq_num,
@@ -1468,7 +1478,7 @@ async def main_with_preemption(
         # set inputs for dummy inp nodes in the system
         # NOTE: stores the req num of base models (for fused models, store req num for the base models inside)
         base_req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
-                                                         num_prompts, independent_srcs)
+                                                         num_prompts, inp_seq_ids_dict)
 
         print(f"base_req_num_dict: {base_req_num_dict}")
 
@@ -1946,6 +1956,8 @@ def get_schedule_setting(test_case:str):
         # we need to prepare the dummpy requests here
         _init_dummy_requests([chunk_size]*tot_req_num)
 
+        req_num = tot_req_num
+
         sampling_args1 = {                    
             "n":1,
             # <jingzhi> change to greedy sampling to check correctness.
@@ -1963,6 +1975,11 @@ def get_schedule_setting(test_case:str):
             "ignore_eos":False, # False, # True (original),
             "max_tokens":int(1e9)}
         sampling_args_dict = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths))}
+
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
 
     elif test_case == 'chain-summary':
         # # chain summary
@@ -2069,7 +2086,7 @@ if __name__ == "__main__":
     gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
-    test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
+    test_case = 'map-reduce' # 'general' 'map-reduce' 'chain-summary'
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
              inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \

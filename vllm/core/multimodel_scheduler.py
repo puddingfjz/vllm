@@ -27,6 +27,7 @@ from vllm.engine.ray_utils import ray
 from multiprocessing.managers import BaseManager
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
+import traceback
 
 
 
@@ -61,7 +62,7 @@ class LLM_COMMUNICATOR:
             # 
             base_model_ids_dict: Dict[int, List[int]],
             inp_req_ids: Dict[int, Dict[int, List[int]]],
-            out_req_id_mapping: Dict[int, Dict[int, Dict[int, Tuple[int, int]]]],
+            out_req_id_mapping:Dict[int, Dict[int, Tuple[int, int]]],
             new_out_req_part_num: Dict[int, int],
             independent_srcs: Dict[int, bool],
             ):
@@ -152,6 +153,8 @@ class LLM_COMMUNICATOR:
         """
             Init self._meta_output_pool according to self.out_req_id_mapping, self.new_out_req_part_num.
         """
+        print(f"self.new_out_req_part_num: {self.new_out_req_part_num}")
+        print(f"self.out_req_id_mapping: {self.out_req_id_mapping}")
         for model_id in self.new_out_req_part_num:
             self._meta_output_pool[model_id] = dict()
             for new_out_req_id, tot_part_num in self.new_out_req_part_num[model_id].items():
@@ -241,15 +244,29 @@ class LLM_COMMUNICATOR:
             Process the outputs, e.g., concat different ori seqs into new out seqs.
             May be called when horizontally fusing models, e.g., Map-reduce Summary.
         """
+        print(f"in _process_outputs")
+
+        print(f"in _process_outputs: self._meta_output_pool[model_id]: model_id: {model_id}, {self._meta_output_pool[model_id]}")
+
         ret = list()
         for req_id, req_content in seqs:
             new_out_id, ind = self.out_req_id_mapping[model_id][req_id]
+
+            print(f"_process_outputs: req_id: {req_id}, model_id: {model_id}, new_out_id, ind: {new_out_id, ind}")
+
             self._meta_output_pool[model_id][new_out_id][1][ind] = req_content
             self._meta_output_pool[model_id][new_out_id][0] = self._meta_output_pool[model_id][new_out_id][0] + 1
             if self._meta_output_pool[model_id][new_out_id][0] == len(self._meta_output_pool[model_id][new_out_id][1]):
                 # this new out req is ready
                 new_out_content = self.fuse_inp_srcs(self._meta_output_pool[model_id][new_out_id][1])
                 ret.append((new_out_id, new_out_content))
+        
+
+        for v in self._meta_output_pool[model_id].values():
+            print(f"v[0]: {v[0]}")
+        print(f"ret: {[_[0] for _ in ret]}")
+        print(f"in _process_outputs: self._meta_output_pool[model_id]: model_id: {model_id}, {self._meta_output_pool[model_id]}")
+        
         return ret
 
 
@@ -283,6 +300,11 @@ class LLM_COMMUNICATOR:
 
             if model_id in self.new_out_req_part_num:
                 to_add = self._process_outputs(model_id=model_id, seqs=seqs)
+                for _ in to_add:
+                    print(_)
+
+            for _ in to_add:
+                print(_)
 
             self.output_pool[model_id].extend(to_add)
             # update self._ungened_out_req_nums
@@ -322,19 +344,27 @@ class LLM_COMMUNICATOR:
             NOTE:
                 1. this function is only for base models.
         """
-        if model_id not in self.base_model_ids_dict:
-            self.add_seqs_base_model(model_id=model_id, seqs=seqs)
-        else:
-            # 1. group seqs by base model ids
-            base_model_seqs_dict = defaultdict(list)
-            for seq in seqs:
-                req_id = seq[0]
-                base_model_id = self.out_req_model_id_mapping[model_id][req_id]
-                base_model_seqs_dict[base_model_id].append(seq)
-            
-            # 2. add seqs to each base model
-            for base_model_id, base_model_seqs in base_model_seqs_dict.items():
-                self.add_seqs_base_model(model_id=base_model_id, seqs=base_model_seqs)
+        try:
+            if model_id not in self.base_model_ids_dict:
+                self.add_seqs_base_model(model_id=model_id, seqs=seqs)
+            else:
+                # 1. group seqs by base model ids
+                base_model_seqs_dict = defaultdict(list)
+                for seq in seqs:
+                    req_id = seq[0]
+                    base_model_id = self.out_req_model_id_mapping[model_id][req_id]
+                    base_model_seqs_dict[base_model_id].append(seq)
+                
+                # 2. add seqs to each base model
+                for base_model_id, base_model_seqs in base_model_seqs_dict.items():
+                    self.add_seqs_base_model(model_id=base_model_id, seqs=base_model_seqs)
+
+        except Exception as e:
+            print(f"Exception in add_seqs: {e}")
+            print(traceback.format_exc())
+            assert False
+
+
 
 
 
@@ -613,7 +643,7 @@ class LLM_COMMUNICATOR:
                         
                         self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
 
-                        # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
+                        print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
 
                         return ret, possible_to_get_future_reqs
                     else:
@@ -624,14 +654,14 @@ class LLM_COMMUNICATOR:
 
                         assert self._unavailable_req_nums[to_model_id] >= 0, f"assert self._unavailable_req_nums[to_model_id] >= 0 wrong: {self._unavailable_req_nums[to_model_id]}"
 
-                        # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
+                        print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
 
                         return [], possible_to_get_future_reqs
                 else:
                     # run the normal get_seq process
                     ret = self._get_seqs(to_model_id, dp_id, dp_size)
 
-                    # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
+                    print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
 
                     self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
                     return ret, possible_to_get_future_reqs
@@ -642,7 +672,7 @@ class LLM_COMMUNICATOR:
 
                 self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
 
-                # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5")
+                print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5")
 
                 return ret, possible_to_get_future_reqs
 
@@ -669,10 +699,9 @@ class LLM_COMMUNICATOR:
             NOTE:
                 1. this function is for any model: fused or base models.
         """ 
-        import traceback
         try:
 
-            # print(f"self.base_model_ids_dict: {self.base_model_ids_dict}")
+            print(f"self.base_model_ids_dict: {self.base_model_ids_dict}")
 
             base_model_ids = list() 
             if to_model_id not in self.base_model_ids_dict:

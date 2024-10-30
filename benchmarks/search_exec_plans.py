@@ -2902,6 +2902,7 @@ class MyModelSystem:
         # parameters for inp/out lens correction
         cost_table: CostTable, inp_merger, outlen_generator, 
         need_correct_inp_out_lens: bool,
+        out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         # here we have self.model_list[i].model_id = i --> change to use model dict now
         self.model_dict: Dict[int, MyModelInfor] = {model.model_id: model for model in model_list}
@@ -2939,7 +2940,7 @@ class MyModelSystem:
         # TODO: 这个地方可以优化一下，一步到位生成所有模型的正确的inp/out lens
         if need_correct_inp_out_lens:
             self._get_inp_out_lens_considering_LLM_dependency(
-                cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator)
+                cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator, out_req_id_mapping=out_req_id_mapping)
         
         print("correct inp/out lens of each model: ")
         for model_id, model in self.model_dict.items():
@@ -3092,7 +3093,9 @@ class MyModelSystem:
     def _get_inp_out_lens_considering_LLM_dependency(
             self, 
             cost_table: CostTable,
-            inp_merger, outlen_generator):
+            inp_merger, outlen_generator, 
+            out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]],
+        ):
         """
             Compute the input and output sequence lengths for all LLMs in the system according to the given ``inp_merger``.
             NOTE: the model dependency is considered here.
@@ -3108,9 +3111,31 @@ class MyModelSystem:
                 update the input and output seq lengths of all LLMs in the system.
         """
 
-        def get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id):
+        def get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id, out_req_id_mapping):
             outputs = self.model_dict[inp_model_id].get_inp_out_seqlens()[1]
             outputs_inds = self.model_dict[inp_model_id].get_inp_seq_ids()
+
+            if inp_model_id in out_req_id_mapping:
+                # we need to concat some output of this model's outputs as new outputs that other models can use
+                new_output_ids = [out_req_id_mapping[inp_model_id][output_id][0] for output_id in outputs_inds]
+                print(f"new_output_ids: {new_output_ids}")
+                # sort the items by the order of new output req ids
+                order = np.argsort(new_output_ids)
+                new_output_ids, counts = np.unique(new_output_ids, return_counts=True)
+                print(f"new_output_ids: {new_output_ids}, counts: {counts}")
+                cum_chunk_nums = np.cumsum(np.concatenate(([0], counts)))
+                new_outputs = np.asarray(outputs)[order]
+                print(f"cum_chunk_nums: {cum_chunk_nums}")
+                print(f"new_outputs: {new_outputs}")
+                new_outputs = [sum(new_outputs[cum_chunk_nums[i]:cum_chunk_nums[i+1]]) for i in range(len(counts))]
+                print(f"new_outputs: {new_outputs}")
+                
+                outputs = new_outputs
+                outputs_inds = new_output_ids
+
+                # NOTE: TODO: 此处我们暂时修改一下output inds，等horizontal fusion的支持完善了之后可以把这个去掉。
+                outputs_inds = cum_chunk_nums[1:]-1
+                print(f"outputs_inds: {outputs_inds}")
 
             # we need to consider the case where the inp seq id is not the output of the model
             # for example: a model after the chain summary, it depends on different model stages in the summary chain
@@ -3150,7 +3175,7 @@ class MyModelSystem:
                 inp_seq_ids = model.get_inp_seq_ids()
                 new_inp_lens = inp_merger(
                     [ori_inp_lens] + \
-                        [get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id) for inp_model_id in model.input_model_ids]
+                        [get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id, out_req_id_mapping) for inp_model_id in model.input_model_ids]
                         )
                 # new_inp_lens = inp_merger(
                 #     [ori_inp_lens] + \
@@ -5467,7 +5492,8 @@ def get_best_model_schedule(
         check_gap: int, sort_input: bool,
         model_paths: List[str], 
         # 
-        num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator,
+        num_prompts, inp_seq_ids_dict, out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]], 
+        inp_generator, inp_merger, outlen_generator,
         # 
         out_edge_dict: Dict[int, List[int]],
         sample_config: Tuple[float, float, float, float],
@@ -5501,7 +5527,8 @@ def get_best_model_schedule(
     
     model_sys = MyModelSystem(model_list=model_list, out_edge_dict=out_edge_dict, 
                               cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator,
-                              need_correct_inp_out_lens=True)
+                              need_correct_inp_out_lens=True, 
+                              out_req_id_mapping=out_req_id_mapping)
 
     _MODEL_ID = len(model_list)
     # 1. correct the model ori remaining decoding flops
@@ -5874,7 +5901,7 @@ if __name__ == "__main__":
     print(f"\nreal out_edge_dict: {out_edge_dict}")
     print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
 
-
+    out_req_id_mapping = dict()
 
 
 
@@ -5930,7 +5957,9 @@ if __name__ == "__main__":
         check_gap,
         sort_input,
         model_paths, 
-        num_prompts=req_num, inp_seq_ids_dict=inp_seq_ids_dict, inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        num_prompts=req_num, inp_seq_ids_dict=inp_seq_ids_dict, 
+        out_req_id_mapping=out_req_id_mapping,
+        inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         out_edge_dict=out_edge_dict,
         sample_config=(1, 1, -1, 0),
         trust_remote_code=True, revision=None,
