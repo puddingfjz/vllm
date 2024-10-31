@@ -3845,7 +3845,7 @@ def _get_possible_exec_plans(
 # Change the default version to the version where dp_size can be any value.
 # 但是其实两种思路都有测试的价值，说到底关键还是我们的cost model发挥了作用，没有cost model的话或许就真的只能选择dp_size=1的这种可能
 def _get_possible_exec_plans_naive_baseline_1(
-        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable):
+        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool):
     '''
     Get the possible execution plan for the model.
     Input:

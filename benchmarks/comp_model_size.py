@@ -271,9 +271,9 @@ def get_model_initialization_time(model_path: str, tp_size: int, model_init_cost
 if __name__ == "__main__":
 
     model_paths = [
-                    # 'NousResearch/Llama-2-7b-hf', 
+                    'NousResearch/Llama-2-7b-hf', 
                 #    'NousResearch/Llama-2-7b-chat-hf',
-                #    'NousResearch/Llama-2-13b-hf',
+                   'NousResearch/Llama-2-13b-hf',
                 #    'NousResearch/Llama-2-70b-hf',
                 #    'THUDM/chatglm3-6b',
                 #    'EleutherAI/gpt-j-6b', 
@@ -281,14 +281,14 @@ if __name__ == "__main__":
                 #    'baichuan-inc/Baichuan2-13B-Chat',
                 #    'baichuan-inc/Baichuan-7B',
                 #    'mistralai/Mixtral-8x7B-v0.1',
-                'lmsys/vicuna-13b-v1.5',
-                'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
-                'chavinlo/alpaca-13b',
-                'project-baize/baize-v2-13b',
-                'TheBloke/koala-13B-HF',
-                'databricks/dolly-v2-12b',
-                'mosaicml/mpt-7b-chat',
-                'THUDM/chatglm3-6b',
+                # 'lmsys/vicuna-13b-v1.5',
+                # 'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+                # 'chavinlo/alpaca-13b',
+                # 'project-baize/baize-v2-13b',
+                # 'TheBloke/koala-13B-HF',
+                # 'databricks/dolly-v2-12b',
+                # 'mosaicml/mpt-7b-chat',
+                # 'THUDM/chatglm3-6b',
                 ]
 
     # model_sizes = dict()

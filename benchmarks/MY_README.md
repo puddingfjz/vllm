@@ -24,6 +24,11 @@ benchmarks
     model_size_database.py:                 stores the model parameter sizes
                                             obtained by running comp_model_size.py
 
+    model_initcost_database.py              stores the model init costs
+                                            obtained by running comp_model_size.py
+                                            NOTE: every time introducing a new model (i.e., the models except those used in LLM-Blender), run comp_model_size.py 
+                                                for that model.
+
     search_exec_plans.py:                   generate multi-model schedule plan
                                             增加data parallel的支持的时候所有改动的代码都标注了data parallel
                                             为了支持data parallel：

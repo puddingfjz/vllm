@@ -132,13 +132,17 @@ class LLMEngine:
         # <jingzhi> For Profiling
         start_time = time.perf_counter()
 
+
+        print(f"finish init workers  ---abs {start_time}")
+
+
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
 
         # <jingzhi> For Profiling
         end_time = time.perf_counter()
-        print(f"_init_workers_ray _init_cache time: {end_time - start_time}s")
+        print(f"_init_workers_ray _init_cache time: {end_time - start_time}s ---abs {end_time}")
 
 
         # Create the scheduler.
