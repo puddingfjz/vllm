@@ -113,6 +113,16 @@ def get_dataset(dataset_path: str):
             dataset.extend([(data['messages'][0]['content'],
                              data['messages'][1]['content']) for data in a])
         return dataset
+    elif dataset_path == 'train-00000-of-00001-b334c773bce22cb2.parquet':
+        # NOTE: for this dataset, there is no answer text, we only have the prompt part
+        # deal with other dataset
+        import pyarrow.parquet as pq
+        dataset = list()
+        for fname in ['train-00000-of-00001-b334c773bce22cb2.parquet']:
+            a = pq.read_table(fname)
+            a = a.to_pylist()
+            dataset.extend([data['text'] for data in a])
+        return dataset
           
 
 

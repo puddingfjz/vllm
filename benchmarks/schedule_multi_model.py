@@ -1093,12 +1093,28 @@ def _get_dummy_requests():
     return dataset
 
 
-def _init_dummy_requests(inp_lens: List[int]):
-    import json
-    with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
-        requests = ["hi" * (input_len - 1) for input_len in inp_lens]
-        json.dump(requests, f)
+# def _init_dummy_requests(inp_lens: List[int]):
+#     import json
+#     with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
+#         requests = ["hi" * (input_len - 1) for input_len in inp_lens]
+#         json.dump(requests, f)
 
+
+def _init_dummy_requests(
+        inp_lens: List[int],
+        sampled_inps: List[List[int]]=None, 
+        model_path:str=None, ):
+    import json
+    if model_path == None:
+        with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
+            requests = ["hi" * (input_len - 1) for input_len in inp_lens]
+            json.dump(requests, f)    
+    else:
+        with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
+            # convert the token ids back to str
+            # NOTE: TODO: 貌似把token ids转回str非常复杂，所以干脆直接在文件里写入token ids了。
+            assert sampled_inps != None
+            json.dump(sampled_inps, f)
 
 
 def init_prompts_for_the_model_system(
@@ -1106,7 +1122,8 @@ def init_prompts_for_the_model_system(
         node_dataset_chunk_mapping: Dict[int, Tuple[str, int, int]], 
         in_edge_dict_with_dummy_inp_nodes: Dict[int, List[int]], 
         num_prompts: int, 
-        inp_seq_ids_dict: Dict[int, List[int]]):
+        inp_seq_ids_dict: Dict[int, List[int]],
+        model_path:str):
     """
         Sample input dataset for the model system.
         INPUT:
@@ -1120,7 +1137,7 @@ def init_prompts_for_the_model_system(
     """
 
     # simply use the tokenizer of llama2 7b to check the lengths of the prompts
-    args = InferenceArgs(model='NousResearch/Llama-2-7b-hf', num_prompts=num_prompts)
+    args = InferenceArgs(model=model_path, num_prompts=num_prompts)
 
     from transformers import AutoTokenizer
     # Sample the requests.
@@ -1129,11 +1146,15 @@ def init_prompts_for_the_model_system(
 
     datasets = set([v[0] for v in node_dataset_chunk_mapping.values()])
     dataset_dict = dict()
+    print(f"datasets: {datasets}")
     for dataset in datasets:
         if dataset == None:
             requests = _get_dummy_requests()
             inp_prompts = [(i, req) for i, req in enumerate(requests)]
             dataset_dict[dataset] = inp_prompts
+            
+            print(f"prompt_lens: {[len(req) for _, req in dataset_dict[None]]}")
+            
             continue
         requests = benchmark_throughput.sample_requests(
             dataset, args.num_prompts, tokenizer,args.output_len)
@@ -1145,14 +1166,18 @@ def init_prompts_for_the_model_system(
     for model_id, (dataset, chunk_id, chunk_size) in node_dataset_chunk_mapping.items():
         inp_prompts = dataset_dict[dataset]
         to_add = inp_prompts
-        print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)}, to_add[0]: {to_add[0]}")
+        # print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)}, to_add[0]: {to_add[0]}")
+
+        print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)} prompt_lens: {[len(req) for _, req in dataset_dict[None]]}")
+
 
         if dataset != None:
             if chunk_size > 0:
                 to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
         else:
             if chunk_size > 0:
-                to_add = [(i, req[max(0,(chunk_id*chunk_size-1)*2):((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
+                # to_add = [(i, req[max(0,(chunk_id*chunk_size-1)*2):((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
+                to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
 
         # communicator.add_seqs(model_id, to_add)
         prompts_dict[model_id] = to_add
@@ -1191,6 +1216,14 @@ def init_prompts_for_the_model_system(
 
     # send the prompts of the dummy inp nodes (i.e., dummy inp nodes' outputs) to the communicator 
     for model_id, to_add in prompts_dict.items():
+
+        # convert token ids to strs
+        # TODO: 暂时先这么写，但是tokenizer.decode还有参数需要完善
+        print(f"model_id: {model_id}")
+        # print(to_add[0])
+        if not isinstance(to_add[0], str):
+            to_add = [(req_i, tokenizer.decode(token_ids)) for req_i, token_ids in to_add]
+
         communicator.add_seqs(model_id, to_add)
 
     return req_num_dict
@@ -1477,8 +1510,9 @@ async def main_with_preemption(
 
         # set inputs for dummy inp nodes in the system
         # NOTE: stores the req num of base models (for fused models, store req num for the base models inside)
+        # TODO: 这里的model_paths[0]也还需要修改
         base_req_num_dict = init_prompts_for_the_model_system(communicator, node_dataset_chunk_mapping, in_edge_dict_with_dummy_inp_nodes,
-                                                         num_prompts, inp_seq_ids_dict)
+                                                         num_prompts, inp_seq_ids_dict, model_path=model_paths[0])
 
         print(f"base_req_num_dict: {base_req_num_dict}")
 
@@ -1857,8 +1891,251 @@ def get_tot_latency_from_log(filename: str):
 
 
 
+def _get_document_prompts(
+        dataset_path: str, model_path: str, num_requests: int
+        ) -> List[List[int]]:
+    """
+        NOTE: 
+            1. Currently, we do not sort the input chunks in this case.
+            2. The dataset in this function only has prompts, i.e., no output texts.
+        Output:
+            1. list of prompt token ids
+    """
+    from benchmark_throughput import get_dataset
+    import random
+    dataset = get_dataset(dataset_path=dataset_path)
 
-def get_schedule_setting(test_case:str):
+    # simply use the tokenizer of llama2 7b to check the lengths of the prompts
+    args = InferenceArgs(model=model_path, num_prompts=1)
+
+    from transformers import AutoTokenizer
+    # Sample the requests.
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, trust_remote_code=args.trust_remote_code)
+
+    # Tokenize the prompts and completions.
+    prompts = dataset
+    prompt_token_ids = tokenizer(prompts).input_ids
+
+    tokenized_dataset = prompt_token_ids
+
+    # Filter out too long sequences.
+    filtered_dataset: List[List[int]] = tokenized_dataset
+
+    # Sample the requests.
+    # <jingzhi> make sample size be ``min(num_requests, len(filtered_dataset))''
+    sampled_requests = random.sample(filtered_dataset, min(num_requests, len(filtered_dataset)))
+
+    # if os.environ['SORT_REQS'] == 'True':
+    #     sampled_requests = sorted(sampled_requests, key=lambda x: x[1], reverse=True)
+
+
+    print(f"tot_tokens: {sum([len(x) for x in sampled_requests])}, tot_context_lens: {sum([(len(x)-1)*len(x)/2 for x in sampled_requests])}")
+
+
+    return sampled_requests
+
+
+
+
+
+def _get_schedule_setting_with_real_data(test_case: str):
+    in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+        None, None, None, None, None
+
+    req_num = None
+    inp_seq_ids_dict = None
+    model_paths = None
+
+    # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
+    inp_req_ids = dict()
+    
+    # store information if the output of a model need to be merged to generate new out reqs
+    out_req_id_mapping = dict()
+    new_out_req_part_num = dict()
+    
+    # whether a base model's different input sources are independent or need to be merged, ...
+    independent_srcs = dict()
+    sampling_args_dict = dict()
+    if test_case == 'general':
+        pass
+
+    elif test_case == 'map-reduce':
+        # NOTE: we have changed the computation graph to directly horizontally fuse all ``map`` models together
+        req_num = 10
+        chunk_size = 512
+        fixed_output_size = 50
+        model_paths = ['NousResearch/Llama-2-13b-hf'] * 2
+        # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
+        in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
+        # 
+        inp_generator = lambda req_num: [chunk_size]*req_num
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
+        outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+        node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
+
+
+        # sample the real data from dataset
+        dataset_path = 'train-00000-of-00001-b334c773bce22cb2.parquet'
+        sampled_inps: List[List[int]] = _get_document_prompts(dataset_path=dataset_path, model_path=model_paths[0], num_requests=req_num)
+        inp_lens = np.asarray([len(prompt_token_ids) for prompt_token_ids in sampled_inps])
+
+        # leave it later: for the case where we horizontally fuse all ``map`` models
+        out_req_id_mapping = {0: dict()}
+        tot_req_num = 0
+        inp_seq_ids_dict = {1:[]}
+        sampled_inp_chunks = list()
+        for i, inp_len in enumerate(inp_lens):
+            chunk_num = (inp_len+chunk_size-1)//chunk_size
+            out_req_id_mapping[0].update({chunk_i+tot_req_num:(i, chunk_i) for chunk_i in range(chunk_num) })
+            tot_req_num += chunk_num
+            inp_seq_ids_dict[1].append(tot_req_num-1)
+            sampled_inp_chunks.extend([sampled_inps[i][chunk_i*chunk_size:(chunk_i+1)*chunk_size] for chunk_i in range(chunk_num)])
+
+        inp_seq_ids_dict.update({0:list(out_req_id_mapping[0].keys())})
+
+
+        new_out_req_part_num = { 0: { i:(inp_len+chunk_size-1)//chunk_size for i, inp_len in enumerate(inp_lens)} }
+        independent_srcs = {i:False for i in range(len(model_paths))}
+
+        # we need to prepare the dummpy requests here
+        _init_dummy_requests([chunk_size]*tot_req_num, sampled_inp_chunks, model_path=model_paths[0])
+
+        req_num = tot_req_num
+
+        sampling_args1 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":True, # False, # True (original),
+            "max_tokens":50}
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths))}
+
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+
+
+    elif test_case == 'chain-summary':
+        # # chain summary
+        req_num = 10
+        chunk_size = 512
+        fixed_output_size = 50
+
+        # sample the real data from dataset
+        dataset_path = 'train-00000-of-00001-b334c773bce22cb2.parquet'
+        model_path = 'NousResearch/Llama-2-13b-hf'
+        sampled_inps: List[List[int]] = _get_document_prompts(dataset_path=dataset_path, model_path=model_path, num_requests=req_num)
+        # sort the sampled inps
+        sampled_inps = sorted(sampled_inps, key=lambda i: len(i), reverse=True)
+        inp_lens = np.asarray([len(prompt_token_ids) for prompt_token_ids in sampled_inps])
+
+        print(f"inp_lens: {inp_lens}")
+
+        max_length = max(inp_lens)
+
+        print(f"max chunk num: {(max_length + chunk_size - 1) // chunk_size}")
+
+        model_paths = ['NousResearch/Llama-2-13b-hf'] * ((max_length + chunk_size - 1) // chunk_size)
+        print(f"model_paths: {model_paths}")
+        # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
+        # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
+        # in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] + list(range(i)) for i in range(len(model_paths))}
+        in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
+        in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
+
+        inp_generator = lambda req_num: [chunk_size]*req_num
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+        outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+        # here ``None`` means we use our own dummpy request dataset
+        node_dataset_chunk_mapping = {-(i+1): (None, i, chunk_size)\
+                                      for i in range(len(model_paths))}
+        
+        inp_seq_ids_dict = defaultdict(list)
+        # inp_lens = np.asarray(inp_generator(req_num))
+        # inp_lens = np.asarray([chunk_size]*int(0.2*req_num)+[2*chunk_size]*int(0.2*req_num)\
+        #                     +[3*chunk_size]*int(0.2*req_num)+[4*chunk_size]*int(0.2*req_num)\
+        #                         +[5*chunk_size]*int(0.2*req_num))
+        # inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
+        inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
+        print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+
+        # add another model after the chain summary
+        model_paths.append('NousResearch/Llama-2-7b-hf')
+        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
+        # in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [19, 49]
+        # out_edge_dict[3].append(5)
+        # out_edge_dict[4] = [5]
+        inp_seq_ids_dict[len(model_paths)-1] = sorted(set(inp_seq_ids_dict[len(model_paths)-2] + inp_seq_ids_dict[len(model_paths)-3]))
+
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+
+        
+        # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
+        inp_req_ids = dict()
+        independent_srcs = {i:False for i in range(len(model_paths))}
+        independent_srcs[len(model_paths)-1] = True
+
+        # we need to prepare the dummpy requests here
+        # _init_dummy_requests(inp_lens)
+        _init_dummy_requests(inp_lens, sampled_inps, model_path=model_paths[0])
+        sampling_args1 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":True, # False, # True (original),
+            "max_tokens":50}
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args1) for base_model_id in range(len(model_paths)-1)}
+        sampling_args_dict.update({len(model_paths)-1:SamplingParams(**sampling_args1)})
+
+
+
+
+    # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
+    # # search_method_baseline = 'ours' # 'naive'  'ours'
+    # gen_execplans_baseline = 'ours' # 'naive'  'ours'
+    # search_method_baseline = 'ours' # 'naive'  'ours'
+    check_gap = 16
+    sort_input = True
+
+    return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
+
+
+
+
+
+
+def get_schedule_setting(test_case:str, use_real_dataset:bool):
+
+    if use_real_dataset:
+        return _get_schedule_setting_with_real_data(test_case=test_case)
+    
+
 
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
@@ -2086,11 +2363,11 @@ if __name__ == "__main__":
     gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
-    test_case = 'map-reduce' # 'general' 'map-reduce' 'chain-summary'
+    test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
              inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \
-        get_schedule_setting(test_case=test_case)
+        get_schedule_setting(test_case=test_case, use_real_dataset=True)
     
     asyncio.run(main_with_preemption(
         model_paths=model_paths,

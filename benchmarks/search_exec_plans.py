@@ -3816,6 +3816,8 @@ def _get_possible_exec_plans(
 
 # NOTE: we set dp_size to 1 here, but maybe we should select the best exec plan for the model?
 # ==> such function is implemented in "_get_possible_exec_plans_naive_baseline_2()"
+# Change the default version to the version where dp_size can be any value.
+# 但是其实两种思路都有测试的价值，说到底关键还是我们的cost model发挥了作用，没有cost model的话或许就真的只能选择dp_size=1的这种可能
 def _get_possible_exec_plans_naive_baseline(
         model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable):
     '''
@@ -3869,6 +3871,9 @@ def _get_possible_exec_plans_naive_baseline(
         num_worker, wld_degree, cache_gpu_num, mem_per_comp_gpu, dp_size,
         param_byte_per_comp_gpu, param_byte_per_cache_gpu,
         gpu_cache_byte_per_block, infer_args, tot_gpu_mem_byte=byte_per_gpu)
+
+    if isinstance(model, MyFusedModelInfor):
+        exec_plan = MyVerticalFusedExecPlan(model, exec_plan)
     
     print(f"gen an exec plan: {str(exec_plan)}")
 
@@ -3924,7 +3929,8 @@ def _get_possible_exec_plans_naive_baseline_2(
             get_per_layer_and_extra_param_and_buffer_byte(model, num_worker)
 
         # for wld_degree in [2, 8, 10, 16, 20, 40]: # get_factors(layer_num): # TODO
-        for wld_degree in get_factors(model.layer_num, 2, model.layer_num):
+        # for wld_degree in get_factors(model.layer_num, 2, model.layer_num):
+        for wld_degree in [2]:
             if wld_degree < 2:
                 # if wld_degree <= 2, then we do not need to use cache gpu, so <2 will be the same as ==2.
                 continue
@@ -3960,6 +3966,9 @@ def _get_possible_exec_plans_naive_baseline_2(
                         param_byte_per_comp_gpu, param_byte_per_cache_gpu,
                         gpu_cache_byte_per_block, infer_args, tot_gpu_mem_byte=byte_per_gpu)
                     
+                    if isinstance(model, MyFusedModelInfor):
+                        exec_plan = MyVerticalFusedExecPlan(model, exec_plan)
+                    
                     # print(f"gen an exec plan: {str(exec_plan)}")
 
                     # check whether exec_plan is valid
@@ -3969,7 +3978,7 @@ def _get_possible_exec_plans_naive_baseline_2(
                         # print(f"valid")
 
                         # support data parallel
-                        for dp_size in range(1, tot_gpu_num // num_worker + 1):
+                        for dp_size in range(2, tot_gpu_num // num_worker + 1):
                             if dp_size * num_worker + cache_gpu_num > tot_gpu_num:
                                 # each dp worker occupies num_worker GPUs for computation
                                 # all dp workers can share cache_gpu_num GPUs for cache (but it is not necessary)
@@ -3980,6 +3989,9 @@ def _get_possible_exec_plans_naive_baseline_2(
                                 num_worker, wld_degree, cache_gpu_num, mem_per_comp_gpu, dp_size,
                                 param_byte_per_comp_gpu, param_byte_per_cache_gpu,
                                 gpu_cache_byte_per_block, infer_args, tot_gpu_mem_byte=byte_per_gpu)
+                            
+                            if isinstance(model, MyFusedModelInfor):
+                                exec_plan = MyVerticalFusedExecPlan(model, exec_plan)
                             
                             # do not need to call is_valid_exec_plan for dp_size
                             exec_plans.append(exec_plan)
@@ -4437,7 +4449,8 @@ def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_p
 
 
 
-
+# TODO: 这个地方可能还是要把model vertical fusion的功能加进来，因为这个函数也会在根据exec plan greedy地做选择的时候被调用，而这种情况
+# 我们并不会无脑vertical fuse model
 def _append_exec_plan_baseline_greedy_baseline_adapted_from_MuxServe(
         plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_per_gpu,
         cost_table: CostTable,
@@ -5078,7 +5091,7 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
     if len(curr_group_seq.plan_group_seq) > model_sys.get_model_num():
         # assert False, f'{[model.left_flops_per_token for model in model_list]},'\
         #             f'{[[str(_) for _ in group] for group in curr_group_seq]}'
-        assert False, f'{[[str(_) for _ in group] for group in curr_group_seq]}'
+        assert False, f'{[[str(_) for _ in group.exec_plans] for group in curr_group_seq]}'
 
 
     print(f"finish step 1:      curr depth is within limit")
@@ -5108,7 +5121,8 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
 
     # 2. get the model states before the current infer stage, check its redundancy
     # model_states = get_model_states(model_list)
-    model_states = model_sys.get_model_states()
+    # model_states = model_sys.get_model_states()
+    model_states = model_sys.get_base_model_states()
 
 
     if model_states in uniq_model_states:
@@ -5150,6 +5164,10 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
     ori_inp_out_lens_list = model_sys.get_model_inp_out_lens()
     ori_remaining_decode_flops_list = model_sys.get_model_remaining_decode_flops()
     ori_inp_seq_ids_list = model_sys.get_model_inp_seq_ids()
+    ori_inp_model_ids_list = model_sys.get_model_inp_model_ids()
+    ori_model_sys = model_sys
+
+
 
     # 3.1 pruning rule: if using the highest throughput in plan_groups still cannot beat best_group_seq, skip all of them
     # if (get_model_left_decode_flops(model_list, cost_table) / plan_groups[0].get_comp_throughput_only() + curr_group_seq.get_tot_time()) \
@@ -5176,12 +5194,42 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
         #     < best_group_seq.get_valid_throughput():
         #     continue
 
-        # update the remaining workload of all models after this stage
-        # recover_model_state(model_list, ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+        # we first recover the ori model sys
+        model_sys = ori_model_sys
+
+
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
         model_sys.recover_model_state(
-            ori_inp_seq_ids_list,ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+            ori_inp_seq_ids_list,ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list,
+            ori_inp_model_ids_list)
+        
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
+        # we need to update model_sys as we may introduce fused model nodes
+        model_sys = model_sys.gen_new_model_sys_with_fused_models(
+            fused_model_list=plan_group.get_involved_fused_models())
+
+        print(f"model_sys model objects: {list(model_sys.model_dict.items())}")
+        print(f"plan_group model objects: {[(plan.model.model_id, plan.model) for plan in plan_group.exec_plans]}")
+
+        # check inp out len accuracy
+        model_sys.check_finish_states_accuracy()
+
         # comp_time = update_model_state(plan_group, gpu_name)
         plan_group.update_model_inp_out_lens(cost_table)
+
+        # check inp out len accuracy
+        model_sys.check_finish_states_accuracy()
+
+
+
+        # update the remaining workload of all models after this stage
+        # recover_model_state(model_list, ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+        # model_sys.recover_model_state(
+        #     ori_inp_seq_ids_list,ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
+        # # comp_time = update_model_state(plan_group, gpu_name)
+        # plan_group.update_model_inp_out_lens(cost_table)
+        
+        
         curr_group_seq.append_plan_group(plan_group)
         curr_group_seq.append_exec_time(plan_group.get_infer_stage_latency())
         _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
@@ -5225,6 +5273,7 @@ def _get_best_model_schedule_dispatcher(
             uniq_model_states,
             gpu_name, tot_gpu_num, byte_per_gpu, top_k)
     else:
+        assert False, "ERROR: we currently do not support greedy search algorithm"
         _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
             gen_execplans_baseline,
             check_gap, sort_input,
@@ -5538,6 +5587,9 @@ def get_best_model_schedule(
         model.inp_base_model_ids = model.input_model_ids
 
     # 3. directly fuse some models vertically to reduce the total model number in the system for faster and better search
+    # TODO: 这个地方对于search method的naive版本我们其实有两种变体，所以之后可能还需要用不同的str来控制。
+    if search_method_baseline == 'naive' or gen_execplans_baseline == 'naive':
+        similar_threshold = float('inf')
     model_sys = model_sys.fuse_similar_models_in_a_chain(
             tot_gpu_num, byte_per_gpu, cost_table,
             check_gap, sort_input,
