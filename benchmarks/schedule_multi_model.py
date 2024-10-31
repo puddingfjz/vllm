@@ -1908,6 +1908,8 @@ def _get_document_prompts(
     # simply use the tokenizer of llama2 7b to check the lengths of the prompts
     args = InferenceArgs(model=model_path, num_prompts=1)
 
+    random.seed(args.seed)
+
     from transformers import AutoTokenizer
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
@@ -2087,7 +2089,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
         inp_req_ids = dict()
         independent_srcs = {i:False for i in range(len(model_paths))}
-        independent_srcs[len(model_paths)-1] = True
+        # independent_srcs[len(model_paths)-1] = True
 
         # we need to prepare the dummpy requests here
         # _init_dummy_requests(inp_lens)
@@ -2360,7 +2362,7 @@ if __name__ == "__main__":
     # --------------------------------------------------------------------
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # # search_method_baseline = 'ours' # 'naive'  'ours'
-    gen_execplans_baseline = 'ours' # 'naive'  'ours'
+    gen_execplans_baseline = 'naive' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
     test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'

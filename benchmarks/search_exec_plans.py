@@ -2999,7 +2999,7 @@ class MyModelSystem:
             for to_fuse_model in cand_models:
                 
                 # 1. compute its comp throughput vector
-                exec_plans = get_possible_exec_plans(to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours')
+                exec_plans = get_possible_exec_plans(to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours', sort_input=sort_input)
                 plan_groups = [MyExecPlanGroup([exec_plan], cost_table=cost_table, last_stage_exec_plans=[],
                                                 check_gap=check_gap, sort_input=sort_input,) for exec_plan in exec_plans]
                 comp_throughput_vecs = np.asarray([plan_group.get_comp_throughput_only() for plan_group in plan_groups])
@@ -3431,7 +3431,7 @@ class MyModelSystem:
             # 1. first get the candidate exec plans for each model
             exec_plans_list = list()
             for model in cand_models:
-                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline)
+                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input)
                 exec_plans_list.append(exec_plans)
                 print(f"model finished? {model.is_finished()}, model_id: {model.get_base_model_ids()}, can exec_plans: {[str(plan) for plan in exec_plans]}")
 
@@ -3539,7 +3539,7 @@ class MyModelSystem:
             # 1. first get the candidate exec plans for each model
             exec_plans_list = list()
             for model in cand_models:
-                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline)
+                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input)
                 exec_plans_list.append(exec_plans)
             
             # 2. second combine exec plans for different models into a group
@@ -3586,7 +3586,7 @@ class MyModelSystem:
             # 1. first get the candidate exec plans for each model
             exec_plans_list = list()
             for model in cand_models:
-                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline)
+                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input)
                 exec_plans_list.extend(exec_plans)
             
             # 2. second combine exec plans for different models into a group
@@ -3818,7 +3818,7 @@ def _get_possible_exec_plans(
 # ==> such function is implemented in "_get_possible_exec_plans_naive_baseline_2()"
 # Change the default version to the version where dp_size can be any value.
 # 但是其实两种思路都有测试的价值，说到底关键还是我们的cost model发挥了作用，没有cost model的话或许就真的只能选择dp_size=1的这种可能
-def _get_possible_exec_plans_naive_baseline(
+def _get_possible_exec_plans_naive_baseline_1(
         model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable):
     '''
     Get the possible execution plan for the model.
@@ -3888,7 +3888,7 @@ def _get_possible_exec_plans_naive_baseline(
 
 
 
-def _get_possible_exec_plans_naive_baseline_2(
+def _get_possible_exec_plans_naive_baseline(
         model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool):
     '''
     Get the possible execution plan for the model.
@@ -4014,7 +4014,7 @@ def _get_possible_exec_plans_naive_baseline_2(
 
 def get_possible_exec_plans(
         model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable,
-        baseline: str):
+        baseline: str, sort_input: bool):
     '''
     Get the possible execution plan for the model.
     Input:
@@ -4027,7 +4027,7 @@ def get_possible_exec_plans(
         return _get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table)
     else:
         # return _get_possible_exec_plans_naive_baseline_2(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input)
-        return _get_possible_exec_plans_naive_baseline(model, tot_gpu_num, byte_per_gpu, cost_table)
+        return _get_possible_exec_plans_naive_baseline(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input)
 
 
 
