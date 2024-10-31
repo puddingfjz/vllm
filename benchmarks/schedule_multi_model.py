@@ -1461,6 +1461,10 @@ async def main_with_preemption(
         similar_threshold=similar_threshold)
     
 
+    
+    # # TODO: <jingzhi> FOR DEBUG
+    # return
+
     # get the NEW model system STRUCTURE from the ``plan_state_group_list``
     model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
         _get_model_sys_structure_from_selected_plan_group_seq(
@@ -2362,7 +2366,7 @@ if __name__ == "__main__":
     # --------------------------------------------------------------------
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # # search_method_baseline = 'ours' # 'naive'  'ours'
-    gen_execplans_baseline = 'naive' # 'naive'  'ours'
+    gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
     test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'

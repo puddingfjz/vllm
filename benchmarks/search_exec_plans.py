@@ -270,6 +270,7 @@ class MyFusedModelInfor(MyModelInfor):
         self.init_inp_model_ids()
 
         self.inp_base_model_ids = None
+        self.init_inp_base_model_ids()
 
         # model-level pipeline
         self.ori_tot_inp_num: int = [model.ori_tot_inp_num for model in self.model_list] # this value will not change during the search
@@ -291,6 +292,15 @@ class MyFusedModelInfor(MyModelInfor):
             self.input_model_ids = self.input_model_ids + model.input_model_ids
         # we do not include the in-fused-model in_edges here
         self.input_model_ids = sorted(set(self.input_model_ids).difference(self.get_base_model_ids()))
+
+
+    def init_inp_base_model_ids(self):
+        inp_base_model_ids = list()
+        for model in self.model_list:
+            inp_base_model_ids = inp_base_model_ids + model.inp_base_model_ids
+        # we do not include the in-fused-model in_edges here
+        self.inp_base_model_ids = sorted(set(inp_base_model_ids).difference(self.get_base_model_ids()))
+
     
     # def get_inp_model_ids(self):
     #     return np.concatenate([model.get_inp_model_ids() for model in self.model_list])
@@ -1786,7 +1796,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         # NOTE: input ``arrive_times`` may not be sorted, so we sort it
         # key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
         key = (self.model.model_name, self.get_key(), *(self._get_inp_key(arrive_times_list)))
-        # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
+        print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
         if key in _FAKE_SCHEDULING_RES:
 
             print(f"Reuse fake scheduling results")
@@ -1812,6 +1822,8 @@ class MyVerticalFusedExecPlan(MyExecPlan):
 
             time3 = time.perf_counter()
             print(f"TIME--reuse fake scheduling: {time3 - time2}")
+
+            print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
 
 
             return self.total_latency_list
@@ -1899,6 +1911,8 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             time5 = time.perf_counter()  
             print(f"TIME--estimate time cost: {time5 - time1}")
 
+            print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+
 
             return self.total_latency_list
 
@@ -1914,7 +1928,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         '''
 
         print(f"exec_plan: {str(self)}")
-        # print(f"arrive_times: {arrive_times_list}")
+        print(f"arrive_times: {arrive_times_list}")
         
 
         if self.total_latency_list[0] == None:
@@ -2240,7 +2254,7 @@ class MyExecPlanGroup:
         sort_input: bool,
     ) -> None:
         
-        print(f"building exec plan group: {[str(_) for _ in exec_plans]}\n", flush=True)
+        print(f"building exec plan group: {[(_.model.get_base_model_ids(), _.get_key()) for _ in exec_plans]}\n", flush=True)
 
         self.exec_plans = exec_plans
         self.throughput = None
@@ -2343,9 +2357,10 @@ class MyExecPlanGroup:
             {exec_plan.model.model_id:exec_plan for exec_plan in self.exec_plans}
         
         # get the model_id mapping from base model id to fused/base model id (or from fuse to fuse)
-        node_mapping = {exec_plan.model.model_id:exec_plan.model.model_id for exec_plan in self.exec_plans}
-        node_mapping.update({ori:exec_plan.model.model_id \
-                             for exec_plan in self.exec_plans for ori in exec_plan.model.get_base_model_ids() })
+        # NOTE: 这里一个需要注意的点是：我们现在允许合并两个fused model成一个更大的fused model，但是这两个fused model需要都还没有开始inference
+        # node_mapping = {exec_plan.model.model_id:exec_plan.model.model_id for exec_plan in self.exec_plans}
+        node_mapping = {ori:exec_plan.model.model_id \
+                             for exec_plan in self.exec_plans for ori in exec_plan.model.get_base_model_ids() }
 
         # the model ids are in the new system with newly fused models
         # all_model_ids = set(model_exec_plan_mapping.keys())
@@ -2357,7 +2372,7 @@ class MyExecPlanGroup:
 
         # get self.inp_exec_plan_dict
         for exec_plan in self.exec_plans:
-            inp_model_ids_this_stage = get_mapped_model_ids_in_group(node_mapping, exec_plan.model.input_model_ids)
+            inp_model_ids_this_stage = get_mapped_model_ids_in_group(node_mapping, exec_plan.model.inp_base_model_ids)
             # inp_model_ids_this_stage = set.intersection(set(mapped_inp_model_ids), all_model_ids)
             inp_exec_plans_this_stage = [model_exec_plan_mapping[model_id] for model_id in inp_model_ids_this_stage]
             self.inp_exec_plan_dict[exec_plan] = inp_exec_plans_this_stage
@@ -3254,19 +3269,29 @@ class MyModelSystem:
             running_plan_group: List[MyExecPlan], 
             cand_models: List[MyModelInfor], cand_exec_plans: List[List[MyExecPlan]]):
         
+
+        print(f"in get_runnable_plans_from_cand_plans: running_plan_group {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in running_plan_group]} cand_models: {[_.get_base_model_ids() for _ in cand_models]}")
+
+
+
         def is_finished_or_running(model: MyModelInfor, running_model_ids: List[int]):
             return (model.is_finished()) or \
-                (model.model_id in running_model_ids)
+                (set(model.get_base_model_ids()).issubset(running_model_ids))
+                # (model.get_base_model_ids() in running_model_ids)
 
         runnable_exec_plans: List[List[MyExecPlan]] = list()
         running_model_ids: List[int] = [exec_plan.model.model_id for exec_plan in running_plan_group]
         # we need to support fused models
         for exec_plan in running_plan_group:
             running_model_ids.extend(exec_plan.model.get_base_model_ids())
+            print(f"running model ids: {exec_plan.model.model_id} = {exec_plan.get_base_model_ids()}")
         
         for model, exec_plans in zip(cand_models, cand_exec_plans):
             inps = model.input_model_ids
             inps_status = [is_finished_or_running(self.model_dict[inp], running_model_ids) for inp in inps]
+
+            print(f"checking model: {model.get_base_model_ids()}  inp model ids: {inps} = {[self.model_dict[_].get_base_model_ids() for _ in inps]}, inps_status: {inps_status}")
+
             if False in inps_status:
                 continue
 
@@ -3443,12 +3468,12 @@ class MyModelSystem:
 
                 runnable_exec_plans_list = self.get_runnable_plans_from_cand_plans(cand_plan_group, cand_models, exec_plans_list)
 
-                # print(f"runnable_exec_plans_list:  ----------------------")
-                # for plans in runnable_exec_plans_list:
-                #     print(f"{len(plans)}, {[str(plan) for plan in plans]}")
+                print(f"runnable_exec_plans_list:  ----------------------")
+                for plans in runnable_exec_plans_list:
+                    print(f"{len(plans)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans]}")
                 
-                # print(f"root cand_plan_group: ------------------------")
-                # print(f"{len(cand_plan_group)}, {[str(plan) for plan in cand_plan_group]}")
+                print(f"root cand_plan_group: ------------------------")
+                print(f"{len(cand_plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in cand_plan_group]}")
                 
                 # 2. second combine exec plans for different models into a group
                 plan_groups = [cand_plan_group]
@@ -3463,7 +3488,7 @@ class MyModelSystem:
                     # we first update the good_plan_group_dict
                     print(f"the groups we found a round: ")
                     for plan_group in plan_groups[1:]:
-                        print([str(plan) for plan in plan_group])
+                        print([(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group])
                     good_plan_group_keys = [_update_good_plan_group_dict(
                         cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
                         plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
@@ -3472,6 +3497,7 @@ class MyModelSystem:
                     to_compare = sorted([_[0] for _ in good_plan_group_dict.values()], reverse=True)[top_k-1] if top_k <= len(good_plan_group_dict) else -1
                     good_plan_groups = [good_plan_group_dict[_][1].exec_plans for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]
                     # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[_ for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]}")
+                    print(f"to_compare: {to_compare}, top_k: {top_k}")
                     print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in _] for _ in good_plan_groups]}")
                     # 
                     # good_plan_groups = [_ for _ in good_plan_groups if len(_)!=0]
@@ -3482,12 +3508,12 @@ class MyModelSystem:
                 # print(f"tot_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tot_plan_groups]}")
                 # print(f"tmp_new_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tmp_new_plan_groups]}")
                 # print(f"cand_plan_group: {[str(plan) for plan in cand_plan_group]}")
-                # print(f"tot_plan_groups: ----------------------")
-                # for plan_group in tot_plan_groups:
-                #     print(f"{len(plan_group)}, {[str(plan) for plan in plan_group]}")
-                # print(f"tmp_new_plan_groups: ------------------")
-                # for plan_group in tmp_new_plan_groups:
-                #     print(f"{len(plan_group)}, {[str(plan) for plan in plan_group]}")
+                print(f"tot_plan_groups: ----------------------")
+                for plan_group in tot_plan_groups:
+                    print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                print(f"tmp_new_plan_groups: ------------------")
+                for plan_group in tmp_new_plan_groups:
+                    print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
 
 
             new_plan_groups = tmp_new_plan_groups
@@ -3497,7 +3523,7 @@ class MyModelSystem:
 
         print(f"in get_candidate_plan_groups: the plan groups we generated: ")
         for plan_group in tot_plan_groups:
-            print(f"{len(plan_group)}, {[str(plan) for plan in plan_group]}")
+            print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
 
 
 
@@ -4273,6 +4299,7 @@ def _update_good_plan_group_dict(
     # 3. check whether this plan group is good
     ret = key
     if key not in good_plan_group_dict:
+        print(f"key not in good_plan_group_dict: {key}-{group_obj.get_throughput()}")
         good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
     else:
         if (group_obj.get_throughput() > good_plan_group_dict[key][0]) or \
@@ -4282,8 +4309,10 @@ def _update_good_plan_group_dict(
             # 2. (2.1) their throughputs are the same and (2.2) the new group has fewer exec plans, 
             # i.e., we prefer fusing models rather than model-level pipeline parallelism.
             good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
+            print(f"key in good_plan_group_dict, update: {key}-{group_obj.get_throughput()}")
         else:
             ret = None
+            print(f"key in good_plan_group_dict, discard: ori-{key}-{good_plan_group_dict[key][0]} vs new-{group_obj.get_throughput()}")
 
     return ret
 
@@ -4546,9 +4575,9 @@ def get_one_stage_exec_plans_sorted(
         gen_execplans_baseline, check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num, byte_per_gpu, top_k)
     
 
-    # print(f"in get_one_stage_exec_plans_sorted: the plan groups we generated: ")
-    # for plan_group in plan_groups:
-    #     print(f"{len(plan_group)}, {str(plan_group)}")
+    print(f"in get_one_stage_exec_plans_sorted: the plan groups we generated: ")
+    for plan_group in plan_groups:
+        print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group.exec_plans]}")
 
 
     # print(f"\nfinish plan group gen\n")
@@ -4661,7 +4690,7 @@ def get_one_stage_exec_plans_sorted(
     print(f"len(uniq_plan_groups): {len(uniq_plan_groups)}")
     print(f"the uniq plan groups we get:")
     for plan_group in uniq_plan_groups:
-        print(str(plan_group))
+        print(f"{[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group.exec_plans], plan_group.infer_stage_latency, plan_group.get_throughput()}")
 
 
     # sort plan groups according to the overall throughput
@@ -5000,7 +5029,7 @@ def _get_best_model_schedule(
 
     # 4. try each candidate plan group and do depth-first search.
     for plan_group in plan_groups:
-        print(f"trying adding plan_group: {plan_group}, models are finished? {[plan.model.is_finished() for plan in plan_group.exec_plans]}")
+        print(f"trying adding plan_group: {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group.exec_plans]}, models are finished? {[plan.model.is_finished() for plan in plan_group.exec_plans]}")
         if len(plan_group) == 0:
             continue
 
