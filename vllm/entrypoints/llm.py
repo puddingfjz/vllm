@@ -465,8 +465,8 @@ class LLM:
 
                     # print(f"try to get new reqs 222: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}, new_inps: {new_inps}, possible_to_get_future_reqs: {possible_to_get_future_reqs}")
                     print(f"GET SEQS for model shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  FROM THE POOL:")
-                    for _ in new_inps:
-                        print(_)
+                    # for _ in new_inps:
+                    #     print(_[0], _[1][:10])
                     with open(f"./test_end2end_schedule/model_IO.log", 'a') as file:
                         for _ in new_inps:
                             file.write(f"Get: shared id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}: {str(_)}\n")
@@ -566,6 +566,7 @@ class LLM:
                     self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
                 
                 # print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, new_outputs: {new_outputs}------------------")
+                print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, len(new_outputs): {len(new_outputs)}------------------")
 
                 SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
 
@@ -590,6 +591,8 @@ class LLM:
         output_num_sent_out, new_outputs = \
             self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
         SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
+
+        print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, len(new_outputs): {len(new_outputs)}------------------")
         
         
         

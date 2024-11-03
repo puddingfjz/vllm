@@ -718,7 +718,24 @@ class MyExecPlan:
         return inp_lens, out_lens, inp_seq_ids, arrive_times
 
 
+    def _get_inp_key(
+            self,
+            arrive_times: List[float],):
+        """
+            The key contains the inp_lens, out_lens, and the arrive_times.
+        """ 
+        def _to_tuple(vs):
+            return tuple([tuple([tuple(j) for j in i]) for i in vs])
 
+        # directly return the model inp/out lens
+        inp_lens_list = list()
+        out_lens_list = list()
+        arrive_times_list = list()
+        for dp_id in range(self.dp_size):
+            inp_lens_list.append(tuple(self.dp_inp_lens_list[dp_id]))
+            out_lens_list.append(tuple(self.dp_out_lens_list[dp_id]))
+            arrive_times_list.append(tuple(arrive_times[dp_id::self.dp_size]))
+        return ((tuple(inp_lens_list), tuple(out_lens_list)), tuple(arrive_times_list))
 
 
 
@@ -788,7 +805,12 @@ class MyExecPlan:
         # support model-level pipeline: we add arrive_times to the key
         # key = (self.model.model_name, self.get_key(), self.model.get_inp_out_seqlens(), tuple(arrive_times))
         # NOTE: input ``arrive_times`` may not be sorted, so we sort it
-        key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+        # key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+
+        # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
+        # 每个dp worker具体的input 和output length信息也存下来。才能做到正确的reuse scheduling results。
+        key = (self.model.model_name, self.get_key(), *self._get_inp_key(arrive_times))
+
         # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
         # print(f"_FAKE_SCHEDULING_RES keys: {_FAKE_SCHEDULING_RES.keys()}")
         # for k in _FAKE_SCHEDULING_RES.keys():
@@ -1148,6 +1170,9 @@ class MyExecPlan:
             dp_inp_lens = self.dp_inp_lens_list[dp_id]
             dp_out_lens = self.dp_out_lens_list[dp_id]
 
+
+            # print(f"dp_inp_lens: {dp_inp_lens}")
+
             # print(self.model.model_name, f"old inp_lens:{inp_lens}, old remaining_lens:{out_lens}")
             print(self)
 
@@ -1275,6 +1300,12 @@ class MyExecPlan:
             return
 
 
+        # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，
+        # 所以对于每个dp worker剩下来的 request 和正常均分workload结果矛盾的情况，我们没有比较进行下面的计算，因为这样的scheduling结果不会被reuse到。
+        # 但是这个好麻烦啊，暂时先不管。
+
+
+
         cumsum_latencys_list = [list() for _ in range(self.dp_size)]
         cum_rng_nums_list = [list() for _ in range(self.dp_size)]
         rng_starts_list = [list() for _ in range(self.dp_size)]
@@ -1307,10 +1338,13 @@ class MyExecPlan:
             
 
             # we may need to reorder the scheduling results if the remaining seqs are not in the order of their seq ids
-            cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs = \
-                self._sort_scheduling_results_by_seq_ids(
-                    self.dp_inp_seq_ids_list[dp_id][alive_old_indices],
-                    cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs)
+            # 为什么这个地方要sort，fused exec plan的地方不用sort？应该都要sort吧？应该都要sort的，因为我们在准备workload的时候是sort了的。
+            # 暂时先把sort全都去掉了，因为我们现在的key并没有进行sort，所以去掉sort后能保证fake scheduling结果和inp reqs的对应。
+            # 如果要扩大reuse的范围,应该要把剩余的inp req 的分配情况也放到被reuse的内容里面.
+            # cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs = \
+            #     self._sort_scheduling_results_by_seq_ids(
+            #         self.dp_inp_seq_ids_list[dp_id][alive_old_indices],
+            #         cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs)
 
 
             # dp_seq_ids = self.dp_seq_ids_list[dp_id]
@@ -1319,9 +1353,15 @@ class MyExecPlan:
             assert (new_inp_out_lens_list[dp_id][2] == alive_old_indices).all(), print(new_inp_out_lens_list[dp_id][2], alive_old_indices)
 
 
-        new_key = (self.model.model_name, self.get_key(), (tuple(new_inp_lens_merged), tuple(new_out_lens_merged)), \
-                   tuple([-1 - self.extra_cost]*len(new_inp_lens_merged)))
+        # new_key = (self.model.model_name, self.get_key(), (tuple(new_inp_lens_merged), tuple(new_out_lens_merged)), \
+        #            tuple([-1 - self.extra_cost]*len(new_inp_lens_merged)))
+        # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
+        # 每个dp worker具体的input 和output length信息也存下来。
+        new_key = (self.model.model_name, self.get_key(), 
+                   (tuple([tuple(dp_data[0]) for dp_data in new_inp_out_lens_list]), tuple([tuple(dp_data[1]) for dp_data in new_inp_out_lens_list])), \
+                   tuple([tuple([-1 - self.extra_cost]*len(dp_data[0])) for dp_data in new_inp_out_lens_list]))
         # print(f"update fake scheduling: new_key: {new_key}")
+        # print(f"")
         _FAKE_SCHEDULING_RES[new_key] = \
             cumsum_latencys_list, cum_rng_nums_list, rng_starts_list, rng_ends_list, is_prefill_steps_list, \
             finish_times_list
@@ -1712,7 +1752,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         _sort_by_seq_ids(self.dp_size)
 
 
-    def _get_inp_key(
+    def _get_inp_key_merged_version(
             self,
             arrive_times_list: List[List[float]],):
         """
@@ -1737,6 +1777,37 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         tuple_out_lens = _to_tuple(self.dp_out_lens_list_for_models)
         tuple_arrive_times = _to_tuple(self.dp_arrive_times_list_for_models)
         return ((tuple_inp_lens, tuple_out_lens), tuple_arrive_times)
+
+
+
+
+    def _get_inp_key(
+            self,
+            arrive_times_list: List[List[float]],):
+        """
+            The key contains the inp_lens, out_lens, and the arrive_times.
+        """ 
+        def _to_tuple(vs):
+            return tuple([tuple([tuple(j) for j in i]) for i in vs])
+
+        # # directly return the model inp/out lens
+        # inp_lens = list()
+        # out_lens = list()
+        # arrive_times = list()
+        # for i in range(len(self.model_list)):
+        #     model = self.model_list[i]
+        #     inps, outs = model.get_inp_out_seqlens()
+        #     inp_lens.append(tuple(inps))
+        #     out_lens.append(tuple(outs))
+        #     arrive_times.append(tuple(np.asarray(arrive_times_list[i]) - self.extra_cost))
+        # return ((tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+
+        tuple_inp_lens = _to_tuple(self.dp_inp_lens_list_for_models)
+        tuple_out_lens = _to_tuple(self.dp_out_lens_list_for_models)
+        tuple_arrive_times = _to_tuple(self.dp_arrive_times_list_for_models)
+        return ((tuple_inp_lens, tuple_out_lens), tuple_arrive_times)
+
+
 
 
     # data parallel + model-level pipeline
@@ -1795,8 +1866,13 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         # key = (self.model.model_name, self.get_key(), self.model.get_inp_out_seqlens(), tuple(arrive_times))
         # NOTE: input ``arrive_times`` may not be sorted, so we sort it
         # key = (self.model.model_name, self.get_key(), (tuple(inp_lens), tuple(out_lens)), tuple(arrive_times))
+        # key = (self.model.model_name, self.get_key(), *(self._get_inp_key(arrive_times_list)))
+
+        # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
+        # 每个dp worker具体的input 和output length信息也存下来。
         key = (self.model.model_name, self.get_key(), *(self._get_inp_key(arrive_times_list)))
-        print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
+
+        # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
         if key in _FAKE_SCHEDULING_RES:
 
             print(f"Reuse fake scheduling results")
@@ -1823,7 +1899,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             time3 = time.perf_counter()
             print(f"TIME--reuse fake scheduling: {time3 - time2}")
 
-            print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+            # print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
 
 
             return self.total_latency_list
@@ -1911,7 +1987,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             time5 = time.perf_counter()  
             print(f"TIME--estimate time cost: {time5 - time1}")
 
-            print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+            # print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
 
 
             return self.total_latency_list
@@ -1928,7 +2004,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         '''
 
         print(f"exec_plan: {str(self)}")
-        print(f"arrive_times: {arrive_times_list}")
+        # print(f"arrive_times: {arrive_times_list}")
         
 
         if self.total_latency_list[0] == None:
@@ -2196,9 +2272,17 @@ class MyVerticalFusedExecPlan(MyExecPlan):
 
 
 
-        new_key = (self.model.model_name, self.get_key(), (to_tuple(new_inp_lens_merged), to_tuple(new_out_lens_merged)), \
-                   tuple([tuple([-1 - self.extra_cost]*len(new_inps)) for new_inps in new_inp_lens_merged]))
-        # print(f"update fake scheduling: new_key: {new_key}")
+        # new_key = (self.model.model_name, self.get_key(), (to_tuple(new_inp_lens_merged), to_tuple(new_out_lens_merged)), \
+        #            tuple([tuple([-1 - self.extra_cost]*len(new_inps)) for new_inps in new_inp_lens_merged]))
+
+        # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
+        # 每个dp worker具体的input 和output length信息也存下来。
+        new_key = (self.model.model_name, self.get_key(), 
+                   (tuple([to_tuple(dp_data[0]) for dp_data in new_inp_out_lens_list]), tuple([to_tuple(dp_data[1]) for dp_data in new_inp_out_lens_list])), \
+                   tuple([to_tuple([[-1 - self.extra_cost]*len(_) for _ in dp_data[0]]) for dp_data in new_inp_out_lens_list]))
+
+
+        # print(f"update fake scheduling 2: new_key: {new_key}")
         _FAKE_SCHEDULING_RES[new_key] = \
             cumsum_latencys_list, cum_rng_nums_list_for_models, rng_starts_list_for_models, rng_ends_list_for_models, \
                 is_prefill_steps_list, finish_times_list_for_models
@@ -2778,8 +2862,8 @@ class MyExecPlanGroup:
             
             print(f"UPDATE MODELS AFTER SELECTING AN EXEC PLAN-------------\n")
             print(f"exec_plan: {str(exec_plan)}, model_ids: {exec_plan.model.get_base_model_ids()}")
-            print(f"inp_out_lens: {inp_out_lens}")
-            print(f"merged_inp_out_lens: {merged_inp_out_lens}")
+            # print(f"inp_out_lens: {inp_out_lens}")
+            # print(f"merged_inp_out_lens: {merged_inp_out_lens}")
 
             # exec_plan.model.update_inp_out_seqlens(*inp_out_lens, cost_table)
             exec_plan.model.update_inp_out_seqlens(*merged_inp_out_lens, cost_table)
@@ -3468,12 +3552,12 @@ class MyModelSystem:
 
                 runnable_exec_plans_list = self.get_runnable_plans_from_cand_plans(cand_plan_group, cand_models, exec_plans_list)
 
-                print(f"runnable_exec_plans_list:  ----------------------")
-                for plans in runnable_exec_plans_list:
-                    print(f"{len(plans)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans]}")
+                # print(f"runnable_exec_plans_list:  ----------------------")
+                # for plans in runnable_exec_plans_list:
+                #     print(f"{len(plans)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans]}")
                 
-                print(f"root cand_plan_group: ------------------------")
-                print(f"{len(cand_plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in cand_plan_group]}")
+                # print(f"root cand_plan_group: ------------------------")
+                # print(f"{len(cand_plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in cand_plan_group]}")
                 
                 # 2. second combine exec plans for different models into a group
                 plan_groups = [cand_plan_group]
@@ -3486,9 +3570,9 @@ class MyModelSystem:
                     tot_plan_groups.extend(plan_groups)
                 else:
                     # we first update the good_plan_group_dict
-                    print(f"the groups we found a round: ")
-                    for plan_group in plan_groups[1:]:
-                        print([(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group])
+                    # print(f"the groups we found a round: ")
+                    # for plan_group in plan_groups[1:]:
+                    #     print([(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group])
                     good_plan_group_keys = [_update_good_plan_group_dict(
                         cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
                         plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
@@ -3497,8 +3581,8 @@ class MyModelSystem:
                     to_compare = sorted([_[0] for _ in good_plan_group_dict.values()], reverse=True)[top_k-1] if top_k <= len(good_plan_group_dict) else -1
                     good_plan_groups = [good_plan_group_dict[_][1].exec_plans for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]
                     # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[_ for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]}")
-                    print(f"to_compare: {to_compare}, top_k: {top_k}")
-                    print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in _] for _ in good_plan_groups]}")
+                    # print(f"to_compare: {to_compare}, top_k: {top_k}")
+                    # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in _] for _ in good_plan_groups]}")
                     # 
                     # good_plan_groups = [_ for _ in good_plan_groups if len(_)!=0]
                     tmp_new_plan_groups.extend(good_plan_groups)
@@ -3508,12 +3592,12 @@ class MyModelSystem:
                 # print(f"tot_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tot_plan_groups]}")
                 # print(f"tmp_new_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tmp_new_plan_groups]}")
                 # print(f"cand_plan_group: {[str(plan) for plan in cand_plan_group]}")
-                print(f"tot_plan_groups: ----------------------")
-                for plan_group in tot_plan_groups:
-                    print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
-                print(f"tmp_new_plan_groups: ------------------")
-                for plan_group in tmp_new_plan_groups:
-                    print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                # print(f"tot_plan_groups: ----------------------")
+                # for plan_group in tot_plan_groups:
+                #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                # print(f"tmp_new_plan_groups: ------------------")
+                # for plan_group in tmp_new_plan_groups:
+                #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
 
 
             new_plan_groups = tmp_new_plan_groups
@@ -3521,9 +3605,9 @@ class MyModelSystem:
                 break
 
 
-        print(f"in get_candidate_plan_groups: the plan groups we generated: ")
-        for plan_group in tot_plan_groups:
-            print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+        # print(f"in get_candidate_plan_groups: the plan groups we generated: ")
+        # for plan_group in tot_plan_groups:
+        #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
 
 
 
@@ -4360,7 +4444,7 @@ def _can_be_fused_vertically(plan_group: List[MyExecPlan], to_fuse: MyExecPlan, 
         # cond2 = (sorted(to_fuse_inp_model_ids) == sorted(plan.get_base_model_ids()))
         # # if (len(to_fuse_inp_model_ids) == 1) and (to_fuse_inp_model_ids[0] == plan.get_base_model_ids()[-1]):
         # if cond1 or cond2:
-        print(f"in _can_be_fused_vertically: to_fuse_inp_model_ids: {to_fuse_inp_base_model_ids}, to_fuse_base_model_ids: {to_fuse.get_base_model_ids()}, model_ids_fused: {plan.get_base_model_ids()}")
+        # print(f"in _can_be_fused_vertically: to_fuse_inp_model_ids: {to_fuse_inp_base_model_ids}, to_fuse_base_model_ids: {to_fuse.get_base_model_ids()}, model_ids_fused: {plan.get_base_model_ids()}")
         if _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids, 
                                          model_ids_fused=plan.get_base_model_ids(), 
                                          fused_model_inp_base_model_ids=plan.get_base_models()[0].inp_base_model_ids):

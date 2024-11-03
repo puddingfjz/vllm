@@ -136,6 +136,9 @@ class LLM_COMMUNICATOR:
         print(f"In INIT Communicator:")
         print(f"self._add_req_locks: {self._add_req_locks}")
         print(f"self._fetch_req_locks: {self._fetch_req_locks}")
+        print(f"self._unavailable_req_nums: {self._unavailable_req_nums}")
+        print(f"self._ungened_out_req_nums: {self._ungened_out_req_nums}")
+        print(f"self.base_model_ids_dict: {self.base_model_ids_dict}")
 
 
 
@@ -191,6 +194,8 @@ class LLM_COMMUNICATOR:
         """
         self._unavailable_req_nums.update(unavailable_req_nums)
         self._ungened_out_req_nums.update(ungened_out_req_nums)
+        print(f"self._unavailable_req_nums: {self._unavailable_req_nums}")
+        print(f"self._ungened_out_req_nums: {self._ungened_out_req_nums}")        
 
 
 
@@ -203,7 +208,7 @@ class LLM_COMMUNICATOR:
                 2. the input model_id can be of fused models or base models, but 
                 ``fused_inp_queues`` and ``fetched_fused_inp_start`` are for base models only.
         """
-        print(f"In reset_state_for_model, parameters: {model_id, dp_size}-----------------\n")
+        print(f"In _reset_state_for_model, parameters: (base_model_id, dp_size): {model_id, dp_size}-----------------\n")
         # first, we need to get the remaining reqs
         old_dp_size = len(self.fetched_fused_inp_start[model_id])
         remaining = list()
@@ -213,12 +218,12 @@ class LLM_COMMUNICATOR:
         remaining = sorted(remaining, key=lambda inp: inp[0])
         self.fused_inp_queues[model_id] = remaining
         self.fetched_fused_inp_start[model_id] = [i for i in range(dp_size)]
-        # print(f"In reset_state_for_model, parameters: {model_id, dp_size} self.fetched_fused_inp_start: {self.fetched_fused_inp_start} self.fused_inp_queues: {self.fused_inp_queues}\n")
+        print(f"In _reset_state_for_model, parameters: (base_model_id, dp_size): {model_id, dp_size} self.fetched_fused_inp_start: {self.fetched_fused_inp_start} self.fused_inp_queues: {self.fused_inp_queues}\n")
 
 
 
 
-    def reset_state_for_model(self, model_id: int, dp_size: int):
+    def reset_state_for_model(self, shared_id: int, dp_size: int):
         """
             When a model is restarted, we need to update some variables.
             Update: self.fused_inp_queues, self.fetched_fused_inp_start.
@@ -227,13 +232,18 @@ class LLM_COMMUNICATOR:
                 2. the input model_id can be of fused models or base models, but 
                 ``fused_inp_queues`` and ``fetched_fused_inp_start`` are for base models only.
         """
-        # print(f"In reset_state_for_model, parameters: {model_id, dp_size}-----------------\n")
-        if model_id in self.base_model_ids_dict:
-            # this model is a fused model
-            for base_model_id in self.base_model_ids_dict[model_id]:
-                self._reset_state_for_model(base_model_id, dp_size)
-        else:
-            self._reset_state_for_model(model_id, dp_size)
+        print(f"In reset_state_for_model, parameters: shared_id: {shared_id} dp_size: {dp_size}-----------------\n")
+        # if model_id in self.base_model_ids_dict:
+        # if len(base_model_ids) > 1:
+        #     # this model is a fused model
+        #     for base_model_id in base_model_ids:
+        #         self._reset_state_for_model(base_model_id, dp_size)
+        # else:
+        #     self._reset_state_for_model(model_id, dp_size)
+
+        base_model_ids = self.base_model_ids_dict[shared_id]
+        for base_model_id in base_model_ids:
+            self._reset_state_for_model(base_model_id, dp_size)
 
 
 
@@ -300,19 +310,19 @@ class LLM_COMMUNICATOR:
 
             if model_id in self.new_out_req_part_num:
                 to_add = self._process_outputs(model_id=model_id, seqs=seqs)
-                for _ in to_add:
-                    print(_)
+                # for _ in to_add:
+                #     print(_)
 
-            for _ in to_add:
-                print(_)
+            # for _ in to_add:
+            #     print(_)
 
             self.output_pool[model_id].extend(to_add)
             # update self._ungened_out_req_nums
             self._ungened_out_req_nums[model_id] = self._ungened_out_req_nums[model_id] - len(to_add)
         
             print(f"ADDING SEQS of model {model_id} TO THE POOL:")
-            for _ in to_add:
-                print(_)
+            # for _ in to_add:
+            #     print(_[0], _[1][:10])
             with open(f"./test_end2end_schedule/model_IO.log", 'a') as file:
                 for _ in to_add:
                     file.write(f"Add: base model id: {model_id}: {str(_)}\n")
@@ -326,7 +336,7 @@ class LLM_COMMUNICATOR:
 
 
 
-    def add_seqs(self, model_id: int, seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]):
+    def add_seqs(self, shared_id: int, seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]):
         """
             Send newly generated outputs to the model communicator.
             We all sort the input outputs by their req id.
@@ -342,17 +352,20 @@ class LLM_COMMUNICATOR:
                 1. ensure the input ``seqs`` only contains seqs which have not been added before.
                 2. need lock here, as there may be multiple dp workers: one lock for one model.
             NOTE:
-                1. this function is only for base models.
+                1. shared_id can be negative values for dummy input nodes, or shared ids for nomal models. 
         """
         try:
-            if model_id not in self.base_model_ids_dict:
-                self.add_seqs_base_model(model_id=model_id, seqs=seqs)
+            if (shared_id not in self.base_model_ids_dict):
+                assert shared_id < 0
+                self.add_seqs_base_model(model_id=shared_id, seqs=seqs)
+            elif len(self.base_model_ids_dict[shared_id]) == 1:
+                self.add_seqs_base_model(model_id=self.base_model_ids_dict[shared_id][0], seqs=seqs)
             else:
                 # 1. group seqs by base model ids
                 base_model_seqs_dict = defaultdict(list)
                 for seq in seqs:
                     req_id = seq[0]
-                    base_model_id = self.out_req_model_id_mapping[model_id][req_id]
+                    base_model_id = self.out_req_model_id_mapping[shared_id][req_id]
                     base_model_seqs_dict[base_model_id].append(seq)
                 
                 # 2. add seqs to each base model
@@ -573,20 +586,21 @@ class LLM_COMMUNICATOR:
 
 
     def _update_out_req_model_id_mapping(
-            self, fused_model_id: int, base_model_id: int,
+            self, shared_id: int, base_model_id: int,
             reqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], 
     ) -> None:
         
-        if fused_model_id not in self.base_model_ids_dict:
+        # if shared_id not in self.base_model_ids_dict:
+        if len(self.base_model_ids_dict[shared_id]) == 1:
             # this is not a fused model
             return
         
         new_mapping = {req[0]:base_model_id for req in reqs}
-        self.out_req_model_id_mapping[fused_model_id].update(new_mapping)
+        self.out_req_model_id_mapping[shared_id].update(new_mapping)
 
 
 
-    def get_seqs_base_model(self, fused_model_id: int, to_model_id: int, dp_id: int, dp_size: int
+    def get_seqs_base_model(self, to_shared_id: int, to_model_id: int, dp_id: int, dp_size: int
         ) -> Tuple[Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], bool]:
         """
             Get the available inp reqs for a specific dp worker.
@@ -602,6 +616,7 @@ class LLM_COMMUNICATOR:
                 3. ``to_model_id`` is the id of a base model.
             NOTE:
                 1. this function is for a base model.
+                2. to_model_id: the base model id.
         """    
 
         # print(f"in get_seqs_base_model: fused_model_id: {fused_model_id}, to_model_id: {to_model_id}")
@@ -625,7 +640,7 @@ class LLM_COMMUNICATOR:
                 # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 3.1")
 
                 # reorganize the fused_inp_queue
-                self.reset_state_for_model(to_model_id, dp_size)
+                self._reset_state_for_model(to_model_id, dp_size)
 
                 # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 3")
 
@@ -641,9 +656,9 @@ class LLM_COMMUNICATOR:
                         ret = [self.fused_inp_queues[to_model_id][0]]
                         self.fused_inp_queues[to_model_id] = self.fused_inp_queues[to_model_id][1:]
                         
-                        self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
+                        self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
 
-                        print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
+                        print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
 
                         return ret, possible_to_get_future_reqs
                     else:
@@ -654,25 +669,25 @@ class LLM_COMMUNICATOR:
 
                         assert self._unavailable_req_nums[to_model_id] >= 0, f"assert self._unavailable_req_nums[to_model_id] >= 0 wrong: {self._unavailable_req_nums[to_model_id]}"
 
-                        print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
+                        print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
 
                         return [], possible_to_get_future_reqs
                 else:
                     # run the normal get_seq process
                     ret = self._get_seqs(to_model_id, dp_id, dp_size)
 
-                    print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
+                    print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
 
-                    self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
+                    self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
                     return ret, possible_to_get_future_reqs
 
             else:
 
                 # print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5.1")
 
-                self._update_out_req_model_id_mapping(fused_model_id, base_model_id=to_model_id, reqs=ret)
+                self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
 
-                print(f"fused_model_id: {fused_model_id}, to_model_id: {to_model_id}, 5")
+                print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5")
 
                 return ret, possible_to_get_future_reqs
 
@@ -681,7 +696,7 @@ class LLM_COMMUNICATOR:
 
 
 
-    def get_seqs(self, to_model_id: int, dp_id: int, dp_size: int
+    def get_seqs(self, to_shared_id: int, dp_id: int, dp_size: int
         ) -> Tuple[Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], bool, List[int]]:
         """
             Get the available inp reqs for a specific dp worker.
@@ -703,11 +718,13 @@ class LLM_COMMUNICATOR:
 
             print(f"self.base_model_ids_dict: {self.base_model_ids_dict}")
 
-            base_model_ids = list() 
-            if to_model_id not in self.base_model_ids_dict:
-                base_model_ids = [to_model_id]
-            else:
-                base_model_ids = self.base_model_ids_dict[to_model_id]
+            # base_model_ids = list() 
+            # if to_model_id not in self.base_model_ids_dict:
+            #     base_model_ids = [to_model_id]
+            # else:
+            #     base_model_ids = self.base_model_ids_dict[to_model_id]
+
+            base_model_ids = self.base_model_ids_dict[to_shared_id]
 
 
             # print(f"base_model_ids: {base_model_ids}  to_model_id: {to_model_id}  dp_id: {dp_id}")
@@ -717,7 +734,7 @@ class LLM_COMMUNICATOR:
             req_base_model_ids = list()
             for base_model_id in base_model_ids:
                 tmp_ret, tmp_possible_to_get_future_reqs = \
-                    self.get_seqs_base_model(fused_model_id=to_model_id, to_model_id=base_model_id, dp_id=dp_id, dp_size=dp_size)                
+                    self.get_seqs_base_model(to_shared_id=to_shared_id, to_model_id=base_model_id, dp_id=dp_id, dp_size=dp_size)                
                 ret.extend(tmp_ret)
                 # print(f"base_model_id: {base_model_id}: {tmp_possible_to_get_future_reqs, tmp_ret}")
                 if tmp_possible_to_get_future_reqs:
@@ -730,6 +747,8 @@ class LLM_COMMUNICATOR:
             
             if len(base_model_ids) == 1:
                 req_base_model_ids = [base_model_ids[0]]
+
+            print(f"in communicator, get reqs: {[_[0] for _ in ret]}, req_base_model_ids: {req_base_model_ids}")
 
             return ret, possible_to_get_future_reqs, req_base_model_ids
         

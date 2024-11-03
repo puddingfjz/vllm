@@ -69,12 +69,12 @@ class MyExecPlanState:
         self.launched = launched
     
     def set_comp_gpus(self, comp_gpus: List[int]):
-        self.comp_gpus = comp_gpus
+        self.comp_gpus = list(comp_gpus)
     def get_comp_gpus(self):
         return self.comp_gpus
 
     def __str__(self) ->str:
-        return f'{str(self.exec_plan)}, launched:{self.launched}, stage_i:{self.stage_i}'
+        return f'{str(self.exec_plan)}, launched:{self.launched}, stage_i:{self.stage_i}, model_id: {self.exec_plan.model.model_id}, comp_gpus: {self.comp_gpus}'
 
 
 
@@ -226,7 +226,13 @@ def get_exec_settings_from_exec_plans(
     tp, gpu_ratio, wldeg, cache_gpu_num, dp_size = exec_plan.get_key()
     gpu_list = available_gpus + [i for i in range(tot_gpu_num) if i not in available_gpus]
 
+    # <jingzhi> FOR DEBUG
+    if max(gpu_list) > tot_gpu_num-1:
+        print(f"available_gpus:{available_gpus}, tot_gpu_num: {tot_gpu_num}, [i for i in range(tot_gpu_num) if i not in available_gpus]: {[i for i in range(tot_gpu_num) if i not in available_gpus]}")
+        assert False
+
     # reorder gpu list according to the gpu order we set
+    print(f"gpu_order_we_set: {gpu_order_we_set}, gpu_list: {gpu_list}")
     gpu_list = [gpu_order_we_set[i] for i in gpu_list]
     print(f"gpu_list to set: {gpu_list}", flush=True)
 
@@ -246,7 +252,7 @@ def get_model_path_list() -> List[str]:
                 #    'NousResearch/Llama-2-7b-chat-hf',
                 # #    'NousResearch/Llama-2-13b-hf',
                 # #    'NousResearch/Llama-2-70b-hf',
-                   'THUDM/chatglm3-6b',
+                #    'THUDM/chatglm3-6b',
                 #    'EleutherAI/gpt-j-6b', 
                 # #    'EleutherAI/gpt-neox-20b',
                 # #    'baichuan-inc/Baichuan2-13B-Chat',
@@ -264,7 +270,7 @@ def get_model_path_list() -> List[str]:
                 ]
     
     # for test
-    model_paths = ['NousResearch/Llama-2-7b-hf', 'NousResearch/Llama-2-7b-chat-hf']
+    # model_paths = ['NousResearch/Llama-2-7b-hf', 'NousResearch/Llama-2-7b-chat-hf']
     return model_paths
 
 
@@ -582,6 +588,8 @@ def initialize_SHARED_CONTECT(
     # set the initial execution plan
     available_gpus: List[int] = list(range(tot_gpu_num))
     launched_exec_plan_states: List[MyExecPlanState] = plan_state_group_list[0]
+    # sort launched_exec_plan_states by tp size:
+    launched_exec_plan_states = sorted(launched_exec_plan_states, key=lambda plan_state: plan_state.exec_plan.num_worker)
     for exec_plan_state in launched_exec_plan_states:
         
         exec_plan = exec_plan_state.exec_plan
@@ -1015,6 +1023,77 @@ def _get_the_next_round_exec_plan_schedule(
 
 
 
+def _adjust_comp_gpus_for_current_launched_exec_plans(
+        launched_exec_plan_states: List[MyExecPlanState],
+        new_launch: List[MyExecPlanState],
+        tot_gpu_num: int,
+        fully_connected_gpu_unit: int)->List[MyExecPlanState]:
+    """
+        INPUT:
+            fully_connected_gpu_unit: the number of gpus that are fully connected, 
+                e.g., 2 if 1 gpu is only connected with 1 other gpu with NV-links;
+                      4 if 1 gpu is connected by 3 other gpus with NV-links.
+        OUTPUT: 
+            the plan_states that will need reload model weights.
+    """
+    launched_exec_plan_states = sorted(launched_exec_plan_states, key=lambda plan_state: plan_state.exec_plan.num_worker)
+    cand_gpu_groups = np.arange(tot_gpu_num).reshape((-1, fully_connected_gpu_unit))
+    # stores the cost to reload models assigned to each gpu group
+    cost_to_clean_models = np.asarray([0]*cand_gpu_groups.shape[0])
+    plan_state_to_reassign_gpus: List[MyExecPlanState] = list()
+    # 
+    # 1. get the gpu groups that should be kept and the groups that will be considered in reassignment;
+    #    get the plan_states that need to ressign gpus to (i.e., plan_state_to_reassign_gpus)
+    for plan_state in launched_exec_plan_states:
+        if plan_state not in new_launch:
+            gpus = plan_state.get_comp_gpus()
+            gpus = np.asarray(gpus)[:plan_state.exec_plan.num_worker*plan_state.exec_plan.dp_size]
+            gpus, counts = np.unique(gpus // fully_connected_gpu_unit, return_counts=True)
+            if plan_state.exec_plan.num_worker >= fully_connected_gpu_unit:
+                # NOTE: we assume the gpus assigned to the plan_state must have been the best choice for it    
+                # check the gpu groups that this model fully occupies
+                assert (counts == fully_connected_gpu_unit).all()
+                cost_to_clean_models[gpus] = 1e9
+            else:
+                cost_to_clean_models[gpus] = cost_to_clean_models[gpus] + counts
+                plan_state_to_reassign_gpus.append(plan_state)
+        else:
+            plan_state_to_reassign_gpus.append(plan_state)
+    # 
+    # 2. reassign gpus for plan_states in plan_state_to_reassign_gpus
+    sorted_gpu_group_ids = np.argsort(cost_to_clean_models)
+    sorted_gpu_group_ids = sorted_gpu_group_ids[ cost_to_clean_models[sorted_gpu_group_ids]<1e9 ]
+    cand_gpus = np.concatenate(cand_gpu_groups[sorted_gpu_group_ids])
+    extra_new_launch = list()
+    for plan_state in plan_state_to_reassign_gpus:
+        comp_gpu_num = plan_state.exec_plan.num_worker*plan_state.exec_plan.dp_size
+        if plan_state.exec_plan.num_worker >= fully_connected_gpu_unit:
+            gpus = cand_gpus[:comp_gpu_num]
+            cand_gpus = cand_gpus[comp_gpu_num:]
+            plan_state.set_comp_gpus(gpus)
+            if plan_state not in new_launch:
+                extra_new_launch.append(plan_state)
+        else:
+            if plan_state not in new_launch:
+                # check whether we do not need move this model
+                gpus = plan_state.get_comp_gpus()[:comp_gpu_num]
+                if set(gpus).issubset(cand_gpus):
+                    if (min(gpus) // fully_connected_gpu_unit) == (max(gpus) // fully_connected_gpu_unit):
+                        # we do not need to change its assigned gpus
+                        cand_gpus = [_ for _ in cand_gpus if _ not in gpus]
+                        continue
+                extra_new_launch.append(plan_state)
+                # 
+            gpus = cand_gpus[:comp_gpu_num]
+            cand_gpus = cand_gpus[comp_gpu_num:]
+            plan_state.set_comp_gpus(gpus)
+    #   
+    # 
+    return extra_new_launch
+
+
+        
+
 
 def get_the_next_round_exec_plan_schedule(
         launched_exec_plan_states: List[MyExecPlanState], candidate_exec_plan_states: List[MyExecPlanState],
@@ -1023,6 +1102,7 @@ def get_the_next_round_exec_plan_schedule(
         plan_state_group_list:List[List[MyExecPlanState]],
         model_driver_worker_gpu_i: Dict[int,int],
         model_id_shared_id_mapping: Dict[int, int],
+        fully_connected_gpu_unit: int,
     )->Tuple[List[MyExecPlanState], List[MyExecPlanState], List[int], List[MyExecPlanState], int]:
 
     # 1. get the new launch plan
@@ -1044,6 +1124,17 @@ def get_the_next_round_exec_plan_schedule(
     model_ids_to_stop = [i.exec_plan.model.model_id for i in launched_exec_plan_states 
                          if (i.exec_plan.model.model_id,i.exec_plan.get_key()) not in to_launch_exec_plans]
 
+
+    # 3. change the comp gpu setting if the GPUs are not fully connected with NV-link.
+    extra_new_launch = _adjust_comp_gpus_for_current_launched_exec_plans(
+        to_launch, new_launch, tot_gpu_num, fully_connected_gpu_unit)
+    new_launch = new_launch + extra_new_launch
+    model_ids_to_stop = model_ids_to_stop + [i.exec_plan.model.model_id for i in extra_new_launch]
+
+    print(f"ORI launched_exec_plan_states: {[str(plan_state) for plan_state in launched_exec_plan_states]}")
+    print(f"extra_new_launch: {[str(plan_state) for plan_state in extra_new_launch]}")
+    print(f"model_ids_to_stop: {model_ids_to_stop}")
+
     return to_launch, new_candidate_exec_plan_states, model_ids_to_stop, new_launch, new_target_stage_i
 
 
@@ -1052,18 +1143,27 @@ def get_the_next_round_exec_plan_schedule(
 def start_exec_plans(
         new_launch: List[MyExecPlanState], tot_gpu_num: int, gpu_order_we_set: List[int],
         model_id_shared_id_mapping: Dict[int, int]):
-    for exec_plan_state in new_launch:
-        
-        exec_plan = exec_plan_state.exec_plan
-        assert len(exec_plan_state.comp_gpus) == (exec_plan.num_worker * exec_plan.dp_size)
-        
-        setting = get_exec_settings_from_exec_plans(
-            exec_plan=exec_plan, available_gpus=exec_plan_state.comp_gpus, tot_gpu_num=tot_gpu_num, gpu_order_we_set=gpu_order_we_set)
-        shared_id = model_id_shared_id_mapping[exec_plan.model.model_id]
-        SHARED_CONTECT.set_execution_plan(setting, shared_ids=[shared_id])
+    try:
+        for exec_plan_state in new_launch:
+            
+            exec_plan = exec_plan_state.exec_plan
+            assert len(exec_plan_state.comp_gpus) == (exec_plan.num_worker * exec_plan.dp_size)
+            
+            print(f"before call get_exec_settings_from_exec_plans: available_gpus: {exec_plan_state.comp_gpus}, tot_gpu_num: {tot_gpu_num}, gpu_order_we_set: {gpu_order_we_set}")
 
-        exec_plan_state.launched = True
-        SHARED_CONTECT.start_specific_models([shared_id])
+            setting = get_exec_settings_from_exec_plans(
+                exec_plan=exec_plan, available_gpus=exec_plan_state.comp_gpus, tot_gpu_num=tot_gpu_num, gpu_order_we_set=gpu_order_we_set)
+            shared_id = model_id_shared_id_mapping[exec_plan.model.model_id]
+            SHARED_CONTECT.set_execution_plan(setting, shared_ids=[shared_id])
+
+            exec_plan_state.launched = True
+            SHARED_CONTECT.start_specific_models([shared_id])
+    except Exception as e:
+        print(f"Exception in start_exec_plans: {e}")
+        print(f"exec plan comp gpus: {[exec_plan_state.comp_gpus for exec_plan_state in new_launch]}, tot_gpu_num: {tot_gpu_num}, gpu_order_we_set: {gpu_order_we_set}")
+        print(f"tot_gpu_num: {tot_gpu_num}, gpu_order_we_set: {gpu_order_we_set}")
+        print(traceback.format_exc())
+        assert False
 
 
 
@@ -1168,7 +1268,7 @@ def init_prompts_for_the_model_system(
         to_add = inp_prompts
         # print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)}, to_add[0]: {to_add[0]}")
 
-        print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)} prompt_lens: {[len(req) for _, req in dataset_dict[None]]}")
+        print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)} prompt_lens: {[len(req) for _, req in dataset_dict[dataset]]}")
 
 
         if dataset != None:
@@ -1185,7 +1285,7 @@ def init_prompts_for_the_model_system(
     
 
     print(f"req_num_dict: {req_num_dict}", flush=True)
-    print(f"to_add: {to_add}")
+    # print(f"to_add: {to_add}")
 
     # set the req number for each non-dummy model node
     tot_node_num = len(req_num_dict) + len(in_edge_dict_with_dummy_inp_nodes)
@@ -1221,7 +1321,7 @@ def init_prompts_for_the_model_system(
         # TODO: 暂时先这么写，但是tokenizer.decode还有参数需要完善
         print(f"model_id: {model_id}")
         # print(to_add[0])
-        if not isinstance(to_add[0], str):
+        if not isinstance(to_add[0][1], str):
             to_add = [(req_i, tokenizer.decode(token_ids)) for req_i, token_ids in to_add]
 
         communicator.add_seqs(model_id, to_add)
@@ -1411,7 +1511,8 @@ async def main_with_preemption(
         tot_gpu_num:int = 4,
         max_group_seq_num: float = float('inf'),
         top_k: float = float('inf'),
-        similar_threshold: float=0.1
+        similar_threshold: float=0.1,
+        fully_connected_gpu_unit: int = 4,
 ):
     import os
     os.environ['RUN_MULTI_MODEL'] = 'True'
@@ -1499,6 +1600,7 @@ async def main_with_preemption(
 
 
     print(f"\nTIMESTAMP 1: {time.perf_counter()}\n")
+    time_lists: List[float] = list()
 
     with MyManager() as manager:
 
@@ -1573,6 +1675,7 @@ async def main_with_preemption(
 
             start = time.perf_counter()
             print(f"Outer iter start time ---abs: {start}")
+            time_lists.append(start)
 
             pending_list = tasks
             model_schedule_iter = 0
@@ -1586,6 +1689,8 @@ async def main_with_preemption(
                 # <jingzhi> For Profiling
                 start_waiting = time.perf_counter()
                 print(f"MAIN PROCESS: total time to launch processes (just the value of iter 0 is useful) {model_schedule_iter}: {start_waiting-start}s ---abs: {start_waiting}", flush=True)
+                time_lists.append(start_waiting)
+
 
                 # 1. get models that need to be stopped
                 try:
@@ -1596,6 +1701,7 @@ async def main_with_preemption(
                             tot_gpu_num, plan_state_group_list,
                             model_driver_worker_gpu_i,
                             model_id_shared_id_mapping,
+                            fully_connected_gpu_unit,
                         )
                 except Exception as e:
                     print(f"Exception in running benchmark_throughput.main(): {e}")
@@ -1604,6 +1710,9 @@ async def main_with_preemption(
                 print(f"new_launch: {new_launch}")
                 print(f"model_ids_to_stop: {model_ids_to_stop}")
                 
+                # for plan_state in launched_exec_plan_states:
+                #     print(f"running plan_state info: {plan_state.exec_plan.model.model_name, plan_state.exec_plan.get_key(), plan_state.comp_gpus}")
+
 
                 # 2. stop the models
                 # SHARED_CONTECT.stop_specific_models(model_ids_to_stop)
@@ -1638,6 +1747,10 @@ async def main_with_preemption(
 
             end = time.perf_counter()
             print(f"total running time: {end-start}s ---abs: {end}")
+
+            time_lists.append(end)
+            print(f"all stage times: timestamps: {time_lists}")
+            print(f"all stage times: time lengths: {np.diff(time_lists).tolist()}")
 
 
 
@@ -2138,7 +2251,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
 def get_schedule_setting(test_case:str, use_real_dataset:bool):
 
-    if use_real_dataset:
+    if use_real_dataset and (test_case != 'general'):
         return _get_schedule_setting_with_real_data(test_case=test_case)
     
 
@@ -2164,7 +2277,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
-        req_num = 200
+        req_num = 1000
         inp_seq_ids_dict = {i: list(range(req_num)) for i in range(len(model_paths))}
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
@@ -2175,14 +2288,44 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
 
         # inp/out len generator functions for the general setting
         # 假设是下面的这种拓扑结构：model 1 -> model 2
-        in_edge_dict_with_dummy_inp_nodes = {0:[-1], 1:[0]}
-        req_num = 20
-        inp_generator = get_inplens
-        inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
-        outlen_generator = output_length_sampler.sample_out_len_for_given_model
-        node_dataset_chunk_mapping = {-1: ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1)}
+        # in_edge_dict_with_dummy_inp_nodes = {0:[-1], 1:[0]}
+        # req_num = 20
+        # inp_generator = get_inplens
+        # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+        # outlen_generator = output_length_sampler.sample_out_len_for_given_model
+        # node_dataset_chunk_mapping = {-1: ("ShareGPT_V3_unfiltered_cleaned_split.json", 0, -1)}
 
         independent_srcs = {i:False for i in range(len(model_paths))}
+
+
+        # # we need to prepare the dummpy requests here
+        # sampled_prompts = 
+        # _init_dummy_requests([], )
+
+        # req_num = tot_req_num
+
+        # sampling_args1 = {                    
+        #     "n":1,
+        #     # <jingzhi> change to greedy sampling to check correctness.
+        #     "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+        #     "top_p":1.0,
+        #     "use_beam_search":False,
+        #     "ignore_eos":True, # False, # True (original),
+        #     "max_tokens":50}
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
+
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+        print(f"node_dataset_chunk_mapping: {node_dataset_chunk_mapping}")
 
     elif test_case == 'map-reduce':
         # inp/out len generator functions for the map-reduce or chain summary scenario
@@ -2366,10 +2509,10 @@ if __name__ == "__main__":
     # --------------------------------------------------------------------
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # # search_method_baseline = 'ours' # 'naive'  'ours'
-    gen_execplans_baseline = 'ours' # 'naive'  'ours'
+    gen_execplans_baseline = 'naive' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     
-    test_case = 'chain-summary' # 'general' 'map-reduce' 'chain-summary'
+    test_case = 'general' # 'general' 'map-reduce' 'chain-summary'
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
              inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \
@@ -2393,10 +2536,12 @@ if __name__ == "__main__":
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
         inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
-        tot_gpu_num=2,
-        max_group_seq_num=100,
+        tot_gpu_num=4,
+        max_group_seq_num=10,
         top_k=100,
-        similar_threshold=0.1))
+        similar_threshold=0.1,
+        # NOTE: 1. for DSF servers: fully_connected_gpu_unit=2, for lccpus, fully_connected_gpu_unit=4.
+        fully_connected_gpu_unit=2))
     # # asyncio.run(main_with_preemption_debug())
 
 

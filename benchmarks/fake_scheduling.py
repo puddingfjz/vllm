@@ -1143,10 +1143,10 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline(
             seq_ids, inp_lens, out_lens, arrive_times, tot_inference_time = _check_new_input_requests(
                 sort_input, seq_ids, inp_lens, out_lens, arrive_times, tot_inference_time, pointer, running_seqs_num)
         
-            print(f"_check_new_input_requests: new seq_ids: {seq_ids}")
+            # print(f"_check_new_input_requests: new seq_ids: {seq_ids}")
             # print(f"arrive_times: {arrive_times}")
             # print(f"query available requests: ____________________")
-            print(f"seq_ids: {seq_ids}")
+            # print(f"seq_ids: {seq_ids}")
             # print(f"arrive_times: {arrive_times}")
             # print(f"tot_inference_time: {tot_inference_time}")
             # print(f"running_seqs: {running_seqs}")
@@ -1212,7 +1212,7 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline(
         new_prompt_ids = np.asarray(new_prompt_ids)
         ori_prefill_logs_num = len(prefill_logs)
 
-        print(f"new_prompt_ids: {new_prompt_ids}")
+        # print(f"new_prompt_ids: {new_prompt_ids}")
         # print(f"must_record_first_step: {must_record_first_step}, tot_iter_num: {tot_iter_num}, last_iter_seqs: {last_iter_seqs}, last_iter_seq_ids: {last_iter_seq_ids}")
 
         # if len(new_prompt_lens) > 0:
@@ -1920,9 +1920,9 @@ def fake_FCFS_schedule(
     else:
 
         print(f"Has input exec plans in this stage")
-        print(f"inp_lens: {inp_lens}")
-        print(f"out_lens: {out_lens}")
-        print(f"arrive_times: {arrive_times}")
+        # print(f"inp_lens: {inp_lens}")
+        # print(f"out_lens: {out_lens}")
+        # print(f"arrive_times: {arrive_times}")
 
         cumsum_latencys, is_prefill_steps, infer_progress = _fake_FCFS_schedule_continuous_model_level_pipeline(
             inp_lens=inp_lens,out_lens=out_lens, arrive_times=arrive_times, check_gap=check_gap,

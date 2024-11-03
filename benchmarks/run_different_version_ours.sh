@@ -430,7 +430,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 schedule_multi_model.py > test_end2end_schedule
 CUDA_VISIBLE_DEVICES=1,2 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-chainSummary-3.log
 CUDA_VISIBLE_DEVICES=4,7 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-mapreduce-4_horizontal_fusion_3.log
 CUDA_VISIBLE_DEVICES=4,7 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-chain_summary_naiveSearchSpace_1.log
-
+CUDA_VISIBLE_DEVICES=1,2,3,4 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1031_4gpu-general_ours_1.log
 
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1003_2gpu_1-chainSummary-1.log
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1009_2gpu_1-chainSummary-1.log
