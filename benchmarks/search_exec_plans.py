@@ -698,11 +698,17 @@ class MyExecPlan:
         arrive_times = np.asarray(arrive_times) - self.extra_cost
         to_sort = list(zip(arrive_times, inp_seq_ids))
         # print(f"arrive_times: {arrive_times}")
+        # print(f"len(arrive_times): {len(arrive_times)}")
+        # print(f"len(inp_lens): {len(inp_lens)}")
+        # print(f"len(to_sort): {len(to_sort)}")
         # print(f"inp_lens: {inp_lens}")
         # print(f"out_lens: {out_lens}")
         # print(f"inp_seq_ids: {inp_seq_ids}")
         # print(f"to_sort: {to_sort}")
         order = sorted(range(len(to_sort)), key=lambda i: to_sort[i])
+        
+        # print(f"len(order): {len(order)}, max|min: {max(order), min(order)}")
+
         inp_lens = np.asarray(inp_lens)[order]
         out_lens = np.asarray(out_lens)[order]
         inp_seq_ids = np.asarray(inp_seq_ids)[order]
@@ -3080,6 +3086,9 @@ class MyModelSystem:
 
         print(f"\n\nTRYING FUSING SOME MODELS AT THE BEGINNING!\n\n")
 
+        if len(self.all_level_model_ids) == 1:
+            return self
+
         # NOTE: assume self.get_all_level_models is already called right before this function is called.
 
         visit_model_level = -1
@@ -3516,6 +3525,18 @@ class MyModelSystem:
             NOTE: here we only ensure the validity of the candidate plan groups;
                 we do not select good ones from them.
         """
+
+        def _directly_discard(
+                gen_execplans_baseline: str, not_finished_base_model_num: int, 
+                plan_group: List[MyExecPlan], tot_gpu_num: int):
+            involved_base_model_num = sum([len(plan.get_base_model_ids()) for plan in plan_group])
+            gpu_num_sum = get_tot_worker_num(plan_group)
+            return (gen_execplans_baseline=='ours') \
+                and (not_finished_base_model_num > involved_base_model_num) \
+                    and (gpu_num_sum<tot_gpu_num)
+
+        not_finished_base_model_num = self.get_not_finished_base_model_num()
+
         # running_model_ids are models running in this exec stage
         tot_plan_groups = [[]]
         new_plan_groups = [[]]
@@ -3523,6 +3544,10 @@ class MyModelSystem:
         uniq_exec_plan_mapping = dict()
         # stores the best plan group given a set of models and the GPU num to use --> to add pruning in the plan group generation process
         good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]] = dict()
+
+        # stores the best exec plans for each model and each GPU number assigned 
+        # --> do not considering other exec plans in the same stage here
+        # good_exec_plans: Dict[int, Dict[int, List[MyExecPlan]]] = dict()
 
         # we first divide the unfinished model into different levels
         self.get_all_level_models()
@@ -3543,6 +3568,13 @@ class MyModelSystem:
                 exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input)
                 exec_plans_list.append(exec_plans)
                 print(f"model finished? {model.is_finished()}, model_id: {model.get_base_model_ids()}, can exec_plans: {[str(plan) for plan in exec_plans]}")
+
+                # # update good_exec_plans
+                # good_exec_plans[model.model_id] = dict()
+                # for exec_plan in exec_plans:
+                #     gpu_num_required = exec_plan.num_worker*exec_plan.dp_size
+                #     throughput = 
+
 
             # print(f"New Round get_candidate_plan_groups ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
@@ -3567,8 +3599,18 @@ class MyModelSystem:
                 
                 if len(plan_groups) == 1:
                     # no new model is added to cand_plan_group
-                    tot_plan_groups.extend(plan_groups)
+                    if not _directly_discard(
+                        gen_execplans_baseline, not_finished_base_model_num, plan_groups[0], tot_gpu_num
+                        ):
+                        tot_plan_groups.extend(plan_groups)
                 else:
+
+                    if visit_model_level+1 >= len(self.all_level_model_ids):
+                        # this is the last layer, we can consider discard some exec plans
+                        plan_groups = [plan_groups[0]]+[plan_group for plan_group in plan_groups[1:] if not _directly_discard(
+                            gen_execplans_baseline, not_finished_base_model_num, plan_group, tot_gpu_num
+                            )]
+
                     # we first update the good_plan_group_dict
                     # print(f"the groups we found a round: ")
                     # for plan_group in plan_groups[1:]:
@@ -4708,7 +4750,8 @@ def get_one_stage_exec_plans_sorted(
 
 
         # 1. if there are models available but the comp gpus are not fully utilized
-        if (not_finished_model_num > plan_group.get_involved_base_model_num()) and (get_tot_worker_num(plan_group.exec_plans)<tot_gpu_num):
+        # only used when gen_execplans_baseline == 'ours', as otherwise there will be only 1 exec plan for each model and we can't discard it.
+        if (gen_execplans_baseline=='ours') and (not_finished_model_num > plan_group.get_involved_base_model_num()) and (get_tot_worker_num(plan_group.exec_plans)<tot_gpu_num):
             continue
 
         # print(f"check redundancy 2 -- fully resource utilization!")
@@ -5554,6 +5597,11 @@ def get_per_layer_and_extra_param_and_buffer_byte(
 
         NOTE: compute according to model.parameters() and model.buffers().
     '''
+    if (model_info.model_path, tp_size) not in model_sizes:
+        per_layer = 1e12
+        extra = 1e12
+        return per_layer, extra
+        
     per_layer, extra = model_sizes[(model_info.model_path, tp_size)]
     if per_layer == None:
         per_layer = 1e12
@@ -5575,7 +5623,7 @@ def get_gpu_cache_byte_per_block(cache_config, model_config, parallel_config):
 def get_model_info_objs(
         cost_table: CostTable,
         data_byte: int,
-        inp_lens: List[int],
+        inp_lens_dict: Dict[str, List[int]],
         model_paths: List[str], 
         inp_seq_ids_dict: Dict[int, int],
         outlen_generator,
@@ -5587,11 +5635,12 @@ def get_model_info_objs(
         NOTE: 
             inp_seq_ids_dict: stores the ids of the inp seqs each model needs to answer. 
                 Support the chain summary case where each LLM stage has different number of inp reqs.
+            inp_lens_dict: dict of {model_path: inp_lens}
     '''
     # out_lens_dict = {model_path: output_length_sampler.sample_out_len_for_given_model(
     #         model=model_path[model_path.find('/')+1:], inp_lens=inp_lens) for model_path in set(model_paths)}
     out_lens_dict = {model_path: outlen_generator(
-            model_path[model_path.find('/')+1:], inp_lens) for model_path in set(model_paths)}
+            model_path[model_path.find('/')+1:], inp_lens_dict[model_path]) for model_path in set(model_paths)}
 
     # try to use the output lengths set by the SharedGPT dataset
     # out_lens_dict = {model_path: get_outlens()  for model_path in set(model_paths)}
@@ -5603,7 +5652,7 @@ def get_model_info_objs(
                 outlen_generator,
                 sample_config, trust_remote_code, revision,
                 data_byte, # the number of bytes to store a value in model weights or intermediate tensors
-                inp_lens,
+                inp_lens_dict[model_path],
                 out_lens=out_lens_dict[model_path],
                 inp_seq_ids=inp_seq_ids_dict[model_id]
                 # input_model_ids=edge_dict[model_id],
@@ -5613,7 +5662,7 @@ def get_model_info_objs(
 
 
 
-def get_inplens(req_num: int):
+def get_inplens_base_on_log_files(req_num: int):
     import json
     def get_lens(filename):
         with open(filename, 'r') as file:
@@ -5679,13 +5728,16 @@ def get_best_model_schedule(
 
     # 2. get input lengths
     # inp_lens = get_inplens()
-    inp_lens = inp_generator(num_prompts)
-    print(f"len(inp_lens): {len(inp_lens)}")
+    # inp_lens = inp_generator(num_prompts)
+    # print(f"len(inp_lens): {len(inp_lens)}")
+    inp_lens_dict = {model_path:inp_generator(num_prompts,model_path) for model_path in set(model_paths)}
+    for k, v in inp_lens_dict.items():
+        print(f"len(inp_lens) of {k}: {v}")
 
     # 3.  initialize model info objects and the model system object
     model_list: List[MyModelInfor] = get_model_info_objs(
         cost_table,
-        data_byte, inp_lens, model_paths, inp_seq_ids_dict, outlen_generator, sample_config, trust_remote_code, revision)
+        data_byte, inp_lens_dict, model_paths, inp_seq_ids_dict, outlen_generator, sample_config, trust_remote_code, revision)
     
     model_sys = MyModelSystem(model_list=model_list, out_edge_dict=out_edge_dict, 
                               cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator,

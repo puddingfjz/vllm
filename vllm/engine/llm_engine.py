@@ -1559,6 +1559,9 @@ class LLMEngine:
 
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+        # from vllm.core.multimodel_scheduler import SHARED_CONTECT
+        # print(f"INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} req ids: {[(_.request_id, list(_.seqs_dict.keys()), len(self.scheduler.block_manager.block_tables[list(_.seqs_dict.keys())[0]]), (list(_.seqs_dict.values())[0].get_len()-1)//self.cache_config.block_size) for list_ in [self.scheduler.running] for _ in list_]}")
+
         if not scheduler_outputs.is_empty():
             # Execute the model.
 

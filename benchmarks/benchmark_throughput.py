@@ -134,6 +134,8 @@ def sample_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int],
+    # <jingzhi>
+    random_seed: int=0,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -176,6 +178,7 @@ def sample_requests(
 
     # Sample the requests.
     # <jingzhi> make sample size be ``min(num_requests, len(filtered_dataset))''
+    random.seed(random_seed)
     sampled_requests = random.sample(filtered_dataset, min(num_requests, len(filtered_dataset)))
 
     if os.environ['SORT_REQS'] == 'True':
@@ -758,14 +761,14 @@ def run_vllm(
         start_before_prepare_model = time.perf_counter()
 
 
-        print(f"waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        print(f"waiting-----------------: shared_id {SHARED_CONTECT.shared_id} rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
 
         if rescheduled_iter_num > 0:
             # need wait for the signal to start model loading
             # SHARED_CONTECT.sync_before_loading_model()
             SHARED_CONTECT.wait_to_be_started()
 
-        print(f"finish waiting----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        print(f"finish waiting-----------------: shared_id {SHARED_CONTECT.shared_id}  rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
 
         # TODO (jingzhi) because we allow model preemption here, we may adjust this later
         if start == None:
@@ -773,7 +776,7 @@ def run_vllm(
         
         # <jingzhi> For Profiling
         start_prepare_model = time.perf_counter()
-        print(f"total time before preparing model: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
+        print(f"total time before preparing model: shared_id {SHARED_CONTECT.shared_id}: {start_prepare_model-start_before_prepare_model}s ---abs {start_prepare_model}")
 
 
 
@@ -784,7 +787,7 @@ def run_vllm(
 
 
 
-        print(f"loading LLM  tensor_parallel_size {tensor_parallel_size} gpu_memory_utilization {gpu_memory_utilization}----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
+        print(f"loading LLM: shared_id {SHARED_CONTECT.shared_id}  tensor_parallel_size {tensor_parallel_size} gpu_memory_utilization {gpu_memory_utilization}----------------- rescheduled_iter_num: {rescheduled_iter_num}", flush=True)
         
         infer_args = [
             # the parameters of LLM engine--------------
@@ -818,7 +821,7 @@ def run_vllm(
 
         # prepare requests (reorder them for dp workers if necessary)
         dp_size = SHARED_CONTECT.get_dp_size()
-        print(f"dp_size: {dp_size}", flush=True)
+        print(f"shared_id {SHARED_CONTECT.shared_id} dp_size: {dp_size}", flush=True)
         if rescheduled_iter_num > 0:
             # except the first round, always make requests pointing to remaining_requests
             if dp_size == 1:
@@ -843,7 +846,7 @@ def run_vllm(
         SHARED_CONTECT.communicator.reset_state_for_model(SHARED_CONTECT.shared_id, dp_size)
 
         # launch multiprocessing subprocess for dp workers------------------------------------------------------------
-        print(f"start doing inference-------------\n")
+        print(f"start doing inference: shared_id {SHARED_CONTECT.shared_id}-------------\n")
         
         
         executor = None
@@ -865,7 +868,7 @@ def run_vllm(
                                 worker_i, requests[worker_i], *infer_args) \
                                     for worker_i in range(dp_size)]
     
-        print(f"finish launching dp processes-------------\n")
+        print(f"finish launching dp processes: shared_id {SHARED_CONTECT.shared_id} -------------\n")
         
         # run the inference of the main dp worker
         # main_output = my_llm_infer_worker_multiprocessing.do_inference(0, requests[0], *infer_args)
@@ -894,7 +897,7 @@ def run_vllm(
         done, not_done = wait(futures, return_when=ALL_COMPLETED)
         ray_dp_worker_outputs = [future.result() for future in done]
 
-        print(f"finish fetching dp worker results-------------\n")
+        print(f"finish fetching dp worker results: shared_id {SHARED_CONTECT.shared_id} -------------\n")
 
         # now we can mark the finish status in SHARED_CONTECT.prepare_for_reschedule
         # first check whether this model is finished
@@ -902,14 +905,16 @@ def run_vllm(
         #                + sum([len(worker_output[1]) for worker_output in ray_dp_worker_outputs])) == 0
         gened_output_num = sum([worker_output[0] for worker_output in ray_dp_worker_outputs])
         
-        print(f"gened_output_num: {gened_output_num}-------------\n")
+        print(f"gened_output_num: shared_id {SHARED_CONTECT.shared_id}: {gened_output_num} -------------\n")
 
-        SHARED_CONTECT.set_finished(gened_output_num, set_event_state_anyway=True)
+        # must update the remaining req num here in the main process, 
+        # s.t., the next round dp workers can have correct reamining req num to use
+        SHARED_CONTECT.set_finished(gened_output_num)#, set_event_state_anyway=True)
         # # then mark the preparation_for_reschedule process as finished ==> mark it when calling ``set_finished``
-        # SHARED_CONTECT.set_finish_preparation_for_reschedule()
+        SHARED_CONTECT.set_finish_preparation_for_reschedule()
         
 
-        print(f"obtain all outputs in this round in main dp actor  ---abs {time.perf_counter()}")
+        print(f"obtain all outputs in this round in main dp actor: shared_id {SHARED_CONTECT.shared_id}  ---abs {time.perf_counter()}")
         
         
         # reorganize all generated outputs
@@ -927,14 +932,14 @@ def run_vllm(
         # if dp_size > 1:
         #     remaining_outputs = sorted(remaining_outputs, key=lambda seq_group: len(seq_group.prompt_token_ids))
         
-        print(f"reorganize all remaining requests ---abs {time.perf_counter()}")
+        print(f"reorganize all remaining requests: shared_id {SHARED_CONTECT.shared_id} ---abs {time.perf_counter()}")
 
         # kill remote llm inference workers if any
         if dp_size > 1:
             executor.shutdown()
 
 
-        print(f"kill all dp actors if any ---abs {time.perf_counter()}")
+        print(f"kill all dp actors if any: shared_id {SHARED_CONTECT.shared_id} ---abs {time.perf_counter()}")
         
         # ray worker应该返回什么request序列呢？返回他们的finished的request和remaining request，
         # 先暂时naive地每次都一定返回，之后再根据是否dp_size发生了改变决定是否当前轮次要返回。

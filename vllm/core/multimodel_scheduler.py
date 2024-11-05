@@ -753,7 +753,7 @@ class LLM_COMMUNICATOR:
             return ret, possible_to_get_future_reqs, req_base_model_ids
         
         except Exception as e:
-            print(f"Exception in llm._run_engine: {e}")
+            print(f"Exception in llm.get_seqs: {e}")
             print(traceback.format_exc())
             assert False
 
@@ -989,6 +989,8 @@ class SHARED_CONTECT():
             # remove_placement_group(pg)
 
             pg_info_name = 'my_pg'+os.environ['DP_WORKER_I']
+            if os.environ['USE_VLLM']=='True':
+                pg_info_name = 'vllm_pg'
             pg = get_placement_group(pg_info_name)
             remove_placement_group(pg)
 
@@ -1045,6 +1047,8 @@ class SHARED_CONTECT():
         # os.environ['CUDA_VISIBLE_DEVICES'] = gpus
         # NOTE: to enable reschedule, we use TOT_ORDERED_GPUS to store the real available gpus in order
         os.environ['TOT_ORDERED_GPUS'] = gpus
+
+        print(f"in update_execution_plan, shared_id: {cls.shared_id}, TOT_ORDERED_GPUS: {gpus}", flush=True)
 
         return tensor_parallel_size, gpu_memory_utilization
 
@@ -1122,9 +1126,9 @@ class SHARED_CONTECT():
         finished = (cls.tot_req_num_remained == 0)
         if finished:
             cls.shared_finish_status[cls.shared_id] = finished
-        if finished or set_event_state_anyway:
-            if os.environ['RUN_MULTI_MODEL'] == 'True':
-                cls.events[cls.shared_id + 2].set()
+        # if finished or set_event_state_anyway:
+        #     if os.environ['RUN_MULTI_MODEL'] == 'True':
+        #         cls.events[cls.shared_id + 2].set()
 
         if os.environ['RUN_MULTI_MODEL'] == 'True':
             print(f"event list status in set finish--model {cls.shared_id}: {[event.is_set() for event in cls.events[2:]]}")
@@ -1147,11 +1151,11 @@ class SHARED_CONTECT():
 
 
 
-    # @classmethod
-    # def set_finish_preparation_for_reschedule(cls) -> None:
-    #     if os.environ['RUN_MULTI_MODEL'] == 'True':
-    #         cls.events[cls.shared_id + 2].set()
-    #         print(f"event list status in set finish prepare for reschedule--model {cls.shared_id}: {[event.is_set() for event in cls.events[2:]]}")
+    @classmethod
+    def set_finish_preparation_for_reschedule(cls) -> None:
+        if os.environ['RUN_MULTI_MODEL'] == 'True':
+            cls.events[cls.shared_id + 2].set()
+            print(f"event list status in set finish prepare for reschedule--model {cls.shared_id}: {[event.is_set() for event in cls.events[2:]]}")
 
 
 
@@ -1230,7 +1234,7 @@ class SHARED_CONTECT():
             return
         cls.started_status[cls.shared_id].wait()
 
-        print(f"event list status in start_specific_models--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
+        print(f"event list status in wait_to_be_started--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
 
 
 
@@ -1254,6 +1258,7 @@ class SHARED_CONTECT():
         # NOTE: change to multiprocessing subprocesses for dp workers, so we do not need such message_passer
         # if cls.dp_id > 0:
         #     return ray.get(cls.message_passer_for_dp.query_stop.remote())
+        # print(f"event list status in should_reschedule--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
         return not cls.started_status[cls.shared_id].is_set()
 
 
@@ -1280,6 +1285,7 @@ class SHARED_CONTECT():
         for shared_id in shared_ids:
             cls.started_status[shared_id].clear()
 
+        print(f"event list status in stop_specific_models--model {cls.shared_id}: {[event.is_set() for event in cls.started_status]}")
 
 
     # ===============================================================================

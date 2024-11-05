@@ -381,6 +381,23 @@ class LLM:
             return output_num_sent_out, [(output.request_id, output.outputs[0].token_ids) for output in new_outputs]
 
 
+
+    def _correct_seq_ids(self):
+        """
+            This function is called in the beginning. 
+            Useful when the last round of inference has data parallelism and there are remaining requests left to this round.
+        """
+        for req in self.llm_engine.scheduler.waiting:
+            new_seqs_dict = dict()
+            for seq in req.seqs_dict.values():
+                new_seq_id = next(self.llm_engine.seq_counter)
+                seq.seq_id = new_seq_id
+                new_seqs_dict[new_seq_id] = seq
+            req.seqs_dict = new_seqs_dict
+
+
+
+
     # <jingzhi> support data parallel + model-level pipeline
     def _run_engine(
             self, use_tqdm: bool, 
@@ -390,6 +407,14 @@ class LLM:
         """
             We add some input parameters to support constructing new requests in multi-level LLM systems.
         """
+
+
+        # print(f"1 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} #: {self.llm_engine.get_num_unfinished_requests()}, req ids: {[(_.request_id, list(_.seqs_dict.keys())) for list_ in [self.llm_engine.scheduler.waiting, self.llm_engine.scheduler.swapped, self.llm_engine.scheduler.running] for _ in list_]}")
+        # print(f"1 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}, GPU block #: {self.llm_engine.scheduler.block_manager.num_total_gpu_blocks}, block_manager: {list(self.llm_engine.scheduler.block_manager.block_tables.keys())}")
+
+        # correct the seqs ids in case we get remaining seqs from last round inference.
+        self._correct_seq_ids()
+
 
         # Initialize tqdm.
         if use_tqdm:
@@ -464,7 +489,7 @@ class LLM:
                         SHARED_CONTECT.communicator.get_seqs(SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id, SHARED_CONTECT.get_dp_size())
 
                     # print(f"try to get new reqs 222: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}, new_inps: {new_inps}, possible_to_get_future_reqs: {possible_to_get_future_reqs}")
-                    print(f"GET SEQS for model shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  FROM THE POOL:")
+                    print(f"GET SEQS for model shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  FROM THE POOL: len(new_inps): {len(new_inps)} seq ids: {[_[0] for _ in new_inps]}")
                     # for _ in new_inps:
                     #     print(_[0], _[1][:10])
                     with open(f"./test_end2end_schedule/model_IO.log", 'a') as file:
@@ -472,6 +497,9 @@ class LLM:
                             file.write(f"Get: shared id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}: {str(_)}\n")
 
                     self._add_new_available_reqs(new_inps, sort_inps, req_base_model_ids)
+
+                    # print(f"2 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} #: {self.llm_engine.get_num_unfinished_requests()}, req ids: {[(_.request_id, list(_.seqs_dict.keys())) for list_ in [self.llm_engine.scheduler.waiting, self.llm_engine.scheduler.swapped, self.llm_engine.scheduler.running] for _ in list_]}")
+                    # print(f"2 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}, GPU block #: {self.llm_engine.scheduler.block_manager.num_total_gpu_blocks}, block_manager: {list(self.llm_engine.scheduler.block_manager.block_tables.keys())}")
 
 
                     # print(f"try to get new reqs 333: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}, self.llm_engine.scheduler.waiting: {self.llm_engine.scheduler.waiting}")
@@ -502,6 +530,7 @@ class LLM:
             step_i+=1
             print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}")
             print(f"step i: {step_i}", flush=True)
+            # print(f"INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} #: {self.llm_engine.get_num_unfinished_requests()}, req ids: {[(_.request_id, list(_.seqs_dict.keys()), len(self.llm_engine.scheduler.block_manager.block_tables[list(_.seqs_dict.keys())[0]]), (list(_.seqs_dict.values())[0].get_len()-1)//self.llm_engine.cache_config.block_size) for list_ in [self.llm_engine.scheduler.running] for _ in list_]}")
             # print(f"model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}  possible_to_get_future_reqs: {possible_to_get_future_reqs}  self.llm_engine.has_unfinished_requests(): {self.llm_engine.has_unfinished_requests()}")
 
 
@@ -533,7 +562,7 @@ class LLM:
                 # SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests)
                 # # now we are ready to reload the model according to the new execution plan and restart the inference
 
-                print(f"THIS MODEL IS STOPPED!")
+                print(f"THIS MODEL IS STOPPED!  model id: {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}")
 
                 # NOTE: after changing to multiprocessing dp worker processes, we do not need to 
                 #       notify the dp ray actors as all workers can share the latest SHARED_CONTECT content
@@ -601,8 +630,10 @@ class LLM:
             # <jingzhi> support multi-model inference
             remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
             SHARED_CONTECT.set_finished(len(outputs))
-            if not SHARED_CONTECT.is_finished():
-                SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
+            SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine, mark_finish=False)
+            # if not SHARED_CONTECT.is_finished():
+            #     SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
+            # 
                 # now we are ready to reload the model according to the new execution plan and restart the inference
             # ----
             # # <jingzhi> support multi-model inference

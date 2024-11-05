@@ -35,10 +35,10 @@ import benchmark_throughput
 
 import time
 import numpy as np
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union
 import itertools
 
-from search_exec_plans import MyExecPlan, MyExecPlanGroupSeq, MyModelInfor, get_best_model_schedule, get_dependent_exec_plans_for_each_plan, get_inplens
+from search_exec_plans import MyExecPlan, MyExecPlanGroupSeq, MyModelInfor, get_best_model_schedule, get_dependent_exec_plans_for_each_plan #, get_inplens
 import output_length_sampler
 
 from collections import defaultdict
@@ -188,6 +188,7 @@ def start_a_model_inference_child_process(
         print(f"SHARED_CONTECT.tot_req_num_remained: {SHARED_CONTECT.tot_req_num_remained}")
         # benchmark_throughput.main(args)
         benchmark_throughput.main(args)
+        print(f"MODEL PROCESS ENDS: shared_id: {SHARED_CONTECT.shared_id}", flush=True)
     except Exception as e:
         print(f"Exception in running benchmark_throughput.main(): {e}")
         print(traceback.format_exc())
@@ -1048,12 +1049,14 @@ def _adjust_comp_gpus_for_current_launched_exec_plans(
         if plan_state not in new_launch:
             gpus = plan_state.get_comp_gpus()
             gpus = np.asarray(gpus)[:plan_state.exec_plan.num_worker*plan_state.exec_plan.dp_size]
+            print(f"model_id: {plan_state.exec_plan.model.model_id}, gpus: {gpus}", flush=True)
             gpus, counts = np.unique(gpus // fully_connected_gpu_unit, return_counts=True)
             if plan_state.exec_plan.num_worker >= fully_connected_gpu_unit:
                 # NOTE: we assume the gpus assigned to the plan_state must have been the best choice for it    
                 # check the gpu groups that this model fully occupies
                 assert (counts == fully_connected_gpu_unit).all()
                 cost_to_clean_models[gpus] = 1e9
+                print(f"keep gpu assignment: model_id: {plan_state.exec_plan.model.model_id}", flush=True)
             else:
                 cost_to_clean_models[gpus] = cost_to_clean_models[gpus] + counts
                 plan_state_to_reassign_gpus.append(plan_state)
@@ -1065,6 +1068,12 @@ def _adjust_comp_gpus_for_current_launched_exec_plans(
     sorted_gpu_group_ids = sorted_gpu_group_ids[ cost_to_clean_models[sorted_gpu_group_ids]<1e9 ]
     cand_gpus = np.concatenate(cand_gpu_groups[sorted_gpu_group_ids])
     extra_new_launch = list()
+
+    # sort the plan states so that those not in new launch can be checked before others
+    plan_state_to_reassign_gpus = sorted(
+        plan_state_to_reassign_gpus, 
+        key=lambda plan_state: (plan_state.exec_plan.num_worker, plan_state not in new_launch), reverse=True)
+
     for plan_state in plan_state_to_reassign_gpus:
         comp_gpu_num = plan_state.exec_plan.num_worker*plan_state.exec_plan.dp_size
         if plan_state.exec_plan.num_worker >= fully_connected_gpu_unit:
@@ -1073,20 +1082,27 @@ def _adjust_comp_gpus_for_current_launched_exec_plans(
             plan_state.set_comp_gpus(gpus)
             if plan_state not in new_launch:
                 extra_new_launch.append(plan_state)
+            print(f"model_id: {plan_state.exec_plan.model.model_id}, reassign gpus: {gpus}, cand_gpus: {cand_gpus}", flush=True)
         else:
             if plan_state not in new_launch:
                 # check whether we do not need move this model
                 gpus = plan_state.get_comp_gpus()[:comp_gpu_num]
                 if set(gpus).issubset(cand_gpus):
-                    if (min(gpus) // fully_connected_gpu_unit) == (max(gpus) // fully_connected_gpu_unit):
+                    # if (min(gpus) // fully_connected_gpu_unit) == (max(gpus) // fully_connected_gpu_unit):
+                    num_worker = plan_state.exec_plan.num_worker
+                    dp_size = plan_state.exec_plan.dp_size
+                    gpu_for_dps = [gpus[dp_i*num_worker:(dp_i+1)*num_worker] for dp_i in range(dp_size)]
+                    if False not in [(min(i) // fully_connected_gpu_unit) == (max(i) // fully_connected_gpu_unit) for i in gpu_for_dps]:
                         # we do not need to change its assigned gpus
                         cand_gpus = [_ for _ in cand_gpus if _ not in gpus]
+                        print(f"model_id: {plan_state.exec_plan.model.model_id}, keep gpus: {gpus}, cand_gpus: {cand_gpus}", flush=True)
                         continue
                 extra_new_launch.append(plan_state)
                 # 
             gpus = cand_gpus[:comp_gpu_num]
             cand_gpus = cand_gpus[comp_gpu_num:]
             plan_state.set_comp_gpus(gpus)
+            print(f"model_id: {plan_state.exec_plan.model.model_id}, reassign gpus: {gpus}, cand_gpus: {cand_gpus}", flush=True)
     #   
     # 
     return extra_new_launch
@@ -1202,7 +1218,7 @@ def _get_dummy_requests():
 
 def _init_dummy_requests(
         inp_lens: List[int],
-        sampled_inps: List[List[int]]=None, 
+        sampled_inps: Union[List[List[int]], List[str]]=None, 
         model_path:str=None, ):
     import json
     if model_path == None:
@@ -1257,7 +1273,7 @@ def init_prompts_for_the_model_system(
             
             continue
         requests = benchmark_throughput.sample_requests(
-            dataset, args.num_prompts, tokenizer,args.output_len)
+            dataset, args.num_prompts, tokenizer,args.output_len, random_seed=args.seed)
         inp_prompts = [(i, req[0]) for i, req in enumerate(requests)]
         dataset_dict[dataset] = inp_prompts
 
@@ -2057,6 +2073,24 @@ def _get_document_prompts(
 
 
 
+# directly get req lengths 
+def get_inplens(req_num: int, model_path: str):
+    import json
+    inp_lens = list()
+    with open("./my_dummy_requests/my_dummy_requests.json", 'r') as file:
+        prompts = json.load(file)
+        args = InferenceArgs(model=model_path, num_prompts=req_num)
+        from transformers import AutoTokenizer
+        # Sample the requests.
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code)
+        prompt_token_ids = tokenizer(prompts).input_ids
+        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+    
+    assert len(inp_lens) == req_num
+    return inp_lens
+
+
 
 def _get_schedule_setting_with_real_data(test_case: str):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
@@ -2077,7 +2111,51 @@ def _get_schedule_setting_with_real_data(test_case: str):
     independent_srcs = dict()
     sampling_args_dict = dict()
     if test_case == 'general':
-        pass
+        # inp/out len generator functions for the general setting
+        model_paths = get_model_path_list()
+        in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
+        req_num = 10000
+        inp_seq_ids_dict = {i: list(range(req_num)) for i in range(len(model_paths))}
+        inp_generator = get_inplens
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+        outlen_generator = output_length_sampler.sample_out_len_for_given_model
+        node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
+                                      for i in range(len(model_paths))}
+
+
+
+        # simply use the tokenizer of llama2 7b to check the lengths of the prompts
+        # TODO: we simply use the llama 7b tokenizer here --> may change this
+        args = InferenceArgs(model='NousResearch/Llama-2-7b-hf', num_prompts=req_num)
+        from transformers import AutoTokenizer
+        # Sample the requests.
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code)
+        requests = benchmark_throughput.sample_requests(
+            "ShareGPT_V3_unfiltered_cleaned_split.json", args.num_prompts, tokenizer, args.output_len, 
+            random_seed=args.seed)
+        inp_prompts = [req[0] for req in requests]
+        # # we need to prepare the dummpy requests here
+        _init_dummy_requests(None, inp_prompts, model_path=model_paths[0])
+
+
+
+        independent_srcs = {i:False for i in range(len(model_paths))}
+
+        sampling_args2 = {                    
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False, # False, # True (original),
+            "max_tokens":int(1e9)}
+        sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
+
+        print(f"\nreal model_paths: {model_paths}")
+        print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+        print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+        print(f"node_dataset_chunk_mapping: {node_dataset_chunk_mapping}")
 
     elif test_case == 'map-reduce':
         # NOTE: we have changed the computation graph to directly horizontally fuse all ``map`` models together
@@ -2088,7 +2166,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
         in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
         # 
-        inp_generator = lambda req_num: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
         node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
@@ -2174,7 +2252,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
         in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
 
-        inp_generator = lambda req_num: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
         # here ``None`` means we use our own dummpy request dataset
@@ -2251,7 +2329,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
 def get_schedule_setting(test_case:str, use_real_dataset:bool):
 
-    if use_real_dataset and (test_case != 'general'):
+    if use_real_dataset:
         return _get_schedule_setting_with_real_data(test_case=test_case)
     
 
@@ -2356,7 +2434,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
         in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
         # 
-        inp_generator = lambda req_num: [512]*req_num
+        inp_generator = lambda req_num, model_path: [512]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
@@ -2434,7 +2512,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
         in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
 
-        inp_generator = lambda req_num: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         # here ``None`` means we use our own dummpy request dataset
@@ -2536,8 +2614,8 @@ if __name__ == "__main__":
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
         inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
-        tot_gpu_num=4,
-        max_group_seq_num=10,
+        tot_gpu_num=8,
+        max_group_seq_num=20,
         top_k=100,
         similar_threshold=0.1,
         # NOTE: 1. for DSF servers: fully_connected_gpu_unit=2, for lccpus, fully_connected_gpu_unit=4.

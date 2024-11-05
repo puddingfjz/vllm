@@ -90,7 +90,7 @@ def do_inference(
             max_paddings=512,
         )
         end_time_load_LLM = time.perf_counter()
-        print(f"total time to load LLM: {end_time_load_LLM - start_time_load_LLM}")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, total time to load LLM: {end_time_load_LLM - start_time_load_LLM}")
     else:
         # update llm instead of initialize a new one
         start_time_load_LLM = time.perf_counter()
@@ -114,7 +114,7 @@ def do_inference(
             max_paddings=512,
         )
         end_time_load_LLM = time.perf_counter()
-        print(f"total time to update LLM: {end_time_load_LLM - start_time_load_LLM}")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, total time to update LLM: {end_time_load_LLM - start_time_load_LLM}")
 
 
     # if rescheduled_iter_num == 0:
@@ -125,9 +125,9 @@ def do_inference(
         # we have not transform the input requests to seqgroups
 
         # <jingzhi>
-        print(f"max_model_len: {llm.llm_engine.model_config.max_model_len}")
-        print(f"temperature: {temperature}")
-        print(f"ignore_eos: {ignore_eos}")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, max_model_len: {llm.llm_engine.model_config.max_model_len}")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, temperature: {temperature}")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, ignore_eos: {ignore_eos}")
 
         # Add the requests to the engine.
         for prompt, _, output_len in remaining_requests:
@@ -150,7 +150,7 @@ def do_inference(
             )
     else:
         # directly set the remaining requests to the scheduler waiting list
-        print(f"directly using unfinished requests!")
+        print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, directly using unfinished requests!")
         # llm.llm_engine.scheduler.waiting = SHARED_CONTECT.remaining_requests
         llm.llm_engine.scheduler.waiting = deque(remaining_requests)
 
@@ -168,7 +168,7 @@ def do_inference(
 
     # <jingzhi> For Profiling
     end_prepare_model = time.perf_counter()
-    print(f"total time to prepare model: {end_prepare_model-start_prepare_model}s ---abs {end_prepare_model}", flush=True)
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, total time to prepare model: {end_prepare_model-start_prepare_model}s ---abs {end_prepare_model}", flush=True)
 
 
     
@@ -182,19 +182,19 @@ def do_inference(
     try:
         outputs = llm._run_engine(use_tqdm=True, sampling_parameters=sampling_parameters)
     except Exception as e:
-        print(f"Exception in llm._run_engine: {e}")
+        print(f"Exception in llm._run_engine: {e}, shared_id: {SHARED_CONTECT.shared_id}  worker i: {worker_i}")
         print(traceback.format_exc())
         
 
     end = time.perf_counter()
     
 
-    print(f"model id: {SHARED_CONTECT.shared_id}, this execution plan running time: {end - tmp_start}s ---abs {end}")
-    print(f"outputs:\n")
+    print(f"shared_id: {SHARED_CONTECT.shared_id}  worker i: {worker_i}, this execution plan running time: {end - tmp_start}s ---abs {end}")
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, outputs:\n")
     # print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), output_len] for req_output, (_, _, output_len) in zip(outputs, requests) for completion_output in req_output.outputs]}")
-    print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), -1] for req_output in outputs for completion_output in req_output.outputs]}")
-    print(f"tot_inp_lens = {sum([len(req_output.prompt_token_ids) for req_output in outputs])}")
-    print(f"tot_out_len = {sum([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), -1] for req_output in outputs for completion_output in req_output.outputs]}")
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, tot_inp_lens = {sum([len(req_output.prompt_token_ids) for req_output in outputs])}")
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, tot_out_len = {sum([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
     # for req_output, (_, _, output_len) in zip(outputs, requests):
     #     for completion_output in req_output.outputs:
     #         print(req_output.request_id, len(req_output.prompt_token_ids), len(completion_output.token_ids), len(req_output.prompt_token_ids)+len(completion_output.token_ids), len(req_output.prompt_token_ids)+output_len)
@@ -206,13 +206,13 @@ def do_inference(
 
 
     # TODO (jingzhi) release the resources of the current execution plan
-    print(f"deleting LLM-----------------", flush=True)
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, deleting LLM-----------------", flush=True)
     # destroy_model_parallel()
     # del llm
     # gc.collect()
     # torch.cuda.empty_cache()
 
-    print(f"SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, SHARED_CONTECT.is_finished: {SHARED_CONTECT.is_finished()}", flush=True)
     print(f"{model} {SHARED_CONTECT.shared_id} One round finished!!!!!!!!!!")
 
 
@@ -222,7 +222,7 @@ def do_inference(
     # my_throughput_logger.print_by_record()
 
     # return request status
-    print(f"model {SHARED_CONTECT.shared_id} worker i: {worker_i}, len of outputs and remainings before return: {len(SHARED_CONTECT.gened_outputs), len(SHARED_CONTECT.remaining_requests)}")
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, len of outputs and remainings before return: {len(SHARED_CONTECT.gened_outputs), len(SHARED_CONTECT.remaining_requests)}")
     # return (SHARED_CONTECT.gened_outputs, SHARED_CONTECT.remaining_requests)
     return len(SHARED_CONTECT.gened_outputs), SHARED_CONTECT.remaining_requests
     
