@@ -407,13 +407,14 @@ class LLM:
         """
             We add some input parameters to support constructing new requests in multi-level LLM systems.
         """
-
+        import os
 
         # print(f"1 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id} #: {self.llm_engine.get_num_unfinished_requests()}, req ids: {[(_.request_id, list(_.seqs_dict.keys())) for list_ in [self.llm_engine.scheduler.waiting, self.llm_engine.scheduler.swapped, self.llm_engine.scheduler.running] for _ in list_]}")
         # print(f"1 INIT REQ iDS: shared id {SHARED_CONTECT.shared_id} dp id: {SHARED_CONTECT.dp_id}, GPU block #: {self.llm_engine.scheduler.block_manager.num_total_gpu_blocks}, block_manager: {list(self.llm_engine.scheduler.block_manager.block_tables.keys())}")
 
         # correct the seqs ids in case we get remaining seqs from last round inference.
-        self._correct_seq_ids()
+        if os.environ['RUN_MULTI_MODEL'] == 'True':
+            self._correct_seq_ids()
 
 
         # Initialize tqdm.
@@ -424,7 +425,7 @@ class LLM:
         outputs: List[RequestOutput] = []
 
         # <jingzhi> init KV_blk_per_layer_weights
-        import os
+
 
         # <jingzhi> support multimodel scheduling
         # from vllm.core.multimodel_scheduler import SHARED_CONTECT
@@ -469,7 +470,8 @@ class LLM:
 
             # print(f"{SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}: len(self.llm_engine.scheduler.running): {len(self.llm_engine.scheduler.running)}")
 
-            if possible_to_get_future_reqs and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0):
+            if (os.environ['RUN_MULTI_MODEL'] == 'True') and \
+                possible_to_get_future_reqs and (len(self.llm_engine.scheduler.waiting)+len(self.llm_engine.scheduler.swapped) == 0):
                 # TODO: 先实现一个naive的版本，不检查目前的资源使用还能不能容纳新的request --> 目前的版本是如果没有waiting的req就一直check
 
                 # print(f"try to get new reqs: {SHARED_CONTECT.shared_id, SHARED_CONTECT.dp_id}")
@@ -518,12 +520,15 @@ class LLM:
 
 
             # check whether we need to stop the inference process
-            if (not possible_to_get_future_reqs) and (not self.llm_engine.has_unfinished_requests()):
+            if (os.environ['RUN_MULTI_MODEL'] == 'True') and \
+                (not possible_to_get_future_reqs) and (not self.llm_engine.has_unfinished_requests()):
                 # (1) not possible to get reqs in the future and (2) all assigned reqs have been finished
                 # print(f"All requests have been finished!")
                 # print(f"possible_to_get_future_reqs: {possible_to_get_future_reqs}")
                 # print(f"self.llm_engine.has_unfinished_requests(): {self.llm_engine.has_unfinished_requests()}")
                 break
+            elif (os.environ['RUN_MULTI_MODEL'] == 'False') and (not self.llm_engine.has_unfinished_requests()):
+                break 
 
 
             # <jingzhi> For Profiling-----------------
@@ -588,7 +593,8 @@ class LLM:
             # send the outputs to the model communicator every check_out_gap steps or when all current reqs are finished
             # <jingzhi> multi-level LLM system
             # print(f"SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id]: {SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id]}")
-            if (step_i % SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id] == 0) or (not self.llm_engine.has_unfinished_requests()):
+            if (os.environ['RUN_MULTI_MODEL'] == 'True') and \
+                ((step_i % SHARED_CONTECT.check_out_gaps[SHARED_CONTECT.shared_id] == 0) or (not self.llm_engine.has_unfinished_requests())):
                 
                 # print(f"writing results back!  SHARED_CONTECT.shared_id: {SHARED_CONTECT.shared_id}------------------")
                 output_num_sent_out, new_outputs = \
@@ -617,16 +623,18 @@ class LLM:
 
         
         # <jingzhi> support multi-level model system
-        output_num_sent_out, new_outputs = \
-            self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
-        SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
+        if (os.environ['RUN_MULTI_MODEL'] == 'True'):
+            output_num_sent_out, new_outputs = \
+                self._get_outputs_to_system_communicator(outputs, output_num_sent_out, SHARED_CONTECT.return_str)
+            SHARED_CONTECT.communicator.add_seqs(SHARED_CONTECT.shared_id, new_outputs)
 
-        print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, len(new_outputs): {len(new_outputs)}------------------")
+            print(f"writing results back!  output_num_sent_out: {output_num_sent_out}, len(new_outputs): {len(new_outputs)}------------------")
         
         
         
         # <jingzhi> support data parallelism
-        if not SHARED_CONTECT.has_dp_parallel():
+        if (os.environ['RUN_MULTI_MODEL'] == 'True') and \
+            (not SHARED_CONTECT.has_dp_parallel()):
             # <jingzhi> support multi-model inference
             remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
             SHARED_CONTECT.set_finished(len(outputs))
@@ -642,7 +650,7 @@ class LLM:
             #     remaining_requests = self.llm_engine.scheduler.get_unfinished_seqs()
             #     SHARED_CONTECT.prepare_for_reschedule(outputs, remaining_requests, self.llm_engine)
             #     # now we are ready to reload the model according to the new execution plan and restart the inference            
-        else:
+        elif (os.environ['RUN_MULTI_MODEL'] == 'True'):
             # data parallelism is used
             # for dp ray actors, we will kill them no matter they finish or not, 
             # for dp main actor, we will kill its tp workers no matter it finishes or not

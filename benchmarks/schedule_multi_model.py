@@ -24,7 +24,7 @@ python3 my_bench_multimodel_throughput.py > ours_multimodel_0313_13b70b_100req_D
 
 
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait
 import asyncio
 from multiprocessing import Array, Event
 
@@ -46,6 +46,7 @@ from collections import defaultdict
 # shared_counter: Array # = Array('d', [-1, -1])
 
 import traceback
+import argparse
 
 
 class MyExecPlanState:
@@ -422,6 +423,7 @@ def _get_model_sys_structure_from_selected_plan_group_seq(
 
 
 def search_best_scheduling(
+        test_case: str,
         gen_execplans_baseline:str,
         search_method_baseline:str,
         model_paths: List[str], 
@@ -431,16 +433,23 @@ def search_best_scheduling(
         num_prompts: int, 
         inp_seq_ids_dict, 
         out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]],
-        inp_generator, inp_merger, outlen_generator,
+        inp_req_ids: Dict[int, Dict[int, List[int]]], 
+        independent_srcs: Dict[int, bool],
+        # inp_generator, inp_merger, outlen_generator,
         # 
+        gpu_name='A100-80G',
+        byte_per_gpu=80*(1024**3),
         tot_gpu_num: int = 4,
         max_group_seq_num: int = 100,
         top_k: int=100,
         similar_threshold: float=0.1,
+        fully_connected_gpu_unit: int=4,
     )->List[List[MyExecPlanState]]:
     
     # 1. first search the best scheduling
     
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(test_case=test_case)
+
     # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # search_method_baseline = 'ours' # 'naive'  'ours'
     # gen_execplans_baseline = 'ours' # 'naive'  'ours'
@@ -454,17 +463,21 @@ def search_best_scheduling(
         num_prompts,
         inp_seq_ids_dict,
         out_req_id_mapping,
+        inp_req_ids, 
+        independent_srcs,
+        # 
         inp_generator,
         inp_merger,
         outlen_generator,
         out_edge_dict,
         sample_config=(1, 1, -1, 0),
         trust_remote_code=True, revision=None,
-        gpu_name='A100-80G', tot_gpu_num = tot_gpu_num, byte_per_gpu=80*(1024**3), 
+        gpu_name=gpu_name, tot_gpu_num = tot_gpu_num, byte_per_gpu=byte_per_gpu, 
         data_byte=2,
         max_group_seq_num=max_group_seq_num,
         top_k=top_k,
         similar_threshold=similar_threshold,
+        fully_connected_gpu_unit=fully_connected_gpu_unit,
     )
 
 
@@ -1296,8 +1309,12 @@ def init_prompts_for_the_model_system(
                 to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
 
         # communicator.add_seqs(model_id, to_add)
-        prompts_dict[model_id] = to_add
-        req_num_dict[model_id] = len(to_add)
+        if model_id not in inp_seq_ids_dict:
+            prompts_dict[model_id] = to_add
+            req_num_dict[model_id] = len(to_add)
+        else:
+            prompts_dict[model_id] = [to_add[i] for i in inp_seq_ids_dict[model_id]] # to_add
+            req_num_dict[model_id] = len(inp_seq_ids_dict[model_id]) # len(to_add)
     
 
     print(f"req_num_dict: {req_num_dict}", flush=True)
@@ -1504,11 +1521,62 @@ def test_search(
 
 
 
+def _search_best_scheduling_with_another_process(
+        test_case:str,
+        gen_execplans_baseline,
+        search_method_baseline,
+        model_paths, 
+        # 
+        out_edge_dict,
+        check_gap, sort_input,
+        num_prompts, 
+        inp_seq_ids_dict, 
+        out_req_id_mapping, inp_req_ids, independent_srcs,
+        # 
+        gpu_name,
+        byte_per_gpu,
+        tot_gpu_num, 
+        max_group_seq_num,
+        top_k,
+        similar_threshold,
+        fully_connected_gpu_unit
+):
+    print(f"in running _search_best_scheduling_with_another_process")
+    with ProcessPoolExecutor(max_workers=1) as executor:
+        try:
+            future = executor.submit(
+                search_best_scheduling, 
+                    test_case,
+                    gen_execplans_baseline,
+                    search_method_baseline,
+                    model_paths, 
+                    # 
+                    out_edge_dict,
+                    check_gap, sort_input,
+                    num_prompts, 
+                    inp_seq_ids_dict, 
+                    out_req_id_mapping, inp_req_ids, independent_srcs,
+                    # inp_generator, inp_merger, outlen_generator,
+                    # 
+                    gpu_name,
+                    byte_per_gpu,
+                    tot_gpu_num, 
+                    max_group_seq_num,
+                    top_k,
+                    similar_threshold,
+                    fully_connected_gpu_unit)
+            done, not_done = wait([future])
+            plan_state_group_list = list(done)[0].result()
+            return plan_state_group_list
 
+        except Exception as e:
+            print(f"Exception in running start_a_model_inference: {e}")
+            print(traceback.format_exc())
 
 
 
 async def main_with_preemption(
+        test_case:str,
         model_paths:List[str],
         gen_execplans_baseline:str,
         search_method_baseline:str,
@@ -1524,12 +1592,17 @@ async def main_with_preemption(
         # 
         inp_generator, inp_merger, outlen_generator,
         # 
+        gpu_name='A100-80G',
+        byte_per_gpu=80*(1024**3),
         tot_gpu_num:int = 4,
         max_group_seq_num: float = float('inf'),
         top_k: float = float('inf'),
         similar_threshold: float=0.1,
         fully_connected_gpu_unit: int = 4,
 ):
+    
+    print(f"fully_connected_gpu_unit: {fully_connected_gpu_unit}")
+
     import os
     os.environ['RUN_MULTI_MODEL'] = 'True'
     os.environ['SOFT_RESCHEDULE'] = 'False'
@@ -1560,7 +1633,11 @@ async def main_with_preemption(
     # model_paths = get_model_path_list()
     # convert the in_edge_dict to out_edge_dict
     out_edge_dict = get_out_edge_dict_from_in_edge_dict_with_inp_nodes(in_edge_dict_with_dummy_inp_nodes)
-    plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
+    
+
+    # plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
+    plan_state_group_list:List[List[MyExecPlanState]] = _search_best_scheduling_with_another_process(
+        test_case,
         gen_execplans_baseline,
         search_method_baseline,
         model_paths, 
@@ -1569,18 +1646,21 @@ async def main_with_preemption(
         check_gap, sort_input,
         num_prompts, 
         inp_seq_ids_dict, 
-        out_req_id_mapping,
-        inp_generator, inp_merger, outlen_generator,
+        out_req_id_mapping, inp_req_ids, independent_srcs,
+        # inp_generator, inp_merger, outlen_generator,
         # 
+        gpu_name,
+        byte_per_gpu,
         tot_gpu_num = tot_gpu_num, 
         max_group_seq_num = max_group_seq_num,
         top_k = top_k,
-        similar_threshold=similar_threshold)
+        similar_threshold=similar_threshold,
+        fully_connected_gpu_unit=fully_connected_gpu_unit)
     
 
     
     # # TODO: <jingzhi> FOR DEBUG
-    # return
+    return
 
     # get the NEW model system STRUCTURE from the ``plan_state_group_list``
     model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
@@ -2074,7 +2154,8 @@ def _get_document_prompts(
 
 
 # directly get req lengths 
-def get_inplens(req_num: int, model_path: str):
+# get seqs with specific seq ids
+def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
     import json
     inp_lens = list()
     with open("./my_dummy_requests/my_dummy_requests.json", 'r') as file:
@@ -2088,11 +2169,36 @@ def get_inplens(req_num: int, model_path: str):
         inp_lens = [len(prompt) for prompt in prompt_token_ids]
     
     assert len(inp_lens) == req_num
-    return inp_lens
+    print(f"inp_seq_ids:{inp_seq_ids}")
+    return list(np.asarray(inp_lens)[inp_seq_ids])
 
 
 
-def _get_schedule_setting_with_real_data(test_case: str):
+
+
+def _get_req_len_funcs(test_case:str):
+    inp_generator, inp_merger, outlen_generator = None, None, None
+    if test_case in ['general', 'router']:
+        inp_generator = get_inplens
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+        outlen_generator = output_length_sampler.sample_out_len_for_given_model
+    elif test_case == 'map-reduce':
+        chunk_size = 512
+        fixed_output_size = 50
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
+        outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+    elif test_case == 'chain-summary':
+        chunk_size = 512
+        fixed_output_size = 50
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+        outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+
+    return inp_generator, inp_merger, outlen_generator
+
+
+def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_set:int):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2110,12 +2216,32 @@ def _get_schedule_setting_with_real_data(test_case: str):
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
     sampling_args_dict = dict()
-    if test_case == 'general':
+    if (test_case == 'general') or (test_case == 'router'):
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
         req_num = 10000
         inp_seq_ids_dict = {i: list(range(req_num)) for i in range(len(model_paths))}
+        if test_case == 'router':
+            ratios = np.arange(1, len(model_paths)+1)
+            if ratio_set == 2:
+                ratios = np.asarray([2**i for i in range(len(model_paths)//2+1) for j in range(2)][:len(model_paths)])
+            rng = np.random.default_rng(seed=ratio_seed)
+            rng.shuffle(ratios)
+
+            ratios = ratios/sum(ratios)
+            cumnums = np.cumsum(np.concatenate(([0], (ratios*req_num).astype(int))))
+            cumnums[-1] = req_num
+            rand_seq_ids = np.arange(req_num)
+            rng = np.random.default_rng(seed=0)
+            rng.shuffle(rand_seq_ids)
+            print(f"ratios: {ratios}, cumnums: {cumnums}, rand_seq_ids: {rand_seq_ids}")
+            inp_seq_ids_dict = {i:sorted(rand_seq_ids[cumnums[i]:cumnums[i+1]]) for i in range(len(model_paths))}
+            inp_seq_ids_dict.update({-(i+1):inp_seq_ids_dict[i] for i in range(len(model_paths))})
+            print(f"new inp_seq_ids_dict: ")
+            for i, v in inp_seq_ids_dict.items():
+                print(f"model {i}, ratio: {ratios[i]} : {v}")
+
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
@@ -2166,7 +2292,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
         in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
         # 
-        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
         node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
@@ -2176,6 +2302,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         dataset_path = 'train-00000-of-00001-b334c773bce22cb2.parquet'
         sampled_inps: List[List[int]] = _get_document_prompts(dataset_path=dataset_path, model_path=model_paths[0], num_requests=req_num)
         inp_lens = np.asarray([len(prompt_token_ids) for prompt_token_ids in sampled_inps])
+        req_num = min(req_num, len(inp_lens))
 
         # leave it later: for the case where we horizontally fuse all ``map`` models
         out_req_id_mapping = {0: dict()}
@@ -2190,6 +2317,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
             sampled_inp_chunks.extend([sampled_inps[i][chunk_i*chunk_size:(chunk_i+1)*chunk_size] for chunk_i in range(chunk_num)])
 
         inp_seq_ids_dict.update({0:list(out_req_id_mapping[0].keys())})
+        # inp_seq_ids_dict.update({-(i+1):inp_seq_ids_dict[i] for i in [0]})
 
 
         new_out_req_part_num = { 0: { i:(inp_len+chunk_size-1)//chunk_size for i, inp_len in enumerate(inp_lens)} }
@@ -2226,17 +2354,19 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
     elif test_case == 'chain-summary':
         # # chain summary
-        req_num = 10
-        chunk_size = 512
-        fixed_output_size = 50
+        req_num = 1000
+        chunk_size = 2048 # 512
+        fixed_output_size = 900 # 50
 
         # sample the real data from dataset
         dataset_path = 'train-00000-of-00001-b334c773bce22cb2.parquet'
         model_path = 'NousResearch/Llama-2-13b-hf'
+        # model_path = 'NousResearch/Llama-2-7b-hf'
         sampled_inps: List[List[int]] = _get_document_prompts(dataset_path=dataset_path, model_path=model_path, num_requests=req_num)
         # sort the sampled inps
         sampled_inps = sorted(sampled_inps, key=lambda i: len(i), reverse=True)
         inp_lens = np.asarray([len(prompt_token_ids) for prompt_token_ids in sampled_inps])
+        req_num = min(req_num, len(inp_lens))
 
         print(f"inp_lens: {inp_lens}")
 
@@ -2244,7 +2374,8 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
         print(f"max chunk num: {(max_length + chunk_size - 1) // chunk_size}")
 
-        model_paths = ['NousResearch/Llama-2-13b-hf'] * ((max_length + chunk_size - 1) // chunk_size)
+        # model_paths = ['NousResearch/Llama-2-13b-hf'] * ((max_length + chunk_size - 1) // chunk_size)
+        model_paths = [model_path] * ((max_length + chunk_size - 1) // chunk_size)
         print(f"model_paths: {model_paths}")
         # out_edge_dict = {i:list(range(i+1, len(model_paths))) for i in range(len(model_paths)-1)}
         # out_edge_dict = {i:[i+1] for i in range(len(model_paths)-1)}
@@ -2252,7 +2383,7 @@ def _get_schedule_setting_with_real_data(test_case: str):
         in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
         in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
 
-        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
         # here ``None`` means we use our own dummpy request dataset
@@ -2267,14 +2398,17 @@ def _get_schedule_setting_with_real_data(test_case: str):
         # inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
         inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
         print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+        # inp_seq_ids_dict.update({-(i+1):inp_seq_ids_dict[i] for i in range(len(model_paths))})
 
         # add another model after the chain summary
-        model_paths.append('NousResearch/Llama-2-7b-hf')
-        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
+        # model_paths.append('NousResearch/Llama-2-7b-hf')
+        model_paths.append('NousResearch/Llama-2-70b-hf')
+        in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = list(range(len(model_paths)-1)) # [len(model_paths)-2, len(model_paths)-3]
         # in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [19, 49]
         # out_edge_dict[3].append(5)
         # out_edge_dict[4] = [5]
-        inp_seq_ids_dict[len(model_paths)-1] = sorted(set(inp_seq_ids_dict[len(model_paths)-2] + inp_seq_ids_dict[len(model_paths)-3]))
+        # inp_seq_ids_dict[len(model_paths)-1] = sorted(set(inp_seq_ids_dict[len(model_paths)-2] + inp_seq_ids_dict[len(model_paths)-3]))
+        inp_seq_ids_dict[len(model_paths)-1] = inp_seq_ids_dict[0]
 
         print(f"\nreal model_paths: {model_paths}")
         print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
@@ -2282,9 +2416,14 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
         
         # TODO: leave it later: for the case where we horizontally fuse all ``map`` models
-        inp_req_ids = dict()
-        independent_srcs = {i:False for i in range(len(model_paths))}
-        # independent_srcs[len(model_paths)-1] = True
+        # inp_req_ids = dict()
+        # independent_srcs = {i:False for i in range(len(model_paths))}
+        inp_req_ids = {len(model_paths)-1: {i:sorted(set(inp_seq_ids_dict[i])-set(inp_seq_ids_dict[i+1])) for i in range(len(model_paths)-2)}}
+        inp_req_ids[len(model_paths)-1][len(model_paths)-2] = inp_seq_ids_dict[len(model_paths)-2]
+        independent_srcs[len(model_paths)-1] = True
+
+        print(f"\nreal inp_req_ids: {inp_req_ids}\n")
+        print(f"\nreal independent_srcs: {independent_srcs}\n")
 
         # we need to prepare the dummpy requests here
         # _init_dummy_requests(inp_lens)
@@ -2327,10 +2466,10 @@ def _get_schedule_setting_with_real_data(test_case: str):
 
 
 
-def get_schedule_setting(test_case:str, use_real_dataset:bool):
+def get_schedule_setting(test_case:str, use_real_dataset:bool, ratio_seed:int, ratio_set:int):
 
     if use_real_dataset:
-        return _get_schedule_setting_with_real_data(test_case=test_case)
+        return _get_schedule_setting_with_real_data(test_case=test_case, ratio_seed=ratio_seed, ratio_set=ratio_set)
     
 
 
@@ -2434,7 +2573,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         # out_edge_dict = {i:[len(model_paths)-1] for i in range(len(model_paths)-1)}
         in_edge_dict_with_dummy_inp_nodes = {0: [-1], 1:[0]}
         # 
-        inp_generator = lambda req_num, model_path: [512]*req_num
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [512]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         node_dataset_chunk_mapping = {-1: (None, 0, chunk_size)}
@@ -2452,6 +2591,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
             inp_seq_ids_dict[1].append(tot_req_num-1)
 
         inp_seq_ids_dict.update({0:list(out_req_id_mapping[0].keys())})
+        # inp_seq_ids_dict.update({-(i+1):inp_seq_ids_dict[i] for i in [0]})
 
 
         new_out_req_part_num = { 0: { i:(inp_len+chunk_size-1)//chunk_size for i, inp_len in enumerate(inp_lens)} }
@@ -2512,7 +2652,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         in_edge_dict_with_dummy_inp_nodes = {0: [-1]}
         in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1)] + [i-1] for i in range(1, len(model_paths))})
 
-        inp_generator = lambda req_num, model_path: [chunk_size]*req_num
+        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([50]*len(inplens))
         # here ``None`` means we use our own dummpy request dataset
@@ -2527,6 +2667,8 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
         inp_lens = np.asarray([20*chunk_size]*int(0.8*req_num)+[50*chunk_size]*int(0.2*req_num))
         inp_seq_ids_dict.update({i:list(range(sum(inp_lens>(chunk_size*i)))) for i in range(len(model_paths))})
         print(f"inp_seq_ids_dict: {inp_seq_ids_dict}")
+        # inp_seq_ids_dict.update({-(i+1):inp_seq_ids_dict[i] for i in range(len(model_paths))})
+
         # add another model after the chain summary
         model_paths.append('NousResearch/Llama-2-7b-hf')
         # in_edge_dict_with_dummy_inp_nodes[len(model_paths)-1] = [len(model_paths)-2, len(model_paths)-3]
@@ -2585,18 +2727,45 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool):
 if __name__ == "__main__":
     print("start")
     # --------------------------------------------------------------------
+
+    parser = argparse.ArgumentParser(description="args of end 2 end test")
+    parser.add_argument("--gen-execplans-baseline",
+                        type=str,
+                        choices=["ours", "naive"],
+                        default="ours")
+
+    parser.add_argument("--test-case",
+                        type=str,
+                        choices=["general", "map-reduce", "chain-summary", "router"],
+                        default="router")
+    
+    parser.add_argument("--ratio-seed",
+                        type=int)    
+    
+    parser.add_argument("--ratio-set",
+                        type=int)    
+    
+    args = parser.parse_args()
+
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # # search_method_baseline = 'ours' # 'naive'  'ours'
-    gen_execplans_baseline = 'naive' # 'naive'  'ours'
+    gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
-    
-    test_case = 'general' # 'general' 'map-reduce' 'chain-summary'
+    test_case = 'router' # 'general' 'map-reduce' 'chain-summary', 'router'
+
+    gen_execplans_baseline = args.gen_execplans_baseline
+    test_case = args.test_case
+    ratio_seed = args.ratio_seed
+    ratio_set = args.ratio_set
+
+
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
              inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \
-        get_schedule_setting(test_case=test_case, use_real_dataset=True)
+        get_schedule_setting(test_case=test_case, use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
     
     asyncio.run(main_with_preemption(
+        test_case=test_case,
         model_paths=model_paths,
         gen_execplans_baseline=gen_execplans_baseline,
         search_method_baseline=search_method_baseline,
@@ -2614,10 +2783,12 @@ if __name__ == "__main__":
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
         inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
+        gpu_name='A100-80G',
+        byte_per_gpu=80*(1024**3),
         tot_gpu_num=8,
         max_group_seq_num=20,
-        top_k=100,
-        similar_threshold=0.1,
+        top_k=20,
+        similar_threshold=0.2,
         # NOTE: 1. for DSF servers: fully_connected_gpu_unit=2, for lccpus, fully_connected_gpu_unit=4.
         fully_connected_gpu_unit=2))
     # # asyncio.run(main_with_preemption_debug())

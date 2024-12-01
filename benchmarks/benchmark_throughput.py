@@ -210,6 +210,9 @@ def run_vllm_ori(
     
     # <jingzhi>
     gpu_memory_utilization: float,
+    temperature: float,
+    ignore_eos: bool,
+    fixed_output_len: int,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -232,16 +235,36 @@ def run_vllm_ori(
         max_paddings=512,
     )
 
+    print(f"finish init LLM engine")
+
     # Add the requests to the engine.
+    # for prompt, _, output_len in requests:
+    #     sampling_params = SamplingParams(
+    #         n=n,
+    #         # <jingzhi> change to greedy sampling to check correctness.
+    #         temperature=0.0 if use_beam_search else 1e-6, #1.0
+    #         top_p=1.0,
+    #         use_beam_search=use_beam_search,
+    #         ignore_eos=True,
+    #         max_tokens=output_len,
+    #     )
+    #     # FIXME(woosuk): Do not use internal method.
+    #     llm._add_request(
+    #         prompt=prompt,
+    #         prompt_token_ids=None,
+    #         sampling_params=sampling_params,
+    #     )
     for prompt, _, output_len in requests:
+        # print(f"in len: {_}, out len: {output_len} vs {4096-_}")
         sampling_params = SamplingParams(
             n=n,
             # <jingzhi> change to greedy sampling to check correctness.
-            temperature=0.0 if use_beam_search else 1e-6, #1.0
+            temperature=0.0 if use_beam_search else temperature, # 0 or 1e-6 (greedy), #1.0
             top_p=1.0,
             use_beam_search=use_beam_search,
-            ignore_eos=True,
-            max_tokens=output_len,
+            ignore_eos=ignore_eos, # False, # True (original),
+            max_tokens=output_len if ignore_eos else (llm.llm_engine.model_config.max_model_len-_),
+            # max_tokens=llm.llm_engine.model_config.max_model_len-_ # 4096-_  # output_len, #TODO(jingzhi) test when using max tokens
         )
         # FIXME(woosuk): Do not use internal method.
         llm._add_request(
@@ -249,6 +272,9 @@ def run_vllm_ori(
             prompt_token_ids=None,
             sampling_params=sampling_params,
         )
+        print(f"output_len {output_len, (llm.llm_engine.model_config.max_model_len-_)}")
+
+    print(f"finish adding requests")
 
     start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
@@ -256,9 +282,16 @@ def run_vllm_ori(
     end = time.perf_counter()
     
     print(f"outputs:\n")
-    for req_output in outputs:
-        for completion_output in req_output.outputs:
-            print(req_output.request_id, req_output.prompt_token_ids[:10], completion_output.token_ids)
+    print(f"this execution plan running time: {end - start}s ---abs {end}")
+    # print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), output_len] for req_output, (_, _, output_len) in zip(outputs, requests) for completion_output in req_output.outputs]}")
+    print(f"output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), -1] for req_output in outputs for completion_output in req_output.outputs]}")
+    print(f"tot_inp_lens = {sum([len(req_output.prompt_token_ids) for req_output in outputs])}")
+    print(f"tot_out_len = {sum([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
+
+
+    # for req_output in outputs:
+    #     for completion_output in req_output.outputs:
+    #         print(req_output.request_id, req_output.prompt_token_ids[:10], completion_output.token_ids)
 
     return end - start
 
@@ -1281,6 +1314,20 @@ def main(args: argparse.Namespace):
                                 # <jingzhi> support multi-level model system
                                 args.output_len,
                                 )
+    elif args.backend == 'vllm_ori':
+        elapsed_time = run_vllm_ori(requests, args.model, args.tokenizer,
+                                args.quantization, args.tensor_parallel_size,
+                                args.seed, args.n, args.use_beam_search,
+                                args.trust_remote_code, args.dtype,
+                                args.max_model_len, args.enforce_eager,
+                                args.kv_cache_dtype, args.device,
+                                # <jingzhi> add more control
+                                args.gpu_use_ratio,
+                                args.temperature,
+                                args.ignore_eos,
+                                # <jingzhi> support multi-level model system
+                                args.output_len,
+                                )        
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -1307,7 +1354,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",
                         type=str,
-                        choices=["vllm", "hf", "mii"],
+                        choices=["vllm", "hf", "mii", "vllm_ori"],
                         default="vllm")
     parser.add_argument("--dataset",
                         type=str,
@@ -1420,7 +1467,7 @@ if __name__ == "__main__":
     else:
         assert args.input_len is None
 
-    if args.backend == "vllm":
+    if args.backend in ["vllm", "vllm_ori"]:
         if args.hf_max_batch_size is not None:
             raise ValueError("HF max batch size is only for HF backend.")
     elif args.backend == "hf":

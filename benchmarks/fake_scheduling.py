@@ -214,11 +214,20 @@ def update_prefill_logs(
     seqs = last_iter_seqs
     seq_ids = last_iter_seq_ids
     for i, seq_id in zip(prompt_lens, prompt_ids):
+        
+        # print(f"seqs: {seqs}  i: {i}")
+
         if max(seqs+[i]) * (len(seqs)+1) <= max_num_batched_tokens:
+            
+            # print(f"add new seq_id--")
+
             # can add to the current step
             seqs.append(i)
             seq_ids.append(seq_id)
         else:
+            
+            # print(f"finish a prefill step-- max_num_batched_tokens: {max_num_batched_tokens}")
+
             prefill_logs.append(get_prefill_step(seqs))
             _store_infer_state(tot_iter_num, tot_iter_num, infer_progress, seq_ids)
             tot_iter_num += 1
@@ -239,10 +248,12 @@ def update_prefill_logs(
     # 查询条件是：inp request还剩最后一个轮次就用完了，或者已经用完了，并且当前轮次是K的倍数；
     # 不查询条件是：inp request做完当前轮次还有剩余，或者不是K的倍数
     # print(f"update_prefill_logs: must_record_first_step: {must_record_first_step}, need_query_available_requests: {need_query_available_requests}, tot_iter_num: {tot_iter_num}, seq_ids: {seq_ids}")
-    if (not must_record_first_step) \
-        and need_query_available_requests and (tot_iter_num % check_gap == 0):
-        # record the last step 
-        return seqs, seq_ids, tot_iter_num
+    
+    # ==> 还是把下面这个延后推理的优化关掉吧，实际上我们做end-to-end scheduling的时候也没有做延后推理
+    # if (not must_record_first_step) \
+    #     and need_query_available_requests and (tot_iter_num % check_gap == 0):
+    #     # record the last step 
+    #     return seqs, seq_ids, tot_iter_num
     
     
     prefill_logs.append(get_prefill_step(seqs))
@@ -376,6 +387,9 @@ def _fake_FCFS_schedule_NO_continuous_model_level_pipeline(
         # new_prompt_ids = running_seqs[0][old_running_seqs_num:running_seqs_num]
         new_prompt_lens = np.asarray(new_prompt_lens)
         new_prompt_ids = np.asarray(new_prompt_ids)
+
+        # print(f"new_prompt_ids: {new_prompt_ids}")
+
         # if len(new_prompt_lens) > 0:
         #     print(f"pointer: {pointer}, start new seqs: {new_prompt_lens}")
         # print(f"in _fake_FCFS_schedule_NO_continuous_model_level_pipeline")
@@ -385,6 +399,13 @@ def _fake_FCFS_schedule_NO_continuous_model_level_pipeline(
                             last_iter_seqs=list(), last_iter_seq_ids=list(),
                             must_record_first_step=False)
         is_prefill_steps.extend([True]*(tot_iter_num - len(is_prefill_steps)))
+      
+        # NOTE: sometimes all seqs's outlens are 1, so there will be only 1 round of prefill and no decoding stages
+        if unfinished_reqnum == 0:
+            # there must be no running seqs
+            assert running_seqs_num == 0
+            break
+
         # 
         # kill some running reqs if the cache is not enough
         block_num_used, running_seqs_num, inp_lens, out_lens, seq_ids, pointer = \
@@ -1674,6 +1695,8 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
                             must_record_first_step)
         is_prefill_steps.extend([True]*(tot_iter_num - len(is_prefill_steps)))
 
+        # print(f"infer_progress: {infer_progress}\n")
+        # print(f"full_infer_progress: {full_infer_progress}\n")
 
         # get the seqs which finishes after the prefill stage
         run_prompt_ids = np.setdiff1d(
@@ -1772,6 +1795,7 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
         tot_iter_num += iter_num
 
         # print(f"new decode logs: {logs[-iter_num:]}")
+        # print(f"full_infer_progress: {full_infer_progress}\n")
 
         # 
         # 2. update the status of the running seqs
@@ -1886,15 +1910,22 @@ def fake_FCFS_schedule(
     if len(inp_lens) == 0:
         return [], [0], [], [], [], []
 
-    if len(arrive_times) == 0:
+    if (len(arrive_times) == 0) or (max(arrive_times)<0):
 
         if sort_input:
             # we need to sort the input requests
             inp_lens = np.asarray(inp_lens)
             out_lens = np.asarray(out_lens)
-            order = np.argsort(-inp_lens, kind='stable')
-            inp_lens = inp_lens[order]
-            out_lens = out_lens[order]
+            # order = np.argsort(-inp_lens, kind='stable')
+            # print(f"order: {order}")
+            # assert list(order) == sorted(order), f"inp_lens: {inp_lens}, order: {order}"
+            # inp_lens = inp_lens[order]
+            # out_lens = out_lens[order]
+
+        # print(f"inp_lens: {inp_lens}")
+        # print(f"out_lens: {out_lens}")
+        # print(f"arrive_times: {arrive_times}")
+
 
         decode_logs, prefill_logs, is_prefill_steps, infer_progress =  \
             _fake_FCFS_schedule_NO_continuous_model_level_pipeline(
@@ -2005,6 +2036,9 @@ def fake_FCFS_schedule_vertical_fuse(
     # print(f"inp_lens: {inp_lens}")
     # print(f"out_lens: {out_lens}")
     # print(f"arrive_times: {arrive_times}")
+    # print(f"inp_lens_list: {inp_lens_list}")
+    # print(f"out_lens_list: {out_lens_list}")
+    # print(f"arrive_times_list: {arrive_times_list}")
 
     cumsum_latencys, is_prefill_steps, full_infer_progress = \
         _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
@@ -2041,6 +2075,7 @@ def fake_FCFS_schedule_vertical_fuse(
         rng_ends_list.append(rng_ends)
 
         # get the finish time of each request in order
+        # print(f"cumsum_latencys: {cumsum_latencys}, infer_progress: {infer_progress}")
         finish_times = get_finish_times(cumsum_latencys, infer_progress)
         finish_times_list.append(finish_times)
 

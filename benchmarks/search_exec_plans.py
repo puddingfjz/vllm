@@ -7,7 +7,8 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict, Union
 import itertools
 import fake_scheduling
-from my_per_iter_latency_estimator import CostTable, get_cost_table
+from my_per_iter_latency_estimator import CostTable, get_cost_table, get_cost_table_from_serialized_data
+import get_my_cost_table_directly
 import output_length_sampler
 
 from vllm.transformers_utils.config import get_config
@@ -18,11 +19,15 @@ from model_size_database import model_sizes
 import time
 
 
+import ray
+import os
+
 _ENGINE_ARGS_LIST = dict()
 _FAKE_SCHEDULING_RES = dict() # key: (model name, exec_plan, inp_lens, out_lens) value: the output of fake_scheduling
 _MAX_SEQ_NUM = 0
 _CHECKED_SEQ_NUM = 0
 _MODEL_ID = 0
+_COST_MODEL_REF = None
 
 class InferenceArgs:
     """ The args of the inference setting. """
@@ -33,6 +38,10 @@ class InferenceArgs:
         self.prompt_limit = min(scheduler_config.max_model_len,
                                 scheduler_config.max_num_batched_tokens)
         self.max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+        # !TODO: 暂时这么写，具体怎么改明天再说
+        self.max_num_batched_tokens = 8912
+
         self.max_seq_num = scheduler_config.max_num_seqs
         self.block_size=cache_config.block_size
 
@@ -50,7 +59,10 @@ class MyModelInfor:
         data_byte, # the number of bytes to store a value in model weights or intermediate tensors
         inp_lens: List[int], # the request input lengths.
         out_lens: List[int] = list(), # the request output lengths.
-        inp_seq_ids: List[int] = list() # the inp seq ids, to support the chain summary case
+        inp_seq_ids: List[int] = list(), # the inp seq ids, to support the chain summary case
+        # 
+        inp_req_from_which_models: Dict[int, List[int]] = None, 
+        independent_srcs: bool = None,
     ) -> None:
         self.data_byte = data_byte
         self.model_name = None
@@ -100,11 +112,23 @@ class MyModelInfor:
         self.ori_tot_remaining_decode_flops = self.remaining_decode_flops
 
         self.ori_inp_seq_ids = sorted(self.inp_seq_ids)
+    
+        self.inp_req_from_which_models = inp_req_from_which_models
+        self.independent_srcs = independent_srcs
 
 
     # def set_input_model_ids(self, input_model_ids: List[int]):
     #     self.input_model_ids = input_model_ids
-        
+
+    def get_unfinished_srcs(self):
+        assert self.independent_srcs
+        alive_seq_ids = set(self.inp_seq_ids)
+        unfinished_srcs = list()
+        for from_model_id, req_ids in self.inp_req_from_which_models.items():
+            if len(alive_seq_ids.intersection(req_ids)) > 0:
+                unfinished_srcs.append(from_model_id)
+        return unfinished_srcs
+
         
     def get_base_model_ids(self):
         return [self.model_id]
@@ -279,6 +303,12 @@ class MyFusedModelInfor(MyModelInfor):
 
         self.ori_tot_remaining_decode_flops = [model.ori_tot_remaining_decode_flops for model in self.model_list]
 
+        # NOTE: here our assumption is that for a vertically fused model, the input models are the same as the first base model's input models.
+        self.inp_req_from_which_models = model_list[0].inp_req_from_which_models
+        self.independent_srcs = model_list[0].independent_srcs
+
+
+
 
 
     def get_base_model_ids(self):
@@ -369,7 +399,7 @@ class MyFusedModelInfor(MyModelInfor):
         '''
             The state of the model, i.e., its inference progress, is determined by its remaining seqlens.
         '''
-        assert False
+        assert False, (self.model_id, self.get_base_model_ids())
         # return (self.model_name, self.get_remaining_flops())
         return (self.model_name, tuple(self.get_base_model_ids()), \
                 tuple([model.inp_lens for model in self.model_list]), \
@@ -381,6 +411,438 @@ class MyFusedModelInfor(MyModelInfor):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+@ray.remote
+def _entry_to_remote_fake_scheduling_for_a_dp_worker(
+    dp_inp_lens, dp_out_lens, 
+    dp_arrive_times, check_gap,
+    max_seq_num, gpu_cache_block_num, 
+    max_num_batched_tokens,
+    block_size, 
+    sort_input, 
+    cost_table, 
+    model_path, 
+    exec_plan_key, 
+    sample_config, 
+    trust_remote_code, 
+    revision
+    ):
+    
+    time1 = time.perf_counter()
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE 0: {os.getpid()} ---abs: {time1}\n")
+
+    # a = np.asarray(cost_table[0][1])
+    # print(f"ahahahahah: {a.shape}")
+    # cost_table=cost_table*2
+    cost_table = get_cost_table_from_serialized_data(*cost_table)
+    # (prefill_table, decode_table,\
+    #      sample_prefill_table, sample_decode_table, \
+    #         prepInp_prefill_table, prepInp_decode_table, \
+    #             model_configs, prepare_cost_table) = cost_table
+    # cost_table = CostTable([],[],[],metadata=cost_table)
+    # cost_table = TEST(cost_table)
+    time1 = time.perf_counter()
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE 1: {os.getpid()} ---abs: {time1}\n")
+    # return None
+
+    dp_arrive_times=dp_arrive_times.copy()
+
+
+    # support model-level pipeline
+    ret = \
+        fake_scheduling.fake_FCFS_schedule(
+            inp_lens=list(dp_inp_lens),out_lens=list(dp_out_lens), 
+            arrive_times=dp_arrive_times, check_gap=check_gap,
+            max_seq_num=max_seq_num, max_block_num=gpu_cache_block_num, 
+            max_num_batched_tokens=max_num_batched_tokens,
+            block_size=block_size, 
+            sort_input=sort_input, 
+            cost_estimate_args={
+                "cost_table":cost_table, 
+                "model_name":model_path, 
+                "exec_plan":exec_plan_key, 
+                "sample_config":sample_config, 
+                "trust_remote_code":trust_remote_code, 
+                "revision":revision})
+    
+    time2 = time.perf_counter()
+    # print(f"TIME TO ESTIMATE COST: exec_plan_key: {exec_plan_key}: {time2 - time1}, ---abs: {time2}", flush=True)
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE 2: {os.getpid()} {time2 - time1}, ---abs: {time2}\n")
+    
+    return ret
+
+
+
+
+
+
+
+@ray.remote
+def _entry_to_remote_fake_scheduling_deprecated(
+    dp_size: int,
+    dp_inp_lens_list: List[List[int]],
+    dp_out_lens_list: List[List[int]],
+    arrive_times: List[float],
+    # 
+    check_gap: int,
+    sort_input: bool,
+    max_seq_num: int,
+    gpu_cache_block_num: int,
+    max_num_batched_tokens: int,
+    block_size: int,
+    # 
+    cost_table: CostTable,
+    model_path: str,
+    exec_plan_key,
+    sample_config,
+    trust_remote_code: bool,
+    revision: bool
+):
+    """
+        This function is a remote function used to do fake scheduling.
+    """
+
+    time1 = time.perf_counter()
+
+
+    cumsum_latencys_list: List[List[float]] = [list() for _ in range(dp_size)]
+    cum_rng_nums_list: List[List[int]] = [list() for _ in range(dp_size)]
+    rng_starts_list: List[List[int]] = [list() for _ in range(dp_size)]
+    rng_ends_list: List[List[int]] = [list() for _ in range(dp_size)]
+    is_prefill_steps_list: List[List[bool]] = [list() for _ in range(dp_size)]
+    total_latency_list: List[Optional[float]] = [None for _ in range(dp_size)]
+    finish_times_list: List[List[float]] = [list() for _ in range(dp_size)]
+
+
+    arrive_times=arrive_times.copy()
+
+    for dp_id in range(dp_size):
+        # divide the requests into dp_size groups evenly
+        dp_inp_lens = dp_inp_lens_list[dp_id]
+        dp_out_lens = dp_out_lens_list[dp_id]            
+        dp_arrive_times = arrive_times[dp_id::dp_size]
+
+        # support model-level pipeline
+        (cumsum_latencys_list[dp_id], cum_rng_nums_list[dp_id], 
+            rng_starts_list[dp_id], rng_ends_list[dp_id], is_prefill_steps_list[dp_id], 
+            finish_times) = \
+                fake_scheduling.fake_FCFS_schedule(
+                    inp_lens=list(dp_inp_lens),out_lens=list(dp_out_lens), 
+                    arrive_times=dp_arrive_times, check_gap=check_gap,
+                    max_seq_num=max_seq_num, max_block_num=gpu_cache_block_num, 
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    block_size=block_size, 
+                    sort_input=sort_input, 
+                    cost_estimate_args={
+                        "cost_table":cost_table, 
+                        "model_name":model_path, 
+                        "exec_plan":exec_plan_key, 
+                        "sample_config":sample_config, 
+                        "trust_remote_code":trust_remote_code, 
+                        "revision":revision})
+        
+
+        # NOTE: since there is a precision issue, we use self.cumsum_latencys[-1] as tot_latency
+        if len(cumsum_latencys_list[dp_id]) == 0:
+            total_latency_list[dp_id] = 0
+        else:
+            total_latency_list[dp_id] = cumsum_latencys_list[dp_id][-1]
+
+
+        # # self.prefill_latencys = prefill_latencys
+        # # self.decode_latencys = decode_latencys
+        # self.is_prefill_steps_list[dp_id] = is_prefill_steps
+
+        # # organize finish_times_merge
+        # # NOTE: here we add the extra cost to the finish times --> CHANGE TO NOT ADDing EXTRA COST
+        # self.finish_times_merged[dp_seq_ids] = finish_times
+        finish_times_list[dp_id] = finish_times
+
+    
+    # self.infer_progress = infer_progress
+    # store the metadata in the global cache
+    # _FAKE_SCHEDULING_RES[key] = (self.cumsum_latencys_list, self.cum_rng_nums_list, 
+    #                                 self.rng_starts_list, self.rng_ends_list, 
+    #                                 self.is_prefill_steps_list, self.finish_times_list,) 
+    #                             #  self.dp_inp_seq_ids_list)
+
+    # # print(f"self.cumsum_latencys: {self.cumsum_latencys}")
+    # print(f"compute from sketch, key={key}")
+    # print(f"self.cum_rng_nums: {self.cum_rng_nums.tolist()}")
+    # print(f"self.rng_starts: {self.rng_starts.tolist()}")
+    # print(f"self.rng_ends: {self.rng_ends.tolist()}")         
+
+    time2 = time.perf_counter()
+    print(f"TIME TO ESTIMATE COST: exec_plan_key: {exec_plan_key, dp_size}: {time2 - time1}, ---abs: {time2}", flush=True)
+
+    return ((cumsum_latencys_list, cum_rng_nums_list, 
+            rng_starts_list, rng_ends_list, 
+            is_prefill_steps_list, finish_times_list,), total_latency_list)
+
+
+
+
+
+
+
+
+
+
+# @ray.remote
+def _entry_to_remote_fake_scheduling(
+    dp_size: int,
+    dp_inp_lens_list: List[List[int]],
+    dp_out_lens_list: List[List[int]],
+    arrive_times: List[float],
+    # 
+    check_gap: int,
+    sort_input: bool,
+    max_seq_num: int,
+    gpu_cache_block_num: int,
+    max_num_batched_tokens: int,
+    block_size: int,
+    # # 
+    # cost_table: CostTable,
+    model_path: str,
+    exec_plan_key,
+    sample_config,
+    trust_remote_code: bool,
+    revision: bool
+):
+    """
+        This function is a remote function used to do fake scheduling. --> change to make only fake scheduling remote
+    """
+    global _COST_MODEL_REF
+    cost_table = _COST_MODEL_REF # ray.put(np.random.rand(7, 6, 3, 512, 5))
+    res_ref_list = [None] * dp_size
+
+    # res_ref_list = list()
+
+    # for dp_id in range(dp_size):
+    #     # divide the requests into dp_size groups evenly
+
+
+    #     time1 = time.perf_counter()
+    #     with open(f'tmp_time_logs.log', 'a') as f:
+    #         f.write(f"TIME TO DP FAKE SCHEDULE -1: {os.getpid()} ---abs: {time1}\n")
+
+    #     res_ref_list[dp_id] = \
+    #         _entry_to_remote_fake_scheduling_for_a_dp_worker.remote(cost_table)
+
+    # return res_ref_list
+
+
+    for dp_id in range(dp_size):
+        # divide the requests into dp_size groups evenly
+        dp_inp_lens = dp_inp_lens_list[dp_id]
+        dp_out_lens = dp_out_lens_list[dp_id]            
+        dp_arrive_times = arrive_times[dp_id::dp_size]
+
+        time1 = time.perf_counter()
+        with open(f'tmp_time_logs.log', 'a') as f:
+            f.write(f"TIME TO DP FAKE SCHEDULE -1: {os.getpid()} ---abs: {time1}\n")
+
+        res_ref_list[dp_id] = \
+            _entry_to_remote_fake_scheduling_for_a_dp_worker.remote(
+                dp_inp_lens, dp_out_lens, 
+                dp_arrive_times, check_gap,
+                max_seq_num, gpu_cache_block_num, 
+                max_num_batched_tokens,
+                block_size, 
+                sort_input, 
+                cost_table, 
+                model_path, 
+                exec_plan_key, 
+                sample_config, 
+                trust_remote_code, 
+                revision
+            )
+        continue
+
+
+        # divide the requests into dp_size groups evenly
+        dp_inp_lens = dp_inp_lens_list[dp_id]
+        dp_out_lens = dp_out_lens_list[dp_id]            
+        dp_arrive_times = arrive_times[dp_id::dp_size]
+
+        # support model-level pipeline
+        res_ref_list[dp_id] = \
+            _entry_to_remote_fake_scheduling_for_a_dp_worker.remote(
+                dp_inp_lens, dp_out_lens, 
+                dp_arrive_times, check_gap,
+                max_seq_num, gpu_cache_block_num, 
+                max_num_batched_tokens,
+                block_size, 
+                sort_input, 
+                cost_table, 
+                model_path, 
+                exec_plan_key, 
+                sample_config, 
+                trust_remote_code, 
+                revision)
+
+    
+    return res_ref_list
+
+
+
+
+
+
+
+
+@ray.remote
+def _entry_to_remote_fake_scheduling_vertical_fusion_for_a_dp_worker(
+    dp_inp_lens_for_models, dp_out_lens_for_models, 
+    dp_arrive_times_for_models, dp_seq_ids_for_models,
+    check_gap,
+    max_seq_num, gpu_cache_block_num, 
+    max_num_batched_tokens,
+    block_size, 
+    sort_input, 
+    cost_table, 
+    model_path, 
+    exec_plan_key, 
+    sample_config, 
+    trust_remote_code, 
+    revision
+    ):
+    
+    time1 = time.perf_counter()
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE vertical 0: {os.getpid()} ---abs: {time1}\n")
+
+    # a = np.asarray(cost_table[0][1])
+    # print(f"ahahahahah: {a.shape}")
+    # cost_table=cost_table*2
+    cost_table = get_cost_table_from_serialized_data(*cost_table)
+    # (prefill_table, decode_table,\
+    #      sample_prefill_table, sample_decode_table, \
+    #         prepInp_prefill_table, prepInp_decode_table, \
+    #             model_configs, prepare_cost_table) = cost_table
+    # cost_table = CostTable([],[],[],metadata=cost_table)
+    # cost_table = TEST(cost_table)
+    time1 = time.perf_counter()
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE vertical 1: {os.getpid()} ---abs: {time1}\n")
+    # return None
+
+    ret = \
+        fake_scheduling.fake_FCFS_schedule_vertical_fuse(
+            inp_lens=list(dp_inp_lens_for_models[0]),out_lens=list(dp_out_lens_for_models[0]), 
+            arrive_times=dp_arrive_times_for_models[0], 
+            ref_seq_ids=dp_seq_ids_for_models[0],
+            # 
+            ref_seq_ids_list=dp_seq_ids_for_models[1:],
+            inp_lens_list=dp_inp_lens_for_models[1:],
+            out_lens_list=dp_out_lens_for_models[1:],
+            arrive_times_list=dp_arrive_times_for_models[1:],
+            # 
+            check_gap=check_gap,
+            max_seq_num=max_seq_num, max_block_num=gpu_cache_block_num, 
+            max_num_batched_tokens=max_num_batched_tokens,
+            block_size=block_size, 
+            sort_input=sort_input, 
+            cost_estimate_args={
+                "cost_table":cost_table, 
+                "model_name":model_path, 
+                "exec_plan":exec_plan_key, 
+                "sample_config":sample_config, 
+                "trust_remote_code":trust_remote_code, 
+                "revision":revision}
+            )
+
+
+
+    time2 = time.perf_counter()
+    # print(f"TIME TO ESTIMATE COST: exec_plan_key: {exec_plan_key}: {time2 - time1}, ---abs: {time2}", flush=True)
+    with open(f'tmp_time_logs.log', 'a') as f:
+        f.write(f"TIME TO DP FAKE SCHEDULE vertical 2: {os.getpid()} {time2 - time1}, ---abs: {time2}\n")
+    
+    return ret
+
+
+
+
+
+
+
+
+
+# @ray.remote
+def _entry_to_remote_fake_scheduling_vertical_fusion(
+    dp_size: int,
+    dp_inp_lens_list_for_models: List[List[List[int]]],
+    dp_out_lens_list_for_models: List[List[List[int]]],
+    dp_inp_seq_ids_list_for_models: List[List[List[int]]],
+    dp_arrive_times_list_for_models: List[List[float]],
+    # 
+    check_gap: int,
+    sort_input: bool,
+    max_seq_num: int,
+    gpu_cache_block_num: int,
+    max_num_batched_tokens: int,
+    block_size: int,
+    # # 
+    # cost_table: CostTable,
+    model_path: str,
+    exec_plan_key,
+    sample_config,
+    trust_remote_code: bool,
+    revision: bool
+):
+    """
+        This function is a remote function used to do fake scheduling. --> change to make only fake scheduling remote
+    """
+    global _COST_MODEL_REF
+    cost_table = _COST_MODEL_REF # ray.put(np.random.rand(7, 6, 3, 512, 5))
+    res_ref_list = [None] * dp_size
+
+
+    for dp_id in range(dp_size):
+        # divide the requests into dp_size groups evenly
+        dp_inp_lens_for_models = dp_inp_lens_list_for_models[dp_id]
+        dp_out_lens_for_models = dp_out_lens_list_for_models[dp_id]            
+        dp_seq_ids_for_models = dp_inp_seq_ids_list_for_models[dp_id]
+        dp_arrive_times_for_models = dp_arrive_times_list_for_models[dp_id]
+
+
+        time1 = time.perf_counter()
+        with open(f'tmp_time_logs.log', 'a') as f:
+            f.write(f"TIME TO DP FAKE SCHEDULE vertical -1: {os.getpid()} ---abs: {time1}\n")
+
+        res_ref_list[dp_id] = \
+            _entry_to_remote_fake_scheduling_vertical_fusion_for_a_dp_worker.remote(
+                dp_inp_lens_for_models, dp_out_lens_for_models, 
+                dp_arrive_times_for_models, dp_seq_ids_for_models,
+                check_gap,
+                max_seq_num, gpu_cache_block_num, 
+                max_num_batched_tokens,
+                block_size, 
+                sort_input, 
+                cost_table, 
+                model_path, 
+                exec_plan_key, 
+                sample_config, 
+                trust_remote_code, 
+                revision
+                )
+
+
+    return res_ref_list
 
 
 
@@ -473,6 +935,8 @@ class MyExecPlan:
         # store the inp seq ids corresponding to dp_inp_lens_list (i.e., sorted by arrive times and seq ids)
         self.dp_inp_seq_ids_list: List[List[int]] = [list() for _ in range(self.dp_size)]
 
+        self._FAKE_SCHEDULING_RES_key = None
+        self.fake_scheduling_res_ref = None
 
         # valid_throughput and tep_remainin_lens depend on the plan group, instead of individual exec_plans.
         # self.valid_throughput: float = 0
@@ -744,6 +1208,17 @@ class MyExecPlan:
         return ((tuple(inp_lens_list), tuple(out_lens_list)), tuple(arrive_times_list))
 
 
+    def _get_valid_max_latency(self, latency_list):
+        # we should consider there may be some req not available for this model, 
+        # e.g., some inp srcs for the horizontally fused model is not ready
+        print(f"exec plan: {self.model.get_base_model_ids(), self.get_key()}")
+        # print(f"latency_list: {latency_list}")
+        latencys = np.asarray(latency_list)
+        latencys = latencys[latencys < 1e8]
+        if len(latencys) == 0:
+            return 0
+        else:
+            return max(latencys)
 
     # data parallel + model-level pipeline
     """
@@ -816,6 +1291,7 @@ class MyExecPlan:
         # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
         # 每个dp worker具体的input 和output length信息也存下来。才能做到正确的reuse scheduling results。
         key = (self.model.model_name, self.get_key(), *self._get_inp_key(arrive_times))
+        self._FAKE_SCHEDULING_RES_key = key
 
         # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
         # print(f"_FAKE_SCHEDULING_RES keys: {_FAKE_SCHEDULING_RES.keys()}")
@@ -829,7 +1305,10 @@ class MyExecPlan:
             (self.cumsum_latencys_list, self.cum_rng_nums_list, self.rng_starts_list, self.rng_ends_list,
                 self.is_prefill_steps_list, self.finish_times_list) = _FAKE_SCHEDULING_RES[key]
             
-            self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
+            # self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
+            #                            for cumsum_latencys in self.cumsum_latencys_list]
+
+            self.total_latency_list = [self._get_valid_max_latency(cumsum_latencys) if len(cumsum_latencys)>0 else 0 \
                                        for cumsum_latencys in self.cumsum_latencys_list]
 
 
@@ -853,6 +1332,37 @@ class MyExecPlan:
         else:
 
             print(f"DO FAKE SCHEDULING SEARCH!\n")
+            # global _COST_MODEL_REF
+
+            time1 = time.perf_counter()
+            # self.fake_scheduling_res_ref = _entry_to_remote_fake_scheduling.remote(
+            self.fake_scheduling_res_ref = _entry_to_remote_fake_scheduling(
+                self.dp_size,
+                self.dp_inp_lens_list,
+                self.dp_out_lens_list,
+                arrive_times,
+                # 
+                check_gap,
+                sort_input,
+                max_seq_num=self.infer_args.max_seq_num,
+                gpu_cache_block_num=self.gpu_cache_block_num,
+                max_num_batched_tokens=self.infer_args.max_num_batched_tokens,
+                block_size=self.infer_args.block_size, 
+                # # 
+                # cost_table=_COST_MODEL_REF, #cost_table,
+                model_path=self.model.model_path, 
+                exec_plan_key=self.get_key_single_dp_worker(),
+                sample_config=self.model.sample_config,
+                trust_remote_code=self.model.trust_remote_code,
+                revision=self.model.revision,
+            )
+            time2 = time.perf_counter()
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"TIME TO launch remote fake scheduling: exec_plan_key: {self.get_key()}: {time2 - time1}, ---abs: {time2}\n")
+            return
+
+
+
 
             # TODO: 这个地方的assert可能不对，因为我们可能是把request按照arrive时间排序的。相同arrive时间可以按照长度排序，
             # 但是这个排序很奇怪，因为model-level pipeline的情况，可能不会保证时刻都排好序。先不管这个？不管request的排序了。
@@ -932,7 +1442,8 @@ class MyExecPlan:
                 if len(self.cumsum_latencys_list[dp_id]) == 0:
                     self.total_latency_list[dp_id] = 0
                 else:
-                    self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    # self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    self.total_latency_list[dp_id] = self._get_valid_max_latency(self.cumsum_latencys_list[dp_id])
 
 
                 # # self.prefill_latencys = prefill_latencys
@@ -984,10 +1495,80 @@ class MyExecPlan:
             self.estimate_exec_time(cost_table, 
                 check_gap=check_gap, sort_input=sort_input, arrive_times=arrive_times)
 
-        print(f"exec plan latency list: {str(self), self.total_latency_list}")
+        
+        # NOTE: we need to check whether the estimate_exec_time calls ray remote function inside
+        if self.fake_scheduling_res_ref != None:
+            print("calling remote fake scheduling function-------")
+            return None
+        
+        
+        print(f"exec plan latency list: {str(self), self.total_latency_list}, self.extra_cost: {self.extra_cost}")
         
         # print(f"finish times list: {self.finish_times_list}")
 
+        return max(self.total_latency_list) + self.extra_cost
+    
+
+
+    def _wait_for_remote_fake_scheduling_deprecated(self):
+        """
+            Wait for the latency list if remote fake scheduling is called.
+        """
+        if self.fake_scheduling_res_ref != None:
+            print(f"exec_plan: {str(self)}, start waiting for remote fake scheduling")
+            ((self.cumsum_latencys_list, self.cum_rng_nums_list, 
+            self.rng_starts_list, self.rng_ends_list, 
+            self.is_prefill_steps_list, self.finish_times_list,), self.total_latency_list) = ray.get(self.fake_scheduling_res_ref)
+
+            # self.cumsum_latencys_list = ray.get(self.cumsum_latencys_list)
+            # self.cum_rng_nums_list = ray.get(self.cum_rng_nums_list)
+            # self.rng_starts_list = ray.get(self.rng_starts_list)
+            # self.rng_ends_list = ray.get(self.rng_ends_list)
+            # self.is_prefill_steps_list = ray.get(self.is_prefill_steps_list)
+            # self.finish_times_list = ray.get(self.finish_times_list)
+            # self.total_latency_list = ray.get(self.total_latency_list)
+            _FAKE_SCHEDULING_RES[self._FAKE_SCHEDULING_RES_key] = (self.cumsum_latencys_list, self.cum_rng_nums_list, 
+                                         self.rng_starts_list, self.rng_ends_list, 
+                                         self.is_prefill_steps_list, self.finish_times_list,) 
+
+
+    def _wait_for_remote_fake_scheduling(self):
+        """
+            Wait for the latency list if remote fake scheduling is called.
+        """
+        if self.fake_scheduling_res_ref != None:
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"exec_plan: {str(self)}, start waiting for remote fake scheduling: ---abs: {time.perf_counter()}\n")
+
+            for dp_id, dp_res_ref in enumerate(self.fake_scheduling_res_ref):
+                (self.cumsum_latencys_list[dp_id], self.cum_rng_nums_list[dp_id], 
+                        self.rng_starts_list[dp_id], self.rng_ends_list[dp_id], self.is_prefill_steps_list[dp_id], 
+                        self.finish_times_list[dp_id]) = ray.get(dp_res_ref)
+                
+                # NOTE: since there is a precision issue, we use self.cumsum_latencys[-1] as tot_latency
+                if len(self.cumsum_latencys_list[dp_id]) == 0:
+                    self.total_latency_list[dp_id] = 0
+                else:
+                    # self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    self.total_latency_list[dp_id] = self._get_valid_max_latency(self.cumsum_latencys_list[dp_id])
+
+
+            _FAKE_SCHEDULING_RES[self._FAKE_SCHEDULING_RES_key] = (self.cumsum_latencys_list, self.cum_rng_nums_list, 
+                                         self.rng_starts_list, self.rng_ends_list, 
+                                         self.is_prefill_steps_list, self.finish_times_list,)
+            
+            time2 = time.perf_counter()
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"TIME TO ESTIMATE COST: exec_plan_key: {self.get_key()}: ---abs: {time2}\n")
+
+
+
+    def wait_for_remote_fake_scheduling_and_get_max_dp_latency_considering_plan_group(self):
+        """
+            Wait for the latency list if remote fake scheduling is called.
+        """
+        self._wait_for_remote_fake_scheduling()
+           
         return max(self.total_latency_list) + self.extra_cost
 
 
@@ -1005,7 +1586,23 @@ class MyExecPlan:
             self.estimate_exec_time(cost_table, 
                 check_gap=1, sort_input=sort_input, arrive_times=arrive_times)
 
+        # NOTE: we need to check whether the estimate_exec_time calls ray remote function inside
+        if self.fake_scheduling_res_ref != None:
+            print("calling remote fake scheduling function-------")
+            return None
+
+
         return max(self.total_latency_list)
+
+
+    def wait_for_remote_fake_scheduling_and_get_max_dp_latency(self):
+        """
+            Wait for the latency list if remote fake scheduling is called.
+        """
+        self._wait_for_remote_fake_scheduling()
+        
+        return max(self.total_latency_list)
+
 
 
     def update_inp_out_seqlens_and_throughput_after_an_infer_stage_no_data_parallel(
@@ -1178,6 +1775,7 @@ class MyExecPlan:
 
 
             # print(f"dp_inp_lens: {dp_inp_lens}")
+            # print(f"dp_out_lens: {dp_out_lens}")
 
             # print(self.model.model_name, f"old inp_lens:{inp_lens}, old remaining_lens:{out_lens}")
             print(self)
@@ -1192,6 +1790,9 @@ class MyExecPlan:
             remaining_lens = np.asarray(dp_out_lens) - finished_lens
             # valid_indices = (remaining_lens>0)
             valid_indices = np.nonzero(remaining_lens>0)[0]
+
+            # print(f"remaining_lens: {remaining_lens}")
+            # print(f"valid_indices: {valid_indices}")
 
             # print(self.model.model_name, f"new inp_lens:{inp_lens[valid_indices]}, new remaining_lens:{remaining_lens[valid_indices]}")
 
@@ -1294,8 +1895,11 @@ class MyExecPlan:
                 1. ``new_inp_lens_merged`` is already sorted by seq ids.
                 2. we only do update when there are unfinished requests.
         '''
-        # print(f"in update_fake_schedule_output_after_an_infer_stage")
+        # print(f"in update_fake_schedule_output_after_an_infer_stage: {self.model.model_name, self.get_key()}")
         # print(f"in / out seqlens: {self.model.get_inp_out_seqlens()}")
+        # print(f"old_inp_lens_list: {old_inp_lens_list}")
+        # print(f"new_inp_out_lens_list: {new_inp_out_lens_list}")
+        # print(f"stop_iter_i_list: {stop_iter_i_list}")
 
         # check whether all the input requests are available after this stage is finished
         if (max([i[0] for i in self.inp_arrive_times]) > \
@@ -1352,6 +1956,12 @@ class MyExecPlan:
             #         self.dp_inp_seq_ids_list[dp_id][alive_old_indices],
             #         cum_rng_nums_list[dp_id], rng_starts_list[dp_id], rng_ends_list[dp_id], finish_times_of_alive_seqs)
 
+
+            # print(f"dp_id: {dp_id}, new_inp_out_lens_list[dp_id][2], alive_old_indices: {new_inp_out_lens_list[dp_id][2], alive_old_indices}")
+            # print(f"self.cumsum_latencys_list[dp_id]: {self.cumsum_latencys_list[dp_id]}")
+            # print(f"self.cum_rng_nums_list[dp_id]: {self.cum_rng_nums_list[dp_id]}")
+            # print(f"self.rng_starts_list[dp_id]: {self.rng_starts_list[dp_id]}")
+            # print(f"self.rng_ends_list[dp_id]: {self.rng_ends_list[dp_id]}")
 
             # dp_seq_ids = self.dp_seq_ids_list[dp_id]
             # finish_times_merged[dp_seq_ids[alive_old_indices]] = finish_times_of_alive_seqs
@@ -1482,6 +2092,10 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             [[list() for model in self.model_list] for _ in range(self.dp_size)]
 
 
+        self._FAKE_SCHEDULING_RES_key = None
+        self.fake_scheduling_res_ref = None
+
+
         # valid_throughput and tep_remainin_lens depend on the plan group, instead of individual exec_plans.
         # self.valid_throughput: float = 0
         # self.tmp_remaining_lens
@@ -1554,6 +2168,12 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             for dp_inp_seq_ids_for_models, finish_times_for_models in \
                 zip(self.dp_inp_seq_ids_list_for_models, self.finish_times_list_for_models):
                 inds = np.searchsorted(self.model_list[model_ind].ori_inp_seq_ids, dp_inp_seq_ids_for_models[model_ind])
+                
+                # if len(dp_inp_seq_ids_for_models[model_ind]) != len(finish_times_for_models[model_ind]):
+                #     print(f"{self.get_base_model_ids(), self.get_key()}")
+                #     print(f"inds: {inds}, model_ind: {model_ind}, dp_inp_seq_ids_for_models: {dp_inp_seq_ids_for_models}, finish_times_for_models: {finish_times_for_models}")
+                #     print(f"inds: {inds}, model_ind: {model_ind}, self.dp_inp_seq_ids_list_for_models: {self.dp_inp_seq_ids_list_for_models}, self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+                
                 self.finish_times_merged_for_models[model_ind][inds] = finish_times_for_models[model_ind]
 
         # we need to consider the case where the inp seq id is not the output of the model
@@ -1877,6 +2497,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         # NOTE: 因为可能每个dp worker的inference进度不一样，所以当前每个dp worker剩下的request并不是均衡的，这个就会和我们想要的fake scheduling相矛盾，所以这个地方要把
         # 每个dp worker具体的input 和output length信息也存下来。
         key = (self.model.model_name, self.get_key(), *(self._get_inp_key(arrive_times_list)))
+        self._FAKE_SCHEDULING_RES_key = key
 
         # print(f"key to check in _FAKE_SCHEDULING_RES: {key}")
         if key in _FAKE_SCHEDULING_RES:
@@ -1888,7 +2509,10 @@ class MyVerticalFusedExecPlan(MyExecPlan):
              self.is_prefill_steps_list, 
              self.finish_times_list_for_models) = _FAKE_SCHEDULING_RES[key]
             
-            self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
+            # self.total_latency_list = [cumsum_latencys[-1] if len(cumsum_latencys)>0 else 0 \
+            #                            for cumsum_latencys in self.cumsum_latencys_list]
+
+            self.total_latency_list = [self._get_valid_max_latency(cumsum_latencys) if len(cumsum_latencys)>0 else 0 \
                                        for cumsum_latencys in self.cumsum_latencys_list]
 
             # # print(f"self.cumsum_latencys: {self.cumsum_latencys}")
@@ -1905,13 +2529,43 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             time3 = time.perf_counter()
             print(f"TIME--reuse fake scheduling: {time3 - time2}")
 
-            # print(f"self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+            # print(f"{self.get_base_model_ids(), self.get_key()} self.finish_times_list_for_models: {self.finish_times_list_for_models}")
 
 
             return self.total_latency_list
         else:
 
             print(f"DO FAKE SCHEDULING SEARCH!\n")
+
+            time1 = time.perf_counter()
+
+            self.fake_scheduling_res_ref = _entry_to_remote_fake_scheduling_vertical_fusion(
+                self.dp_size,
+                self.dp_inp_lens_list_for_models,
+                self.dp_out_lens_list_for_models,
+                self.dp_inp_seq_ids_list_for_models,
+                self.dp_arrive_times_list_for_models,
+                # 
+                check_gap,
+                sort_input,
+                max_seq_num=self.infer_args.max_seq_num,
+                gpu_cache_block_num=self.gpu_cache_block_num,
+                max_num_batched_tokens=self.infer_args.max_num_batched_tokens,
+                block_size=self.infer_args.block_size,
+                # # 
+                # cost_table: CostTable,
+                model_path=self.model.model_path, 
+                exec_plan_key=self.get_key_single_dp_worker(),
+                sample_config=self.model.sample_config,
+                trust_remote_code=self.model.trust_remote_code,
+                revision=self.model.revision
+            )
+
+            time2 = time.perf_counter()
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"TIME TO launch remote fake scheduling vertical: exec_plan_key: {self.get_key()}: {time2 - time1}, ---abs: {time2}\n")
+            return
+
 
             # TODO: 这个地方的assert可能不对，因为我们可能是把request按照arrive时间排序的。相同arrive时间可以按照长度排序，
             # 但是这个排序很奇怪，因为model-level pipeline的情况，可能不会保证时刻都排好序。先不管这个？不管request的排序了。
@@ -1970,7 +2624,8 @@ class MyVerticalFusedExecPlan(MyExecPlan):
                 if len(self.cumsum_latencys_list[dp_id]) == 0:
                     self.total_latency_list[dp_id] = 0
                 else:
-                    self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    # self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    self.total_latency_list[dp_id] = self._get_valid_max_latency(self.cumsum_latencys_list[dp_id])
 
                 time4 = time.perf_counter()
                 print(f"TIME--fake scheduling vertical: {time4 - time3}")
@@ -2017,11 +2672,62 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             self.estimate_exec_time(cost_table, 
                 check_gap=check_gap, sort_input=sort_input, arrive_times_list=arrive_times_list)
 
-        print(f"exec plan latency list: {str(self), self.total_latency_list}")
+
+        # NOTE: we need to check whether the estimate_exec_time calls ray remote function inside
+        if self.fake_scheduling_res_ref != None:
+            print("calling remote fake scheduling function vertical -------")
+            return None
+
+
+        print(f"exec plan latency list: {str(self), self.total_latency_list}, self.extra_cost: {self.extra_cost}")
         
         # print(f"finish times list: {self.finish_times_list}")
 
         return max(self.total_latency_list) + self.extra_cost
+
+
+
+
+    def _wait_for_remote_fake_scheduling(self):
+        """
+            Wait for the latency list if remote fake scheduling is called.
+        """
+        if self.fake_scheduling_res_ref != None:
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"exec_plan: {str(self)}, start waiting for remote fake scheduling vertical: ---abs: {time.perf_counter()}\n")
+
+            for dp_id, dp_res_ref in enumerate(self.fake_scheduling_res_ref):               
+                (self.cumsum_latencys_list[dp_id], self.cum_rng_nums_list_for_models[dp_id], 
+                    self.rng_starts_list_for_models[dp_id], self.rng_ends_list_for_models[dp_id], 
+                    self.is_prefill_steps_list[dp_id], 
+                    self.finish_times_list_for_models[dp_id]) = ray.get(dp_res_ref)
+
+
+                # if [len(_) for _ in self.dp_inp_seq_ids_list_for_models[dp_id]] != [len(_) for _ in self.finish_times_list_for_models[dp_id]]:
+                #     print(f"{self.model.get_base_model_ids(), self.get_key()}")
+                #     print(f"dp_id: {dp_id}")
+                #     print(f"self.dp_inp_seq_ids_list_for_models[dp_id]: {self.dp_inp_seq_ids_list_for_models[dp_id]}")
+                #     print(f"self.finish_times_list_for_models[dp_id]: {self.finish_times_list_for_models[dp_id]}")
+
+
+                # NOTE: since there is a precision issue, we use self.cumsum_latencys[-1] as tot_latency
+                if len(self.cumsum_latencys_list[dp_id]) == 0:
+                    self.total_latency_list[dp_id] = 0
+                else:
+                    # self.total_latency_list[dp_id] = self.cumsum_latencys_list[dp_id][-1]
+                    self.total_latency_list[dp_id] = self._get_valid_max_latency(self.cumsum_latencys_list[dp_id])
+
+
+            # print(f"{self.get_base_model_ids(), self.get_key()} self.finish_times_list_for_models: {self.finish_times_list_for_models}")
+            
+            _FAKE_SCHEDULING_RES[self._FAKE_SCHEDULING_RES_key] = (self.cumsum_latencys_list, self.cum_rng_nums_list_for_models, 
+                                         self.rng_starts_list_for_models, self.rng_ends_list_for_models, 
+                                         self.is_prefill_steps_list, self.finish_times_list_for_models,) 
+            
+            time2 = time.perf_counter()
+            with open(f'tmp_time_logs.log', 'a') as f:
+                f.write(f"TIME TO ESTIMATE COST vertical: exec_plan_key: {self.get_key()}: ---abs: {time2}\n")
+
 
 
     # data parallel
@@ -2037,6 +2743,12 @@ class MyVerticalFusedExecPlan(MyExecPlan):
             arrive_times_list = [[-1]*len(model.get_inp_seq_ids()) for model in self.model_list]
             self.estimate_exec_time(cost_table, 
                 check_gap=1, sort_input=sort_input, arrive_times_list=arrive_times_list)
+
+        # NOTE: we need to check whether the estimate_exec_time calls ray remote function inside
+        if self.fake_scheduling_res_ref != None:
+            print("calling remote fake scheduling function-------")
+            return None
+
 
         return max(self.total_latency_list)
 
@@ -2213,6 +2925,12 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         def to_tuple(vs):
             return tuple([tuple(_) for _ in vs])
 
+        def _get_max(vs):
+            if len(vs) > 0:
+                return max(vs)
+            else:
+                return 0
+
         # print(f"in update_fake_schedule_output_after_an_infer_stage")
         # print(f"in / out seqlens: {self.model.get_inp_out_seqlens()}")
 
@@ -2222,7 +2940,7 @@ class MyVerticalFusedExecPlan(MyExecPlan):
         if sum([len(model.get_inp_seq_ids()) for model in self.model_list[:-1]]) == 0:
             # all the models but the last one has finished
             last_inp_available_time = max(\
-                [max(self.dp_arrive_times_list_for_models[dp_id][-1]) \
+                [_get_max(self.dp_arrive_times_list_for_models[dp_id][-1]) \
                  for dp_id in range(self.dp_size)])
             stop_time = max([cumsum_latencys[stop_iter_i] if len(cumsum_latencys) > 0 else 0 \
                              for cumsum_latencys, stop_iter_i in \
@@ -2342,6 +3060,8 @@ class MyExecPlanGroup:
         # model-level pipeline
         check_gap: int,
         sort_input: bool,
+        # 
+        base_model_finish_status: Dict[int, bool],
     ) -> None:
         
         print(f"building exec plan group: {[(_.model.get_base_model_ids(), _.get_key()) for _ in exec_plans]}\n", flush=True)
@@ -2350,6 +3070,7 @@ class MyExecPlanGroup:
         self.throughput = None
         self.infer_stage_latency = None
         self.comp_throughput = None
+        self.base_model_finish_status = base_model_finish_status
         # self.tot_worker_num = None
 
         # model-level pipeline
@@ -2367,6 +3088,10 @@ class MyExecPlanGroup:
         self.compute_infer_stage_data(cost_table=cost_table, 
                                       last_stage_exec_plans=last_stage_exec_plans, 
                                       check_gap=check_gap, sort_input=sort_input)
+
+        # NOTE: here we need to stop to wait for all the remote fake scheduling calls to finish
+        # so we need to call self.wait_remote_fake_scheduling_to_compute_infer_stage_data 
+        # before we can really use this MyExecPlanGroup object.
 
 
 
@@ -2409,6 +3134,12 @@ class MyExecPlanGroup:
                     exec_plan.set_extra_cost(
                         cost_table.get_prepare_cost(model.model_name, exec_plan.get_key_single_dp_worker())
                     )
+            
+            # !NOTE: we need to consider the vertical fusion of models here
+            elif _get_vertical_fuse_model_pairs(last_stage_exec_plans, exec_plan)!=None:
+                # this model can be vertically fused
+                exec_plan.set_extra_cost(0.0)
+            
             else:
                 # there is extra cost to load the model
                 # self.extra_prepare_costs.append(
@@ -2604,14 +3335,44 @@ class MyExecPlanGroup:
             print(f"base_model: {base_model.get_base_model_ids()} its input model ids: {base_model.input_model_ids}")
 
             # 1. get the inp plans and the corresponding base model ids in the inp plans that this base model depends on
+            # for in_model_id in base_model.inp_base_model_ids:
+            # !NOTE: it is possible that only a part of the inp base model is ready (finished or running) for this base model, 
+            # e.g., the model evaluator after a chain summary model list.
             for in_model_id in base_model.inp_base_model_ids:
+                find:bool = False
                 for i, model_ids in enumerate(in_exec_plans_base_model_ids):
                     if in_model_id in model_ids:
                         for j, model_id in enumerate(model_ids):
                             if in_model_id == model_id:
                                 inp_info.append((inp_exec_plans[i], j))
+                                find = True
+                if (not find) and base_model.independent_srcs:
+                    # we record the not-in-stage inp models for a base model that is a horizontally fused one
+                    inp_info.append((None, None))
             
             # 2. get the inp arrive times
+            if base_model.independent_srcs:
+                tmp_finish_time_dict: Dict[int, float] = dict()
+                for in_model_id, (inp_plan, model_ind) in zip(base_model.inp_base_model_ids, inp_info):
+                    inp_seq_ids = base_model.inp_req_from_which_models[in_model_id]
+                    if model_ind == None:
+                        if self.base_model_finish_status[in_model_id]:
+                            tmp_finish_time_dict.update({i:-1 for i in inp_seq_ids})
+                        else:
+                            tmp_finish_time_dict.update({i:1e9 for i in inp_seq_ids})
+                    else:
+                        # can get finish times from in-stage exec_plan
+                        tmp_finish_times = self._get_arrive_times_base_model(inp_seq_ids, [(inp_plan, model_ind)])
+                        tmp_finish_time_dict.update({i:t for i, t in zip(inp_seq_ids, tmp_finish_times)})
+
+                inp_seq_ids: List[int] = base_model.get_inp_seq_ids()
+                finish_times_list.append([tmp_finish_time_dict[i] for i in inp_seq_ids])
+                # print(f"horizontally fused model inp_seq_ids  model_id: {base_model.model_id} : {inp_seq_ids}")
+                # print(f"horizontally fused model finish_times_list  model_id: {base_model.model_id} : {finish_times_list}")
+                # if inp_info[0][0]!=None:
+                #     print(f"inp_info[0][0].finish_times_merged   model_id: {inp_info[0][0].model.model_id} : {[list(_) for _ in inp_info[0][0].finish_times_merged_for_models]}")
+                continue
+
             inp_seq_ids: List[int] = base_model.get_inp_seq_ids()
             finish_times_list.append(self._get_arrive_times_base_model(inp_seq_ids, inp_info))
 
@@ -2664,7 +3425,64 @@ class MyExecPlanGroup:
                         cost_table, check_gap, sort_input, self._get_arrive_times(exec_plan),
                         # self.extra_prepare_costs[exec_plan],
                     ) for exec_plan in self.exec_plans]
+        
+        # NOTE: here we need to stop to wait for all the remote fake scheduling calls to finish
+        return 
+
+
         latency = min(latencys)
+
+        print(f"stage latency: {latency}")
+        print(f"{[exec_plan.model.get_base_model_ids() for exec_plan in self.exec_plans]}")
+
+        # 2. Update the infer progress of each model involved.
+        # for exec_plan in self.exec_plans:
+        # for exec_plan, extra_cost in zip(self.exec_plans, self.extra_prepare_costs):
+        for exec_plan in self.exec_plans:
+            extra_cost = exec_plan.extra_cost
+            # data parallel
+            # new_inp_out_lens stores a list of all dp workers' results (list length is dp_size)
+            (new_inp_out_lens, valid_throughput), stop_iter_i = \
+                exec_plan.update_inp_out_seqlens_and_throughput_after_an_infer_stage(
+                    stop_time=latency-extra_cost, cost_table=cost_table)
+            self.tmp_inp_out_lens_list.append(new_inp_out_lens)
+            # self.tmp_remaining_decode_flops_after_infer_stage.append(
+            #     exec_plan.model.get_remaining_decode_flops_after_infer_stage(cost_table, *new_inp_out_lens))
+            self.valid_throughputs.append(valid_throughput)
+            self.tmp_stop_iter_i_list.append(stop_iter_i)
+        
+        self.infer_stage_latency = latency
+
+        print(f"throughput: {self.get_throughput()}")
+
+
+
+
+    def wait_remote_fake_scheduling_to_compute_infer_stage_data(
+            self, cost_table: CostTable):
+        '''
+            1. Compute the infer stage time.
+            2. Update the infer progress of each model involved.
+            Modify:
+                (1) self.valid_throughputs, (2) self.tmp_inp_out_lens_list
+                (3) self.tmp_remaining_decode_flops_after_infer_stage [deleted]
+                (4) self.tmp_stop_iter_i_list
+                (5) the total latency of the current infer stage.
+            # NOTE: here we need to continue the computation after waiting for the remote fake scheduling calls to finish
+        '''
+
+        print(f"Continue to INIT plan group: {[(exec_plan.model.get_base_model_ids(), exec_plan.get_key(), exec_plan.model.model_id, isinstance(exec_plan, MyVerticalFusedExecPlan)) for exec_plan in self.exec_plans]}")
+       
+        # 1. Compute the infer stage time.
+        # NOTE: here we need to stop to wait for all the remote fake scheduling calls to finish
+        latencys = [exec_plan.wait_for_remote_fake_scheduling_and_get_max_dp_latency_considering_plan_group(
+                    ) for exec_plan in self.exec_plans]
+
+        # NOTE: here we ensure the exec plan with in-stage-inp-model does not determine the infer stage latency
+        latencys_to_consider = [v for v, exec_plan in zip(latencys, self.exec_plans) if len(self.inp_exec_plan_dict[exec_plan])==0]
+        
+        # latency = min(latencys)
+        latency = min(latencys_to_consider)
 
         print(f"stage latency: {latency}")
         print(f"{[exec_plan.model.get_base_model_ids() for exec_plan in self.exec_plans]}")
@@ -2867,7 +3685,10 @@ class MyExecPlanGroup:
             merged_inp_out_lens = exec_plan.merge_new_inp_out_lens_of_data_parallel_workers(inp_out_lens)
             
             print(f"UPDATE MODELS AFTER SELECTING AN EXEC PLAN-------------\n")
-            print(f"exec_plan: {str(exec_plan)}, model_ids: {exec_plan.model.get_base_model_ids()}")
+            print(f"exec_plan: {str(exec_plan)}, model_ids: {exec_plan.model.get_base_model_ids()} exec_plan.model.independent_srcs: {exec_plan.model.independent_srcs}")
+            if exec_plan.model.independent_srcs:
+                print(f"inp arrivetimes: {exec_plan.inp_arrive_times}")
+                print(f"inp arrivetimes: {self.infer_stage_latency}")
             # print(f"inp_out_lens: {inp_out_lens}")
             # print(f"merged_inp_out_lens: {merged_inp_out_lens}")
 
@@ -2928,11 +3749,14 @@ class MyExecPlanGroupSeq:
         self,
         tot_flops: float,
         plan_group_seq: List[MyExecPlanGroup], 
-        time_seq: List[float]
+        time_seq: List[float],
+        last_stage_model_sys_values_seq: List[List],
     ) -> None:
         self.tot_flops = tot_flops
         self.plan_group_seq = plan_group_seq
         self.time_seq = time_seq
+        # the model sys values before each stage begins
+        self.last_stage_model_sys_values_seq = last_stage_model_sys_values_seq
     
     def get_last_stage_exec_plans(self) -> List[MyExecPlan]:
         if len(self.plan_group_seq) == 0:
@@ -2975,12 +3799,25 @@ class MyExecPlanGroupSeq:
         self.time_seq.append(comp_time)
 
 
+    def append_last_stage_model_sys_values(self, last_stage_model_sys_values):
+        self.last_stage_model_sys_values_seq.append(last_stage_model_sys_values)
+
     def pop_one_stage(self):
         self.plan_group_seq = self.plan_group_seq[:-1]
         self.time_seq = self.time_seq[:-1]
-    def set_plan_group_and_time(self, plan_group_seq, time_seq):
+        self.last_stage_model_sys_values_seq = self.last_stage_model_sys_values_seq[:-1]
+
+    def get_last_stage(self)->Tuple[MyExecPlanGroup, float]:
+        return self.plan_group_seq[-1], self.time_seq[-1], self.last_stage_model_sys_values_seq[-1]
+    
+    def set_plan_group_and_time(self, plan_group_seq, time_seq, last_stage_model_sys_values_seq):
         self.plan_group_seq = plan_group_seq
         self.time_seq = time_seq
+        self.last_stage_model_sys_values_seq = last_stage_model_sys_values_seq
+    
+    def get_stage_throughputs(self):
+        return [group.get_throughput() for group in self.plan_group_seq]
+    
     def __str__(self) -> str:
         if (len(self.plan_group_seq) == 0) or (self.plan_group_seq[0] == None):
             return f"{self.plan_group_seq, self.time_seq}"
@@ -3076,7 +3913,8 @@ class MyModelSystem:
             tot_gpu_num, byte_per_gpu, cost_table: CostTable,
             # baseline: str, 
             check_gap: int, sort_input: bool,
-            similar_threshold: float):
+            similar_threshold: float,
+            fully_connected_gpu_unit:int):
         """
             This function tries to fuse models in a chain (these models can be fused vertically) which has similar performance given the same GPU resources.
             Output: a new model system with fused models.
@@ -3098,18 +3936,40 @@ class MyModelSystem:
         # { the first model id in the fused model: all the model ids in the fused model }
         fused_models: Dict[int, List[int]] = dict()
 
+        # set a fake base model finish status dict
+        base_model_finish_status = {base_model.model_id: True \
+                                    for model in self.model_dict.values() \
+                                        for base_model in model.get_base_models()}
+
         while True:
             visit_model_level += 1
             cand_models = self.get_models_at_given_level(visit_model_level)
             if len(cand_models) == 0:
                 break
 
+
+            # construct exec plan groups at the same time
+            plan_groups_dict: Dict[int, List[MyExecPlanGroup]] = dict()
+            for to_fuse_model in cand_models:
+                exec_plans = get_possible_exec_plans(
+                    to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours', sort_input=sort_input, fully_connected_gpu_unit=fully_connected_gpu_unit)
+                plan_groups = [MyExecPlanGroup([exec_plan], cost_table=cost_table, last_stage_exec_plans=[],
+                                                check_gap=check_gap, sort_input=sort_input, base_model_finish_status=base_model_finish_status) for exec_plan in exec_plans]
+                plan_groups_dict[to_fuse_model.model_id] = plan_groups
+            
+
             for to_fuse_model in cand_models:
                 
                 # 1. compute its comp throughput vector
-                exec_plans = get_possible_exec_plans(to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours', sort_input=sort_input)
-                plan_groups = [MyExecPlanGroup([exec_plan], cost_table=cost_table, last_stage_exec_plans=[],
-                                                check_gap=check_gap, sort_input=sort_input,) for exec_plan in exec_plans]
+                # exec_plans = get_possible_exec_plans(to_fuse_model, tot_gpu_num, byte_per_gpu, cost_table, baseline='ours', sort_input=sort_input)
+                # plan_groups = [MyExecPlanGroup([exec_plan], cost_table=cost_table, last_stage_exec_plans=[],
+                #                                 check_gap=check_gap, sort_input=sort_input,) for exec_plan in exec_plans]
+                
+                plan_groups = plan_groups_dict[to_fuse_model.model_id]
+                for plan_group in plan_groups:
+                    plan_group.wait_remote_fake_scheduling_to_compute_infer_stage_data(cost_table=cost_table)
+
+
                 comp_throughput_vecs = np.asarray([plan_group.get_comp_throughput_only() for plan_group in plan_groups])
 
 
@@ -3119,7 +3979,8 @@ class MyModelSystem:
                 to_fuse_inp_model_ids = to_fuse_model.input_model_ids
                 for first_model_id, model_ids_fused in fused_models.items():
                     fused_model_inp_base_model_ids = self.model_dict[first_model_id].inp_base_model_ids
-                    if _meet_vertical_fuse_condition(to_fuse_inp_model_ids, model_ids_fused, fused_model_inp_base_model_ids):
+                    if (self.model_dict[first_model_id].model_name == to_fuse_model.model_name) and \
+                        _meet_vertical_fuse_condition(to_fuse_inp_model_ids, model_ids_fused, fused_model_inp_base_model_ids):
                         # this model can be fused topologically
 
                         # 3. check whether the comp_throughput_vecs is similar enough
@@ -3271,7 +4132,7 @@ class MyModelSystem:
             return np.asarray(outputs)[inds]
 
         # sort the models by the topological order first
-        self.get_all_level_models()
+        self.get_all_level_models(aggresive_for_horizontally_fused_model=False)
         for model_ids in self.all_level_model_ids:
             for model_id in model_ids:
                 model = self.model_dict[model_id]
@@ -3281,10 +4142,27 @@ class MyModelSystem:
                 ori_inp_lens = model.get_inp_out_seqlens()[0]
                 # NOTE: all the inp seq ids are sorted
                 inp_seq_ids = model.get_inp_seq_ids()
-                new_inp_lens = inp_merger(
-                    [ori_inp_lens] + \
-                        [get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id, out_req_id_mapping) for inp_model_id in model.input_model_ids]
-                        )
+
+                # get correct inp lens
+                new_inp_lens = None
+                if model.independent_srcs:
+                    # we do not need to merge the output of different input sources
+                    assert model.inp_req_from_which_models!=None
+                    new_inp_lens = dict()
+                    for from_model_id, req_ids in model.inp_req_from_which_models.items():
+                        assert from_model_id >= 0
+                        fetched_seq_lens = get_required_outputs_from_inp_model(req_ids, from_model_id, out_req_id_mapping)
+                        new_inp_lens.update({i:length for i, length in zip(req_ids, fetched_seq_lens)})
+                    new_inp_lens = [new_inp_lens[i] for i in inp_seq_ids]
+                else:
+                    if model.inp_req_from_which_models==None:
+                        new_inp_lens = inp_merger(
+                            [ori_inp_lens] + \
+                                [get_required_outputs_from_inp_model(inp_seq_ids, inp_model_id, out_req_id_mapping) for inp_model_id in model.input_model_ids]
+                                )
+                    else:
+                        # 暂时不支持这种情况。
+                        assert False
                 # new_inp_lens = inp_merger(
                 #     [ori_inp_lens] + \
                 #         [self.model_dict[inp_model_id].get_inp_out_seqlens()[1] for inp_model_id in model.input_model_ids]
@@ -3364,7 +4242,7 @@ class MyModelSystem:
         
 
         print(f"in get_runnable_plans_from_cand_plans: running_plan_group {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in running_plan_group]} cand_models: {[_.get_base_model_ids() for _ in cand_models]}")
-
+        base_model_mapping: Dict[int, int] = {i:j for j, model in self.model_dict.items() for i in model.get_base_model_ids()}
 
 
         def is_finished_or_running(model: MyModelInfor, running_model_ids: List[int]):
@@ -3381,11 +4259,19 @@ class MyModelSystem:
         
         for model, exec_plans in zip(cand_models, cand_exec_plans):
             inps = model.input_model_ids
+
+            if model.independent_srcs:
+                unfinished_srcs = model.get_unfinished_srcs()
+                inps = set([base_model_mapping[src] for src in unfinished_srcs])
+
             inps_status = [is_finished_or_running(self.model_dict[inp], running_model_ids) for inp in inps]
 
             print(f"checking model: {model.get_base_model_ids()}  inp model ids: {inps} = {[self.model_dict[_].get_base_model_ids() for _ in inps]}, inps_status: {inps_status}")
 
-            if False in inps_status:
+            if model.independent_srcs:
+                if sum(inps_status) == 0:
+                    continue
+            elif False in inps_status:
                 continue
 
             # print(f"in get_runnable_plans_from_cand_plans: model {model.model_id} is runnable")
@@ -3395,14 +4281,21 @@ class MyModelSystem:
 
 
 
-    def get_all_level_models(self):
+    def get_all_level_models(self, aggresive_for_horizontally_fused_model: bool):
         """
             Update the model ids on all levels according to the current model status.
             Update: self.all_level_model_ids
+            Input:
+                aggresive_for_horizontally_fused_model: if True, we put each horizontally fused model in the earliest level it can be, 
+                    i.e., as long as one of its inp model is finished or running, it can run.
+                    ==> NOTE: change to 
+                    1. for horizontally fused models, we will treat each independent inp src as an individual model instance.
+                    E.g., if model A has 2 independent inp srcs, then there can be at most 2 model instances in the sys.
         """
         self.all_level_model_ids = list()
         # visited: List[bool] = np.asarray([False] * len(self.model_dict))
         visited: Dict[int, bool] = {model_id: False for model_id in self.model_dict}
+        base_model_mapping: Dict[int, int] = {i:j for j, model in self.model_dict.items() for i in model.get_base_model_ids()}
 
         # while sum(visited) < len(self.model_dict):
         while False in visited.values():
@@ -3417,8 +4310,24 @@ class MyModelSystem:
                     newly_visited[model.model_id] = True
                     continue
                 inp_status = [visited[inp] for inp in model.input_model_ids]
-                if False in inp_status:
+                
+                # if False in inp_status:
+                # NOTE: we consider the horizontally fused models, whose inp srcs are indepedent that do not need to be merged here.
+                if aggresive_for_horizontally_fused_model and model.independent_srcs:
+                    # 1. find the srcs of which the related workload has not been finished
+                    unfinished_srcs = model.get_unfinished_srcs()
+
+                    unfinished_srcs = set([base_model_mapping[src] for src in unfinished_srcs])
+                    inp_status = [visited[inp] for inp in unfinished_srcs]
+                    
+                    # if 1. inp srcs are independent and at least one inp scr is ready and we want to aggresively compute model sys levels
+                    if sum(inp_status) == 0:
+                        continue
+                    
+                elif False in inp_status:
+                    #    2. inp scrs need to be merged and all the inp scrs are ready
                     continue
+
                 newly_visited[model.model_id] = True
                 new_model_ids.append(model.model_id)
             # visited = visited + newly_visited
@@ -3441,6 +4350,17 @@ class MyModelSystem:
                                       for model in self.model_dict.values() \
                                         for base_model in model.get_base_models()])
         return not_finished_model_num
+
+
+    def get_base_model_finish_status(self) -> Dict[int, bool]:
+        """
+            Get the dict of the finish status of each base model.
+        """
+        base_model_finish_status = {base_model.model_id: base_model.is_finished() \
+                                      for model in self.model_dict.values() \
+                                        for base_model in model.get_base_models()}
+        return base_model_finish_status
+
 
 
     def is_finished(self) -> bool:
@@ -3512,14 +4432,79 @@ class MyModelSystem:
 
 
 
-    def get_candidate_plan_groups(
+    def _get_good_runnable_exec_plan_keys(
+            self,
+            cand_plan_group: List[MyExecPlan],
+            runnable_exec_plans_list: List[List[MyExecPlan]],
+            models_have_in_level_dependency: List[List[int]], 
+            # 
+            check_gap: int, sort_input: bool,
+            last_stage_exec_plans: List[MyExecPlan],
+            cost_table: CostTable,
+            tot_gpu_num = 4, 
+            ) -> List[List[MyExecPlan]]:
+        """
+            Get the best exec plan for each runnable models and each assigned comp gpu num.
+            NOTE: 
+                1. 在这里我们提前进行了一些exec plan合理性的判断。
+                2. for models which may have inp models in the same stage, e.g., a horizontally fused model (we can check this by ``models_have_in_level_dependency``), 
+                we do not compute their good exec plans, i.e., we think each exec plan needs to be checked.
+        """
+        plan_group_objs_list = list()
+        available_gpu_num = tot_gpu_num-get_tot_worker_num(cand_plan_group)
+        valid_res_list: List[List[Tuple[int, MyExecPlan]]] = list()
+        base_model_finish_status = self.get_base_model_finish_status()
+        skip_is = list()
+        for i, runnable_exec_plans in enumerate(runnable_exec_plans_list):
+            if (len(runnable_exec_plans) > 0) and (runnable_exec_plans[0].model.model_id in models_have_in_level_dependency):
+                valid_res_list.append(runnable_exec_plans)
+                skip_is.append(i)
+                continue
+
+            gpu_nums = [get_tot_worker_num([exec_plan]) for exec_plan in runnable_exec_plans]
+            plan_group_objs_list.append(
+                [MyExecPlanGroup(
+                    _get_path_key(cand_plan_group, exec_plan)[1],
+                    # cand_plan_group+[exec_plan], 
+                    cost_table, last_stage_exec_plans, check_gap, sort_input,
+                    base_model_finish_status=base_model_finish_status
+                    ) for gpu_num, exec_plan in zip(gpu_nums, runnable_exec_plans) if gpu_num <=  available_gpu_num])
+            valid_res_list.append([(gpu_num, exec_plan) for gpu_num, exec_plan in zip(gpu_nums, runnable_exec_plans) if gpu_num <=  available_gpu_num])
+        
+        # get good exec plan lists to return 
+        ret = list()
+        for i, valid_res in enumerate(valid_res_list):
+            # if (len(valid_res) > 0) and (valid_res[0][1].model.model_id in models_have_in_level_dependency):
+            if i in skip_is:
+                ret.append([exec_plan.get_key() for exec_plan in valid_res])
+                continue
+            
+            good_dict: Dict[int, Tuple[float, MyExecPlan]] = dict()
+            for gpu_num, exec_plan in valid_res:
+                latency = exec_plan.wait_for_remote_fake_scheduling_and_get_max_dp_latency_considering_plan_group()
+                print(f"good plan keys candidate: {(exec_plan.get_key(), latency)}")
+                if gpu_num not in good_dict:
+                    good_dict[gpu_num] = (latency, exec_plan)
+                else:
+                    if latency < good_dict[gpu_num][0]:
+                        good_dict[gpu_num] = (latency, exec_plan)
+            ret.append([exec_plan.get_key() for latency, exec_plan in good_dict.values()])
+        
+
+        print(f"good plan keys: {ret}")
+        return ret
+
+
+
+    def get_candidate_plan_groups_no_horizontal_fused_model(
         self, 
         gen_execplans_baseline:str,
         check_gap: int, sort_input: bool,
         last_stage_exec_plans: List[MyExecPlan],
         cost_table: CostTable,
         tot_gpu_num = 4, byte_per_gpu=80*(1024**3),
-        top_k=float('inf'),)->List[MyExecPlanGroup]:
+        top_k=float('inf'),
+        fully_connected_gpu_unit:int=4)->List[MyExecPlanGroup]:
         """
             Get the candidate plan groups following the last_stage_exec_plans.
             NOTE: here we only ensure the validity of the candidate plan groups;
@@ -3535,11 +4520,12 @@ class MyModelSystem:
                 and (not_finished_base_model_num > involved_base_model_num) \
                     and (gpu_num_sum<tot_gpu_num)
 
+        
         not_finished_base_model_num = self.get_not_finished_base_model_num()
 
         # running_model_ids are models running in this exec stage
-        tot_plan_groups = [[]]
-        new_plan_groups = [[]]
+        tot_plan_groups: List[List[MyExecPlan]] = [[]]
+        new_plan_groups: List[List[MyExecPlan]] = [[]]
 
         uniq_exec_plan_mapping = dict()
         # stores the best plan group given a set of models and the GPU num to use --> to add pruning in the plan group generation process
@@ -3550,9 +4536,11 @@ class MyModelSystem:
         # good_exec_plans: Dict[int, Dict[int, List[MyExecPlan]]] = dict()
 
         # we first divide the unfinished model into different levels
-        self.get_all_level_models()
+        self.get_all_level_models(aggresive_for_horizontally_fused_model=True)
 
         print(f"all_level_model_ids: {self.all_level_model_ids}")
+
+        base_model_finish_status = self.get_base_model_finish_status()
 
         visit_model_level = -1
         while True:
@@ -3565,7 +4553,8 @@ class MyModelSystem:
             # 1. first get the candidate exec plans for each model
             exec_plans_list = list()
             for model in cand_models:
-                exec_plans = get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input)
+                exec_plans = get_possible_exec_plans(
+                    model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input, fully_connected_gpu_unit=fully_connected_gpu_unit)
                 exec_plans_list.append(exec_plans)
                 print(f"model finished? {model.is_finished()}, model_id: {model.get_base_model_ids()}, can exec_plans: {[str(plan) for plan in exec_plans]}")
 
@@ -3584,6 +4573,15 @@ class MyModelSystem:
 
                 runnable_exec_plans_list = self.get_runnable_plans_from_cand_plans(cand_plan_group, cand_models, exec_plans_list)
 
+
+                # -1. get good exec plans for each runnable model for pruning
+                # TODO: 这个地方的pruning如果在更general的带有horizontal fused model的场景可能就用不了了，
+                # 因为这个model的time estimate和plan group里有什么别的inp model有关。
+                good_runnable_exec_plan_keys_list = self._get_good_runnable_exec_plan_keys(
+                    cand_plan_group, runnable_exec_plans_list,
+                    check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num)
+
+
                 # print(f"runnable_exec_plans_list:  ----------------------")
                 # for plans in runnable_exec_plans_list:
                 #     print(f"{len(plans)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans]}")
@@ -3593,7 +4591,8 @@ class MyModelSystem:
                 
                 # 2. second combine exec plans for different models into a group
                 plan_groups = [cand_plan_group]
-                _append_exec_plan(plan_groups, runnable_exec_plans_list, 0, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping)
+                old_uniq_exec_plan_mapping_keys = list(uniq_exec_plan_mapping.keys())
+                _append_exec_plan(plan_groups, runnable_exec_plans_list, 0, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping, good_runnable_exec_plan_keys_list)
                 # plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans) \
                 #             for plan_group in plan_groups if len(plan_group) > 0]
                 
@@ -3611,14 +4610,44 @@ class MyModelSystem:
                             gen_execplans_baseline, not_finished_base_model_num, plan_group, tot_gpu_num
                             )]
 
+
+                    new_uniq_exec_plan_mappinp_keys = [k for k in uniq_exec_plan_mapping if k not in old_uniq_exec_plan_mapping_keys]
+                    new_uniq_exec_plans: List[MyExecPlan] = [uniq_exec_plan_mapping[k] for k in new_uniq_exec_plan_mappinp_keys]
+                    # new_uniq_sub_plan_groups = [cand_plan_group+[exec_plan] for exec_plan in new_uniq_exec_plans]
+
+                    # NOTE: we should consider there may be fused model exec plan in new_uniq_exec_plans
+                    new_uniq_sub_plan_groups = list()
+                    for exec_plan in new_uniq_exec_plans:
+                        if isinstance(exec_plan, MyVerticalFusedExecPlan):
+                            tmp_cand_plan_group = [plan for plan in cand_plan_group if not set(plan.model.get_base_model_ids()).issubset(exec_plan.model.get_base_model_ids())]
+                            new_uniq_sub_plan_groups.append(tmp_cand_plan_group+[exec_plan])
+                        else:
+                            new_uniq_sub_plan_groups.append(cand_plan_group+[exec_plan])
+
                     # we first update the good_plan_group_dict
-                    # print(f"the groups we found a round: ")
+                    print(f"the groups we found a round: # of  groups: {len(plan_groups)}")
                     # for plan_group in plan_groups[1:]:
                     #     print([(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group])
+                    print(f"the uniq sub plan groups we found a round: # of  groups: {len(new_uniq_sub_plan_groups)}")
+
+                    # 0. we first init the uniq sub plan groups where no fake scheduling results will be shared
+                    uniq_sub_plan_group_objs = [MyExecPlanGroup(
+                        plan_group, cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status=base_model_finish_status) for plan_group in new_uniq_sub_plan_groups]
+                    for exec_plan in new_uniq_exec_plans:
+                        exec_plan._wait_for_remote_fake_scheduling()
+
+                    # 1. we first init all the possible exec plan group objects at the same time
+                    plan_group_objs = [MyExecPlanGroup(
+                        plan_group, cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status=base_model_finish_status) for plan_group in plan_groups[1:]]
                     good_plan_group_keys = [_update_good_plan_group_dict(
-                        cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
-                        plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
-                        ) for plan_group in plan_groups[1:]]
+                        group_obj=group_obj, cost_table=cost_table, good_plan_group_dict=good_plan_group_dict
+                        ) for group_obj in plan_group_objs]
+
+                    # good_plan_group_keys = [_update_good_plan_group_dict(
+                    #     cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
+                    #     plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
+                    #     ) for plan_group in plan_groups[1:]]
+
                     good_plan_group_keys = [_ for _ in good_plan_group_keys if _ != None]
                     to_compare = sorted([_[0] for _ in good_plan_group_dict.values()], reverse=True)[top_k-1] if top_k <= len(good_plan_group_dict) else -1
                     good_plan_groups = [good_plan_group_dict[_][1].exec_plans for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]
@@ -3665,6 +4694,316 @@ class MyModelSystem:
 
 
 
+
+
+
+
+
+
+    def get_candidate_plan_groups(
+        self, 
+        gen_execplans_baseline:str,
+        check_gap: int, sort_input: bool,
+        last_stage_exec_plans: List[MyExecPlan],
+        cost_table: CostTable,
+        tot_gpu_num = 4, byte_per_gpu=80*(1024**3),
+        top_k=float('inf'),
+        fully_connected_gpu_unit:int=4)->List[MyExecPlanGroup]:
+        """
+            Get the candidate plan groups following the last_stage_exec_plans.
+            NOTE: here we only ensure the validity of the candidate plan groups;
+                we do not select good ones from them.
+        """
+
+        def _directly_discard(
+                gen_execplans_baseline: str, not_finished_base_model_num: int, 
+                plan_group: List[MyExecPlan], tot_gpu_num: int):
+            involved_base_model_num = sum([len(plan.get_base_model_ids()) for plan in plan_group])
+            gpu_num_sum = get_tot_worker_num(plan_group)
+            return (gen_execplans_baseline=='ours') \
+                and (not_finished_base_model_num > involved_base_model_num) \
+                    and (gpu_num_sum<tot_gpu_num)
+
+        
+        def _get_model_ids_of_different_levels(models: List[MyModelInfor]) -> Tuple[List[List[int]], Dict[int, List[int]]]:
+            sorted_model_ids = list()
+            all_model_ids = set([model.model_id for model in models])
+            model_ids_of_each_layer = list()
+            in_stage_out_edge_dict = defaultdict(list)
+            # iteratively add LLMs which are ready
+            while len(sorted_model_ids) < len(models):
+                new_layer = list()
+                for model in models:
+                    if model.model_id in sorted_model_ids:
+                        continue
+                    in_stage_inp_model_ids = all_model_ids.intersection(model.input_model_ids)
+                    if in_stage_inp_model_ids.issubset(sorted_model_ids):
+                        new_layer.append(model.model_id)
+                        for i in in_stage_inp_model_ids:
+                            in_stage_out_edge_dict[i].append(model.model_id)
+                sorted_model_ids.extend(new_layer)
+                model_ids_of_each_layer.append(new_layer)
+            print(f"model_ids_of_each_layer: {model_ids_of_each_layer}, in_stage_out_edge_dict: {in_stage_out_edge_dict}")
+            return model_ids_of_each_layer, in_stage_out_edge_dict
+
+
+        def _run_exec_cost_estimation_on_uniq_sub_plan_groups(
+                uniq_exec_plan_mapping: Dict[Tuple, Tuple[MyExecPlan, List[MyExecPlan]]], 
+                old_uniq_exec_plan_mapping_keys,
+                cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status
+                ):
+            
+            models_to_estimate: List[int] = list()
+            new_uniq_exec_plan_mappinp_keys = [k for k in uniq_exec_plan_mapping if k not in old_uniq_exec_plan_mapping_keys]
+            new_uniq_sub_plan_groups = defaultdict(list)
+            for k in new_uniq_exec_plan_mappinp_keys:
+                plan, path_plans = uniq_exec_plan_mapping[k]
+                new_uniq_sub_plan_groups[plan.model.model_id].append(uniq_exec_plan_mapping[k])
+                if plan.model not in models_to_estimate:
+                    models_to_estimate.append(plan.model)
+            
+            model_ids_of_each_layer, _ = _get_model_ids_of_different_levels(models_to_estimate)
+
+            print(f"the uniq sub plan groups we found a round: # of  groups: {sum([len(vs) for vs in new_uniq_sub_plan_groups.values()])}")
+
+            # 0. we first init the uniq sub plan groups where no fake scheduling results will be shared
+            for model_ids in model_ids_of_each_layer:
+                print(f"uniq_sub_plan_group_objs:")
+                for model_id in model_ids: 
+                    for plan, plan_group in new_uniq_sub_plan_groups[model_id]:
+                        print(f"{[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                plans_to_wait = [plan for model_id in model_ids for plan, plan_group in new_uniq_sub_plan_groups[model_id]]
+                uniq_sub_plan_group_objs = [MyExecPlanGroup(
+                    plan_group, cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status=base_model_finish_status
+                    ) for model_id in model_ids for plan, plan_group in new_uniq_sub_plan_groups[model_id]]
+                for exec_plan in plans_to_wait:
+                    exec_plan._wait_for_remote_fake_scheduling()
+
+        def _has_in_stage_inp_models(plan_group: List[MyExecPlan]):
+            horizontally_fused_model_ids = [plan.model.input_model_ids for plan in plan_group if plan.model.independent_srcs]
+            all_model_ids = set([plan.model.model_id for plan in plan_group])
+            res = [((len(all_model_ids.intersection(inps))>0) or (False not in [self.model_dict[i].is_finished() for i in inps])) \
+                   for inps in horizontally_fused_model_ids]
+            if False in res:
+                return False
+            else: 
+                return True
+
+
+        not_finished_base_model_num = self.get_not_finished_base_model_num()
+
+        # running_model_ids are models running in this exec stage
+        tot_plan_groups: List[List[MyExecPlan]] = [[]]
+        new_plan_groups: List[List[MyExecPlan]] = [[]]
+
+        uniq_exec_plan_mapping = dict()
+        # stores the best plan group given a set of models and the GPU num to use --> to add pruning in the plan group generation process
+        good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]] = dict()
+
+        # stores the best exec plans for each model and each GPU number assigned 
+        # --> do not considering other exec plans in the same stage here
+        # good_exec_plans: Dict[int, Dict[int, List[MyExecPlan]]] = dict()
+
+        self.get_all_level_models(aggresive_for_horizontally_fused_model=False)
+        model_correct_level_num = dict()
+        for level_i, model_ids in enumerate(self.all_level_model_ids):
+            model_correct_level_num.update({model_id:level_i for model_id in model_ids})
+        
+        # we first divide the unfinished model into different levels
+        self.get_all_level_models(aggresive_for_horizontally_fused_model=True)       
+
+
+        print(f"all_level_model_ids: {self.all_level_model_ids}")
+
+        base_model_finish_status = self.get_base_model_finish_status()
+
+        visit_model_level = -1
+        while True:
+            tmp_new_plan_groups = []
+            visit_model_level += 1
+            cand_models = self.get_models_at_given_level(visit_model_level)
+
+
+            # NOTE: as there may be horizontally fused models in cand_models, we may need to sort them
+            model_ids_of_each_layer, in_stage_out_edge_dict = _get_model_ids_of_different_levels(cand_models)
+            models_have_in_level_dependency = list()
+            for _ in model_ids_of_each_layer[1:]:
+                models_have_in_level_dependency.extend(_)
+
+            # also consider the models that are on the wrong level due to horizontally fused models
+            models_have_in_level_dependency.extend([model.model_id for model in cand_models if model_correct_level_num[model.model_id]!=visit_model_level])
+            models_have_in_level_dependency = list(set(models_have_in_level_dependency))
+
+            # print(f"cand_models in this round: {[model.model_id for model in cand_models]}")
+
+            # 1. first get the candidate exec plans for each model
+            exec_plans_list = list()
+            for model in cand_models:
+                exec_plans = get_possible_exec_plans(
+                    model, tot_gpu_num, byte_per_gpu, cost_table, gen_execplans_baseline, sort_input=sort_input, fully_connected_gpu_unit=fully_connected_gpu_unit)
+                exec_plans_list.append(exec_plans)
+                print(f"model finished? {model.is_finished()}, model_id: {model.get_base_model_ids()}, can exec_plans: {[str(plan) for plan in exec_plans]}")
+
+                # # update good_exec_plans
+                # good_exec_plans[model.model_id] = dict()
+                # for exec_plan in exec_plans:
+                #     gpu_num_required = exec_plan.num_worker*exec_plan.dp_size
+                #     throughput = 
+
+
+            # print(f"New Round get_candidate_plan_groups ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+
+            for cand_plan_group in new_plan_groups:
+                # running_model_ids = [exec_plan.model.model_id for exec_plan in cand_plan_group]
+                # cand_models = self.get_next_level_models(last_level_running_model_ids=, all_running_model_ids=running_model_ids)
+
+                runnable_exec_plans_list = self.get_runnable_plans_from_cand_plans(cand_plan_group, cand_models, exec_plans_list)
+
+
+                # -1. get good exec plans for each runnable model for pruning
+                # TODO: 这个地方的pruning如果在更general的带有horizontal fused model的场景可能就用不了了，
+                # 因为这个model的time estimate和plan group里有什么别的inp model有关。
+                good_runnable_exec_plan_keys_list = self._get_good_runnable_exec_plan_keys(
+                    cand_plan_group, runnable_exec_plans_list,
+                    models_have_in_level_dependency,
+                    check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num)
+
+
+                # print(f"runnable_exec_plans_list:  ----------------------")
+                # for plans in runnable_exec_plans_list:
+                #     print(f"{len(plans)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans]}")
+                
+                # print(f"root cand_plan_group: ------------------------")
+                # print(f"{len(cand_plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in cand_plan_group]}")
+                
+                # 2. second combine exec plans for different models into a group
+                plan_groups = [cand_plan_group]
+                old_uniq_exec_plan_mapping_keys = list(uniq_exec_plan_mapping.keys())
+                _append_exec_plan(plan_groups, runnable_exec_plans_list, 0, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping, good_runnable_exec_plan_keys_list, 
+                                  self.out_edge_dict)
+                # plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans) \
+                #             for plan_group in plan_groups if len(plan_group) > 0]
+                
+                if len(plan_groups) == 1:
+                    # no new model is added to cand_plan_group
+                    if not _directly_discard(
+                        gen_execplans_baseline, not_finished_base_model_num, plan_groups[0], tot_gpu_num
+                        ):
+                        tot_plan_groups.extend(plan_groups)
+                else:
+
+                    if visit_model_level+1 >= len(self.all_level_model_ids):
+                        # this is the last layer, we can consider discard some exec plans
+                        plan_groups = [plan_groups[0]]+[plan_group for plan_group in plan_groups[1:] if not _directly_discard(
+                            gen_execplans_baseline, not_finished_base_model_num, plan_group, tot_gpu_num
+                            )]
+
+
+                    # prune some plan groups where horizontally fused models do not have in-stage input models
+                    print(f"the groups we found a round: # of  groups before pruning: {len(plan_groups)}")
+                    plan_groups = plan_groups[:1] + [plan_group for plan_group in plan_groups[1:] if _has_in_stage_inp_models(plan_group)]
+
+
+                    print(f"the groups we found a round: # of  groups after pruning: {len(plan_groups)}")
+                    for plan_group in plan_groups:
+                        print(f"{[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                    
+                    _run_exec_cost_estimation_on_uniq_sub_plan_groups(
+                        uniq_exec_plan_mapping, 
+                        old_uniq_exec_plan_mapping_keys,
+                        cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status
+                    )
+
+                    # =================================================================================================================
+                    # new_uniq_exec_plan_mappinp_keys = [k for k in uniq_exec_plan_mapping if k not in old_uniq_exec_plan_mapping_keys]
+                    # new_uniq_exec_plans: List[MyExecPlan] = [uniq_exec_plan_mapping[k] for k in new_uniq_exec_plan_mappinp_keys]
+                    # # new_uniq_sub_plan_groups = [cand_plan_group+[exec_plan] for exec_plan in new_uniq_exec_plans]
+
+                    # # NOTE: we should consider there may be fused model exec plan in new_uniq_exec_plans
+                    # new_uniq_sub_plan_groups = list()
+                    # for exec_plan in new_uniq_exec_plans:
+                    #     if isinstance(exec_plan, MyVerticalFusedExecPlan):
+                    #         tmp_cand_plan_group = [plan for plan in cand_plan_group if not set(plan.model.get_base_model_ids()).issubset(exec_plan.model.get_base_model_ids())]
+                    #         new_uniq_sub_plan_groups.append(tmp_cand_plan_group+[exec_plan])
+                    #     else:
+                    #         new_uniq_sub_plan_groups.append(cand_plan_group+[exec_plan])
+
+                    # # we first update the good_plan_group_dict
+                    # print(f"the groups we found a round: # of  groups: {len(plan_groups)}")
+                    # # for plan_group in plan_groups[1:]:
+                    # #     print([(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group])
+                    # print(f"the uniq sub plan groups we found a round: # of  groups: {len(new_uniq_sub_plan_groups)}")
+
+                    # # 0. we first init the uniq sub plan groups where no fake scheduling results will be shared
+                    # uniq_sub_plan_group_objs = [MyExecPlanGroup(
+                    #     plan_group, cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status=base_model_finish_status) for plan_group in new_uniq_sub_plan_groups]
+                    # for exec_plan in new_uniq_exec_plans:
+                    #     exec_plan._wait_for_remote_fake_scheduling()
+                    # =================================================================================================================
+
+                    # 1. we first init all the possible exec plan group objects at the same time
+                    plan_group_objs = [MyExecPlanGroup(
+                        plan_group, cost_table, last_stage_exec_plans, check_gap, sort_input, base_model_finish_status=base_model_finish_status) for plan_group in plan_groups[1:]]
+                    good_plan_group_keys = [_update_good_plan_group_dict(
+                        group_obj=group_obj, cost_table=cost_table, good_plan_group_dict=good_plan_group_dict
+                        ) for group_obj in plan_group_objs]
+
+                    # good_plan_group_keys = [_update_good_plan_group_dict(
+                    #     cost_table=cost_table, check_gap=check_gap, sort_input=sort_input, last_stage_exec_plans=last_stage_exec_plans,
+                    #     plan_group=plan_group, good_plan_group_dict=good_plan_group_dict
+                    #     ) for plan_group in plan_groups[1:]]
+
+                    good_plan_group_keys = [_ for _ in good_plan_group_keys if _ != None]
+                    to_compare = sorted([_[0] for _ in good_plan_group_dict.values()], reverse=True)[top_k-1] if top_k <= len(good_plan_group_dict) else -1
+                    good_plan_groups = [good_plan_group_dict[_][1].exec_plans for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]
+                    # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[_ for _ in good_plan_group_keys if good_plan_group_dict[_][0] > to_compare]}")
+                    # print(f"to_compare: {to_compare}, top_k: {top_k}")
+                    # print(f"only keep good plan groups: num: {len(good_plan_groups)}, keys: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in _] for _ in good_plan_groups]}")
+                    # 
+                    # good_plan_groups = [_ for _ in good_plan_groups if len(_)!=0]
+                    tmp_new_plan_groups.extend(good_plan_groups)
+                    # 
+                    # tmp_new_plan_groups.extend(plan_groups[1:])
+
+                # print(f"tot_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tot_plan_groups]}")
+                # print(f"tmp_new_plan_groups: {[[str(plan) for plan in plan_group] for plan_group in tmp_new_plan_groups]}")
+                # print(f"cand_plan_group: {[str(plan) for plan in cand_plan_group]}")
+                # print(f"tot_plan_groups: ----------------------")
+                # for plan_group in tot_plan_groups:
+                #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+                # print(f"tmp_new_plan_groups: ------------------")
+                # for plan_group in tmp_new_plan_groups:
+                #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+
+
+            new_plan_groups = tmp_new_plan_groups
+            if len(new_plan_groups) == 0:
+                break
+
+
+        # print(f"in get_candidate_plan_groups: the plan groups we generated: ")
+        # for plan_group in tot_plan_groups:
+        #     print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group]}")
+
+
+
+        # convert plan_groups to MyExecPlanGroup objects
+        # plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
+        #                 check_gap=check_gap, sort_input=sort_input,) \
+        #             for plan_group in tot_plan_groups if len(plan_group) > 0]
+
+        plan_groups = [_[1] for _ in good_plan_group_dict.values()]
+
+        return plan_groups
+
+
+
+
+
+
+
+
+
     def get_candidate_plan_groups_greedy_baseline_adapted_from_MuxServe_best_model_first(
         self, 
         gen_execplans_baseline:str,
@@ -3679,6 +5018,7 @@ class MyModelSystem:
         """
         new_plan_groups = [[]]
         checked_model_ids = list()
+        base_model_finish_status = self.get_base_model_finish_status()
         while True:
             cand_plan_group = new_plan_groups[0]
             running_model_ids = [exec_plan.model.model_id for exec_plan in cand_plan_group]
@@ -3710,7 +5050,7 @@ class MyModelSystem:
         
         # convert plan_groups to MyExecPlanGroup objects
         plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
-                        check_gap=check_gap, sort_input=sort_input) \
+                        check_gap=check_gap, sort_input=sort_input, base_model_finish_status=base_model_finish_status) \
                     for plan_group in new_plan_groups if len(plan_group) > 0]
         return plan_groups
 
@@ -3754,8 +5094,9 @@ class MyModelSystem:
                 break
         
         # convert plan_groups to MyExecPlanGroup objects
+        base_model_finish_status = self.get_base_model_finish_status()
         plan_groups = [MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
-                        check_gap=check_gap, sort_input=sort_input) \
+                        check_gap=check_gap, sort_input=sort_input, base_model_finish_status=base_model_finish_status) \
                     for plan_group in new_plan_groups if len(plan_group) > 0]
         return plan_groups
 
@@ -3852,7 +5193,7 @@ def is_valid_exec_plan(exec_plan: MyExecPlan, cost_table: CostTable):
 
 
 def _get_possible_exec_plans(
-        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable):
+        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, fully_connected_gpu_unit:int):
     '''
     Get the possible execution plan for the model.
     Input:
@@ -3874,6 +5215,10 @@ def _get_possible_exec_plans(
     # enumerate possible tensor parallel degrees (i.e., parallel worker numbers)
     for i in range(int(math.log(tot_gpu_num, 2)+1)):
         num_worker = 2**i
+
+        # 0. we assume if num_worker > fully_connected_gpu_unit, the tensor parallelism will be extremely slow
+        if num_worker > fully_connected_gpu_unit:
+            continue
 
         # 1. first get necessary engine args
         if (model.model_path, num_worker) not in _ENGINE_ARGS_LIST:
@@ -3902,6 +5247,8 @@ def _get_possible_exec_plans(
             #     param_byte_per_layer * (model.layer_num - wld_degree + 2)
             param_byte_per_comp_gpu = extra_byte + \
                 param_byte_per_layer * (model.layer_num - wld_degree + 2)
+
+            print(f"param_byte_per_comp_gpu: {param_byte_per_comp_gpu/1024/1024/1024}, byte_per_gpu: {byte_per_gpu/1024/1024/1024}")
 
             # TODO (jingzhi): we allow different possoble cache_gpu_num? strange
             for cache_gpu_num in range(tot_gpu_num-num_worker+1):
@@ -3971,7 +5318,7 @@ def _get_possible_exec_plans(
 # Change the default version to the version where dp_size can be any value.
 # 但是其实两种思路都有测试的价值，说到底关键还是我们的cost model发挥了作用，没有cost model的话或许就真的只能选择dp_size=1的这种可能
 def _get_possible_exec_plans_naive_baseline_1(
-        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool):
+        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool, fully_connected_gpu_unit:int):
     '''
     Get the possible execution plan for the model.
     Input:
@@ -3991,6 +5338,8 @@ def _get_possible_exec_plans_naive_baseline_1(
     
 
     num_worker = tot_gpu_num
+    # we assume if num_worker > fully_connected_gpu_unit, the tensor parallelism will be extremely slow
+    num_worker = fully_connected_gpu_unit
 
     # 1. first get necessary engine args
     if (model.model_path, num_worker) not in _ENGINE_ARGS_LIST:
@@ -4018,6 +5367,7 @@ def _get_possible_exec_plans_naive_baseline_1(
     mem_per_comp_gpu = 0.9
     param_byte_per_cache_gpu = 0
     dp_size = 1
+    dp_size = tot_gpu_num//num_worker
 
     exec_plan = MyExecPlan(model,
         num_worker, wld_degree, cache_gpu_num, mem_per_comp_gpu, dp_size,
@@ -4041,7 +5391,7 @@ def _get_possible_exec_plans_naive_baseline_1(
 
 
 def _get_possible_exec_plans_naive_baseline(
-        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool):
+        model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable, sort_input: bool, fully_connected_gpu_unit:int):
     '''
     Get the possible execution plan for the model.
     Input:
@@ -4063,6 +5413,10 @@ def _get_possible_exec_plans_naive_baseline(
     # enumerate possible tensor parallel degrees (i.e., parallel worker numbers)
     for i in range(int(math.log(tot_gpu_num, 2)+1)):
         num_worker = 2**i
+
+        # 0. we assume if num_worker > fully_connected_gpu_unit, the tensor parallelism will be extremely slow
+        if num_worker > fully_connected_gpu_unit:
+            continue
 
         # 1. first get necessary engine args
         if (model.model_path, num_worker) not in _ENGINE_ARGS_LIST:
@@ -4150,9 +5504,13 @@ def _get_possible_exec_plans_naive_baseline(
     
     # compute the latency for each exec plan
     # consider the max data parallel worker latency
+    for exec_plan in exec_plans:
+        exec_plan.get_max_dp_latency(cost_table, sort_input)
+        
     exec_plans = sorted(exec_plans, \
         key=lambda exec_plan: \
-            exec_plan.get_max_dp_latency(cost_table, sort_input)+\
+            # exec_plan.get_max_dp_latency(cost_table, sort_input)+\
+            exec_plan.wait_for_remote_fake_scheduling_and_get_max_dp_latency()+\
                 cost_table.get_prepare_cost(model.model_name, exec_plan.get_key_single_dp_worker())
     )
     exec_plans = [exec_plans[0]]
@@ -4166,7 +5524,7 @@ def _get_possible_exec_plans_naive_baseline(
 
 def get_possible_exec_plans(
         model: MyModelInfor, tot_gpu_num, byte_per_gpu, cost_table: CostTable,
-        baseline: str, sort_input: bool):
+        baseline: str, sort_input: bool, fully_connected_gpu_unit:int):
     '''
     Get the possible execution plan for the model.
     Input:
@@ -4176,10 +5534,10 @@ def get_possible_exec_plans(
             (num_worker, wld_degree, cache_gpu_num, mem_per_comp_gpu, param_byte_per_comp_gpu, param_byte_per_cache_gpu).
     '''
     if baseline == 'ours':
-        return _get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table)
+        return _get_possible_exec_plans(model, tot_gpu_num, byte_per_gpu, cost_table, fully_connected_gpu_unit)
     else:
-        # return _get_possible_exec_plans_naive_baseline_2(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input)
-        return _get_possible_exec_plans_naive_baseline(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input)
+        # return _get_possible_exec_plans_naive_baseline_2(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input, fully_connected_gpu_unit)
+        return _get_possible_exec_plans_naive_baseline(model, tot_gpu_num, byte_per_gpu, cost_table, sort_input, fully_connected_gpu_unit)
 
 
 
@@ -4383,36 +5741,46 @@ def _can_be_fused_vertically_linear_dependency(plan_group: List[MyExecPlan], to_
 def _get_path_key(plan_group:List[MyExecPlan], exec_plan):
     """
         Get the information of all models that exec_plan depends directly or indirectly on in the current plan_group.
+        TODO: 这个地方好像有点问题，因为我们应该是支持了fuse 两个 还没有开始inference的fused model了。
+        ==> 
+        诶，好像这个问题还是没有被解决。但是我们现在已经不会在搜索一个stage的exec plan group的时候考虑vertically fuse model了，所以暂时先不用管。
+        Output: path_key and the related plans.
     """
     inp_model_ids = sorted(exec_plan.model.input_model_ids)
     key = list()
+    key_plans = list()
     for inp in inp_model_ids:
         for plan in plan_group:
             if (inp == plan.model.model_id) or (inp in plan.model.get_base_model_ids()):
                 # key.append((inp, tuple(plan.model.get_base_model_ids()), plan.get_key() ))
                 # NOTE: it seems we do not need to store the model_id itself in the key
                 key.append(( tuple(plan.model.get_base_model_ids()), plan.get_key() ))
+                key_plans.append(plan)
                 break
     # add the key part for exec_plan
     # key.append(( exec_plan.model.model_id, tuple(exec_plan.model.get_base_model_ids()), exec_plan.get_key() ))
     key.append(( tuple(exec_plan.model.get_base_model_ids()), exec_plan.get_key() ))
-    return tuple(key)
+    key_plans.append(exec_plan)
+    return tuple(key), key_plans
 
 
 
 def _update_good_plan_group_dict(
+        group_obj: MyExecPlanGroup,
         cost_table: CostTable,
-        check_gap: int, sort_input: bool,
-        last_stage_exec_plans: List[MyExecPlan],
-        plan_group: List[MyExecPlan], good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]], 
+        # check_gap: int, sort_input: bool,
+        # last_stage_exec_plans: List[MyExecPlan],
+        # plan_group: List[MyExecPlan], 
+        good_plan_group_dict: Dict[Tuple[List[int], int], Tuple[float, MyExecPlanGroup]], 
     ) -> Optional[Tuple[List[int], int]]:
     """
         Return None if the given plan group is not good enough, else return the input plan_group key.
     """
 
-    # 1. get MyExecPlanGroup based on plan_group
-    group_obj = MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
-                    check_gap=check_gap, sort_input=sort_input,)
+    # # 1. get MyExecPlanGroup based on plan_group
+    # group_obj = MyExecPlanGroup(plan_group, cost_table=cost_table, last_stage_exec_plans=last_stage_exec_plans,
+    #                 check_gap=check_gap, sort_input=sort_input,)
+    group_obj.wait_remote_fake_scheduling_to_compute_infer_stage_data(cost_table=cost_table)
     
     # 2. get key in good_plan_group_dict
     # NOTE: here we regard fused models and base models as the same if their base model sets are the same
@@ -4424,8 +5792,9 @@ def _update_good_plan_group_dict(
 
     # 3. check whether this plan group is good
     ret = key
+    group_to_print = f"{len(group_obj.exec_plans)}, {[(tuple(plan.model.get_base_model_ids()), plan.get_key()) for plan in group_obj.exec_plans]}"
     if key not in good_plan_group_dict:
-        print(f"key not in good_plan_group_dict: {key}-{group_obj.get_throughput()}")
+        print(f"key not in good_plan_group_dict: {key}-{group_obj.get_throughput()}: {group_to_print}")
         good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
     else:
         if (group_obj.get_throughput() > good_plan_group_dict[key][0]) or \
@@ -4435,10 +5804,10 @@ def _update_good_plan_group_dict(
             # 2. (2.1) their throughputs are the same and (2.2) the new group has fewer exec plans, 
             # i.e., we prefer fusing models rather than model-level pipeline parallelism.
             good_plan_group_dict[key] = (group_obj.get_throughput(), group_obj)
-            print(f"key in good_plan_group_dict, update: {key}-{group_obj.get_throughput()}")
+            print(f"key in good_plan_group_dict, update: {key}-{group_obj.get_throughput()}: {group_to_print}")
         else:
             ret = None
-            print(f"key in good_plan_group_dict, discard: ori-{key}-{good_plan_group_dict[key][0]} vs new-{group_obj.get_throughput()}")
+            print(f"key in good_plan_group_dict, discard: ori-{key}-{good_plan_group_dict[key][0]} vs new-{group_obj.get_throughput()}: {group_to_print}")
 
     return ret
 
@@ -4461,6 +5830,32 @@ def _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids: List[int], model_i
     # cond2 = (sorted(to_fuse_inp_base_model_ids) == sorted(model_ids_fused))
     cond2 = sorted(to_fuse_inp_base_model_ids) == sorted(fused_model_inp_base_model_ids+model_ids_fused)
     return (cond1 or cond2)
+
+
+
+def _get_vertical_fuse_model_pairs_topology_level(plan_group: List[MyExecPlan], to_fuse: MyExecPlan):
+    to_fuse_inp_base_model_ids = to_fuse.get_base_models()[0].inp_base_model_ids
+    for plan_i, plan in enumerate(plan_group):
+        if _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids, 
+                                         model_ids_fused=plan.get_base_model_ids(), 
+                                         fused_model_inp_base_model_ids=plan.get_base_models()[0].inp_base_model_ids):
+            # to_fuse directly depend on the last exec_plan in the plan (which may be fused)
+            if plan.model.get_name() == to_fuse.model.get_name():
+                return plan.model
+    return None
+
+
+def _get_vertical_fuse_model_pairs(plan_group: List[MyExecPlan], to_fuse: MyExecPlan):
+    to_fuse_inp_base_model_ids = to_fuse.get_base_models()[0].inp_base_model_ids
+    for plan_i, plan in enumerate(plan_group):
+        if _meet_vertical_fuse_condition(to_fuse_inp_base_model_ids, 
+                                         model_ids_fused=plan.get_base_model_ids(), 
+                                         fused_model_inp_base_model_ids=plan.get_base_models()[0].inp_base_model_ids):
+            # to_fuse directly depend on the last exec_plan in the plan (which may be fused)
+            if plan.model.get_name() == to_fuse.model.get_name():
+                if plan.get_key() == to_fuse.get_key():
+                    return plan.model
+    return None
 
 
 
@@ -4543,13 +5938,41 @@ def _can_be_fused_vertically(plan_group: List[MyExecPlan], to_fuse: MyExecPlan, 
 
 
 
+def _update_plan_group_consider_new_inp_for_horizontally_fused_models(
+        plan_group: List[MyExecPlan], new_exec_plan: MyExecPlan, in_stage_out_edge_dict: Dict[int, List[int]],
+        uniq_exec_plan_mapping):
+    """
+        If there are horizontally fused models in plan_group, the new_exec_plan may be a new inp for it, so we may need to instantiate a new plan for it.
+    """
+    affected_model_ids = list()
+    newly_add = [new_exec_plan.model.model_id]
+    while True:
+        tmp_newly_add = list()
+        for model_id in newly_add:
+            tmp_newly_add.extend(in_stage_out_edge_dict[model_id])
+            affected_model_ids.extend(in_stage_out_edge_dict[model_id])
+        newly_add = tmp_newly_add
+        if len(newly_add) == 0:
+            break
 
+    # now we get all the affected model ids
+    new_plan_group = list()
+    for plan in plan_group:
+        exec_plan_to_use = plan
+        if plan.model.model_id in affected_model_ids:
+            # we should instantiate a new plan here because the model's inp arrive times have changed
+            path_key, path_plans = _get_path_key(plan_group, plan)
+            exec_plan_to_use = plan.copy_the_plan()
+            uniq_exec_plan_mapping[path_key] = exec_plan_to_use, path_plans
+        new_plan_group.append(exec_plan_to_use)
+    return new_plan_group
 
 
 
 
 # support vertical fusion of models
-def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping):
+def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping, good_runnable_exec_plan_keys_list,
+                      in_stage_out_edge_dict: Dict[int, List[int]]):
     '''
     Get all the possible exec plans with depth-first search.
     The initial plan_groups is [[]], i.e., containing a group with no exec plan.
@@ -4567,39 +5990,58 @@ def _append_exec_plan(plan_groups, exec_plans_list, depth_i, tot_gpu_num, byte_p
 
         for exec_plan in exec_plans_list[depth_i]:
 
-            # check whether we need to copy a new exec plan
-            path_key = _get_path_key(plan_group, exec_plan)
-            # print(f"path_key: {path_key},    exec_plan: {str(exec_plan)}")
-            exec_plan_to_use = None
-            if path_key in uniq_exec_plan_mapping:
-                exec_plan_to_use = uniq_exec_plan_mapping[path_key]
-                # print(f"Reuse exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
-            else:
-                # exec_plan_to_use = copy.deepcopy(exec_plan)
-                exec_plan_to_use = exec_plan.copy_the_plan()
-                uniq_exec_plan_mapping[path_key] = exec_plan_to_use
-                # print(f"New exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
-
-
             # support vertical fusion
             # check whether this plan can be fused vertically with its inp exec plan
-            new_plan_groups = new_plan_groups+_can_be_fused_vertically(plan_group, exec_plan_to_use, uniq_exec_plan_mapping)
+            # new_plan_groups = new_plan_groups+_can_be_fused_vertically(plan_group, exec_plan_to_use, uniq_exec_plan_mapping)
+
+            # !NOTE: 1. to reduce the search space, we do not consider vertical fusion here, and 
+            # !NOTE: 2. if a model satisfy the vertical fusion condition, we do not consider the model-level parallel here.
+            if _get_vertical_fuse_model_pairs_topology_level(plan_group, exec_plan)!=None:
+                continue
+
 
             if get_tot_worker_num(plan_group) == tot_gpu_num:
                 # no model can be added
                 continue
 
-            tmp_plan_group = plan_group + [exec_plan_to_use]
+            if exec_plan.get_key() not in good_runnable_exec_plan_keys_list[depth_i]:
+                # this exec plan is pruned
+                continue
+
+
+
+            tmp_plan_group = plan_group + [exec_plan]
             # check valid
             # print(f"uniq_exec_plan_mapping: {[(k,str(v)) for k,v in uniq_exec_plan_mapping.items()]}")
             # print(f"checking plan group: {[str(_) for _ in tmp_plan_group]}")
             if is_valid_exec_plan_combination(tmp_plan_group, tot_gpu_num, byte_per_gpu):
+
+                # check whether we need to copy a new exec plan
+                path_key, path_plans = _get_path_key(plan_group, exec_plan)
+                # print(f"path_key: {path_key},    exec_plan: {str(exec_plan)}")
+                exec_plan_to_use: MyExecPlan = None
+                if path_key in uniq_exec_plan_mapping:
+                    exec_plan_to_use, path_plans = uniq_exec_plan_mapping[path_key]
+                    # print(f"Reuse exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+                else:
+                    # exec_plan_to_use = copy.deepcopy(exec_plan)
+                    exec_plan_to_use = exec_plan.copy_the_plan()
+                    uniq_exec_plan_mapping[path_key] = exec_plan_to_use, path_plans
+                    # print(f"New exec plan: {str(exec_plan_to_use), exec_plan_to_use.model.model_id}")
+
+
+                plan_group_to_use = _update_plan_group_consider_new_inp_for_horizontally_fused_models(
+                    plan_group, exec_plan_to_use, in_stage_out_edge_dict,
+                    uniq_exec_plan_mapping)
+
+                tmp_plan_group = plan_group_to_use + [exec_plan_to_use]
                 new_plan_groups.append(tmp_plan_group)
 
                 # print(f"valid")
 
     plan_groups.extend(new_plan_groups)
-    _append_exec_plan(plan_groups, exec_plans_list, depth_i+1, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping)
+    _append_exec_plan(plan_groups, exec_plans_list, depth_i+1, tot_gpu_num, byte_per_gpu, uniq_exec_plan_mapping, good_runnable_exec_plan_keys_list, 
+                      in_stage_out_edge_dict)
 
 
 
@@ -4677,7 +6119,8 @@ def get_one_stage_exec_plans_sorted(
         cost_table: CostTable,
         model_sys: MyModelSystem, 
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
-        top_k=float('inf')):
+        top_k=float('inf'),
+        fully_connected_gpu_unit:int=4):
     '''
     Get a set of exec plans which can work corrently on the given multi-GPU environment.
     '''
@@ -4698,12 +6141,12 @@ def get_one_stage_exec_plans_sorted(
     
     # allow models with dependency to be selected into the same group
     plan_groups = model_sys.get_candidate_plan_groups(
-        gen_execplans_baseline, check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num, byte_per_gpu, top_k)
+        gen_execplans_baseline, check_gap, sort_input, last_stage_exec_plans, cost_table, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
     
 
     print(f"in get_one_stage_exec_plans_sorted: the plan groups we generated: ")
     for plan_group in plan_groups:
-        print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group.exec_plans]}")
+        print(f"{len(plan_group)}, {[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plan_group.exec_plans], plan_group.get_throughput()}")
 
 
     # print(f"\nfinish plan group gen\n")
@@ -5026,7 +6469,8 @@ def _get_best_model_schedule(
         best_group_seq: MyExecPlanGroupSeq, 
         uniq_model_states: dict,
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3),
-        top_k=float('inf'),):
+        top_k=float('inf'),
+        fully_connected_gpu_unit:int=4):
     '''
     Input: 
         model_list: (model_name, flops_per_token, (layer_num, param_byte_per_layer, extra_param_byte)).
@@ -5054,7 +6498,10 @@ def _get_best_model_schedule(
     if len(curr_group_seq.plan_group_seq) > model_sys.get_model_num():
         # assert False, f'{[model.left_flops_per_token for model in model_list]},'\
         #             f'{[[str(_) for _ in group] for group in curr_group_seq]}'
-        assert False, f'{[[str(_) for _ in group.exec_plans] for group in curr_group_seq.plan_group_seq]}'
+        # assert False, f'{[[(_.get_base_model_ids(), _.get_key()) for _ in group.exec_plans] for group in curr_group_seq.plan_group_seq]}'
+        print(f"too many stages: {[[(_.get_base_model_ids(), _.get_key()) for _ in group.exec_plans] for group in curr_group_seq.plan_group_seq]}")
+        return 
+
 
 
     print(f"finish step 1:      curr depth is within limit")
@@ -5071,7 +6518,8 @@ def _get_best_model_schedule(
         # update best plan seq info
         # print(f"curr_plan_seq return: {curr_plan_seq}")
         if curr_group_seq.get_tot_time() < best_group_seq.get_tot_time():
-            best_group_seq.set_plan_group_and_time(curr_group_seq.plan_group_seq, curr_group_seq.time_seq)
+            best_group_seq.set_plan_group_and_time(
+                curr_group_seq.plan_group_seq, curr_group_seq.time_seq, curr_group_seq.last_stage_model_sys_values_seq)
         return 
     # 
 
@@ -5120,7 +6568,7 @@ def _get_best_model_schedule(
         gen_execplans_baseline,
         check_gap, sort_input,
         curr_group_seq.get_last_stage_exec_plans(),
-        cost_table, model_sys, gpu_name, tot_gpu_num, byte_per_gpu, top_k)
+        cost_table, model_sys, gpu_name, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
     # # ori_left_flops = [model.get_left_flops_per_token() for model in model_list]
     # # ori_left_seqlens = [model.get_remaining_seqlens() for model in model_list]
     # ori_inp_out_lens_list = [model.get_inp_out_seqlens() for model in model_list]
@@ -5160,6 +6608,59 @@ def _get_best_model_schedule(
         if len(plan_group) == 0:
             continue
 
+        # !NOTE: before further checking below, we need to first consider whether this plan_group has models 
+        # that need to be fused vertically with the previous-step models
+        if (len(curr_group_seq.plan_group_seq) > 0):
+            print(f"curr_group_seq.plan_group_seq.exec_plans: {[[(plan.model.get_base_model_ids(), plan.get_key()) for plan in plans.exec_plans] for plans in curr_group_seq.plan_group_seq]}")
+            model_pairs_to_fuse: List[Tuple[MyModelInfor, MyModelInfor]] = [[_get_vertical_fuse_model_pairs(
+                curr_group_seq.plan_group_seq[-1].exec_plans, plan), plan.model] for plan in plan_group.exec_plans]
+            model_pairs_to_fuse = [model_pairs for model_pairs in model_pairs_to_fuse if model_pairs[0]!=None]
+            
+            print(f"model_pairs_to_fuse: {[(i.get_base_model_ids(), j.get_base_model_ids()) for i, j in model_pairs_to_fuse]}")
+            
+            if len(model_pairs_to_fuse) > 0:
+
+                print(f"\nVERTICAL FUSE AND TAKE 1 STEP BACK!\n")
+
+                # we need to take 1 step back, fuse the models, and then do the search
+                # 1. first take 1 step back
+                last_stage_plan_group, last_stage_time, last_stage_model_sys_values = curr_group_seq.get_last_stage()
+                last_ori_inp_out_lens_list, last_ori_remaining_decode_flops_list, \
+                    last_ori_inp_seq_ids_list, last_ori_inp_model_ids_list, \
+                    last_ori_model_sys = last_stage_model_sys_values
+                model_sys = last_ori_model_sys
+                model_sys.recover_model_state(
+                    last_ori_inp_seq_ids_list,last_ori_inp_out_lens_list, cost_table, last_ori_remaining_decode_flops_list,
+                    last_ori_inp_model_ids_list)
+                
+                # 2. fuse the models
+                fused_model_list: List[MyFusedModelInfor] = [MyFusedModelInfor(
+                    list(model1.get_base_models())+list(model2.get_base_models())
+                    ) for model1, model2 in model_pairs_to_fuse]
+                model_sys = model_sys.gen_new_model_sys_with_fused_models(
+                    fused_model_list=fused_model_list)
+
+                print(f"fused_model_list: {[_.get_base_model_ids() for _ in fused_model_list]}")
+                
+
+                # 3. do the search
+                curr_group_seq.pop_one_stage()
+                _get_best_model_schedule(
+                    gen_execplans_baseline,
+                    check_gap, sort_input,
+                    cost_table,
+                    model_sys, curr_group_seq, best_group_seq, uniq_model_states, gpu_name, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
+                curr_group_seq.append_plan_group(last_stage_plan_group)
+                curr_group_seq.append_exec_time(last_stage_time)
+                curr_group_seq.append_last_stage_model_sys_values(last_stage_model_sys_values)
+                continue
+
+            
+
+
+        # we first recover the ori model sys
+        model_sys = ori_model_sys
+
         # TODO: 这个地方在考虑了extra preparation cost之后可能要修改-->已经改成了不考虑extra cost的近似throughput，是一个会偏高的估计
         # if avg valid throughput of adding plan_group to current group seq is lower than the current_group_seq's throughput, skip it
         # if curr_group_seq.get_tmp_throughput_after_adding_a_plan_group(plan_group) \
@@ -5169,8 +6670,7 @@ def _get_best_model_schedule(
                  < best_group_seq.get_valid_throughput()):
             continue
 
-        # we first recover the ori model sys
-        model_sys = ori_model_sys
+
         
         # update the remaining workload of all models after this stage
         # recover_model_state(model_list, ori_inp_out_lens_list, cost_table, ori_remaining_decode_flops_list)
@@ -5197,13 +6697,20 @@ def _get_best_model_schedule(
         # check inp out len accuracy
         model_sys.check_finish_states_accuracy()
 
+
+        # only when we apply a plan group update to the system, we update last_iter_model_sys_values
+        new_iter_model_sys_values = \
+                ori_inp_out_lens_list, ori_remaining_decode_flops_list, \
+                    ori_inp_seq_ids_list, ori_inp_model_ids_list, \
+                    ori_model_sys
         curr_group_seq.append_plan_group(plan_group)
         curr_group_seq.append_exec_time(plan_group.get_infer_stage_latency())
+        curr_group_seq.append_last_stage_model_sys_values(new_iter_model_sys_values)
         _get_best_model_schedule(
             gen_execplans_baseline,
             check_gap, sort_input,
             cost_table,
-            model_sys, curr_group_seq, best_group_seq, uniq_model_states, gpu_name, tot_gpu_num, byte_per_gpu, top_k)
+            model_sys, curr_group_seq, best_group_seq, uniq_model_states, gpu_name, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
         curr_group_seq.pop_one_stage()
     # print(f"best_group_seq: {best_group_seq}")
 
@@ -5264,7 +6771,8 @@ def _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
         # update best plan seq info
         # print(f"curr_plan_seq return: {curr_plan_seq}")
         if curr_group_seq.get_tot_time() < best_group_seq.get_tot_time():
-            best_group_seq.set_plan_group_and_time(curr_group_seq.plan_group_seq, curr_group_seq.time_seq)
+            best_group_seq.set_plan_group_and_time(
+                curr_group_seq.plan_group_seq, curr_group_seq.time_seq, curr_group_seq.last_stage_model_sys_values_seq)
         return 
     # 
 
@@ -5411,7 +6919,7 @@ def _get_best_model_schedule_dispatcher(
         curr_group_seq: MyExecPlanGroupSeq, 
         best_group_seq: MyExecPlanGroupSeq, 
         uniq_model_states: dict,
-        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), top_k=float('inf'),):
+        gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), top_k=float('inf'), fully_connected_gpu_unit: int=4):
     '''
     Input: 
         model_list: (model_name, flops_per_token, (layer_num, param_byte_per_layer, extra_param_byte)).
@@ -5427,7 +6935,7 @@ def _get_best_model_schedule_dispatcher(
             curr_group_seq, 
             best_group_seq, 
             uniq_model_states,
-            gpu_name, tot_gpu_num, byte_per_gpu, top_k)
+            gpu_name, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
     else:
         assert False, "ERROR: we currently do not support greedy search algorithm"
         _get_best_model_schedule_greedy_baseline_adapted_from_MuxServe(
@@ -5438,7 +6946,7 @@ def _get_best_model_schedule_dispatcher(
             curr_group_seq, 
             best_group_seq, 
             uniq_model_states,
-            gpu_name, tot_gpu_num, byte_per_gpu)        
+            gpu_name, tot_gpu_num, byte_per_gpu, fully_connected_gpu_unit)        
 
 
 
@@ -5626,6 +7134,9 @@ def get_model_info_objs(
         inp_lens_dict: Dict[str, List[int]],
         model_paths: List[str], 
         inp_seq_ids_dict: Dict[int, int],
+        inp_req_from_which_models: Dict[int, Dict[int, List[int]]], 
+        independent_srcs: Dict[int, bool],
+        # 
         outlen_generator,
         # edge_dict: Dict[int, List[int]],
         sample_config: Tuple[float, float, float, float], 
@@ -5636,11 +7147,14 @@ def get_model_info_objs(
             inp_seq_ids_dict: stores the ids of the inp seqs each model needs to answer. 
                 Support the chain summary case where each LLM stage has different number of inp reqs.
             inp_lens_dict: dict of {model_path: inp_lens}
+            1. inp_req_from_which_models: store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
     '''
     # out_lens_dict = {model_path: output_length_sampler.sample_out_len_for_given_model(
     #         model=model_path[model_path.find('/')+1:], inp_lens=inp_lens) for model_path in set(model_paths)}
-    out_lens_dict = {model_path: outlen_generator(
-            model_path[model_path.find('/')+1:], inp_lens_dict[model_path]) for model_path in set(model_paths)}
+    # out_lens_dict = {model_path: outlen_generator(
+    #         model_path[model_path.find('/')+1:], inp_lens_dict[model_path]) for model_path in set(model_paths)}
+    out_lens_dict = {i: outlen_generator(
+            model_path[model_path.find('/')+1:], inp_lens_dict[i]) for i, model_path in enumerate(model_paths)}
 
     # try to use the output lengths set by the SharedGPT dataset
     # out_lens_dict = {model_path: get_outlens()  for model_path in set(model_paths)}
@@ -5652,9 +7166,12 @@ def get_model_info_objs(
                 outlen_generator,
                 sample_config, trust_remote_code, revision,
                 data_byte, # the number of bytes to store a value in model weights or intermediate tensors
-                inp_lens_dict[model_path],
-                out_lens=out_lens_dict[model_path],
-                inp_seq_ids=inp_seq_ids_dict[model_id]
+                inp_lens_dict[model_id], #[model_path],
+                out_lens=out_lens_dict[model_id], #[model_path],
+                inp_seq_ids=inp_seq_ids_dict[model_id],
+                # 
+                inp_req_from_which_models=inp_req_from_which_models[model_id] if model_id in inp_req_from_which_models else None, 
+                independent_srcs=independent_srcs[model_id] if model_id in independent_srcs else False,
                 # input_model_ids=edge_dict[model_id],
             ) for model_id, model_path in enumerate(model_paths)]
 
@@ -5704,6 +7221,8 @@ def get_best_model_schedule(
         model_paths: List[str], 
         # 
         num_prompts, inp_seq_ids_dict, out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]], 
+        inp_req_from_which_models: Dict[int, Dict[int, List[int]]], 
+        independent_srcs: Dict[int, bool],
         inp_generator, inp_merger, outlen_generator,
         # 
         out_edge_dict: Dict[int, List[int]],
@@ -5711,7 +7230,7 @@ def get_best_model_schedule(
         trust_remote_code:bool=True, revision:Optional[str] = None,
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
         data_byte=2,
-        max_group_seq_num=float('inf'), top_k=float('inf'), similar_threshold: float=0.1):
+        max_group_seq_num=float('inf'), top_k=float('inf'), similar_threshold: float=0.1, fully_connected_gpu_unit:int=4):
     """
         NOTE: ``inp_generator``, ``inp_merger``, ``outlen_generator`` are 3 functions about model inp/out lens.
     """
@@ -5724,20 +7243,27 @@ def get_best_model_schedule(
     time1 = time.perf_counter()
 
     # 1. first initialize cost_table
-    cost_table = get_cost_table()
+    # cost_table = get_cost_table()
+    cost_table: CostTable = get_my_cost_table_directly.cost_table
+    global _COST_MODEL_REF
+    cost_model_serialized = cost_table.serialize(model_paths=model_paths)
+    print(f"np.asarray(cost_model_serialized[0][1]).nbytes: {np.asarray(cost_model_serialized[0][1]).nbytes}")
+    _COST_MODEL_REF = ray.put(cost_model_serialized)
 
     # 2. get input lengths
     # inp_lens = get_inplens()
     # inp_lens = inp_generator(num_prompts)
     # print(f"len(inp_lens): {len(inp_lens)}")
-    inp_lens_dict = {model_path:inp_generator(num_prompts,model_path) for model_path in set(model_paths)}
+    # inp_lens_dict = {model_path:inp_generator(num_prompts,model_path,inp_seq_ids_dict[]) for model_path in set(model_paths)}
+    inp_lens_dict = {i:inp_generator(num_prompts,model_path,inp_seq_ids_dict[i]) for i, model_path in enumerate(model_paths)}
     for k, v in inp_lens_dict.items():
-        print(f"len(inp_lens) of {k}: {v}")
+        print(f"len(inp_lens) of model {k}: {v}")
 
     # 3.  initialize model info objects and the model system object
     model_list: List[MyModelInfor] = get_model_info_objs(
         cost_table,
-        data_byte, inp_lens_dict, model_paths, inp_seq_ids_dict, outlen_generator, sample_config, trust_remote_code, revision)
+        data_byte, inp_lens_dict, model_paths, inp_seq_ids_dict, inp_req_from_which_models, independent_srcs, 
+        outlen_generator, sample_config, trust_remote_code, revision)
     
     model_sys = MyModelSystem(model_list=model_list, out_edge_dict=out_edge_dict, 
                               cost_table=cost_table, inp_merger=inp_merger, outlen_generator=outlen_generator,
@@ -5758,11 +7284,12 @@ def get_best_model_schedule(
     model_sys = model_sys.fuse_similar_models_in_a_chain(
             tot_gpu_num, byte_per_gpu, cost_table,
             check_gap, sort_input,
-            similar_threshold)
+            similar_threshold,
+            fully_connected_gpu_unit)
 
     total_flops = get_total_model_flops(model_list, cost_table)
-    curr_group_seq = MyExecPlanGroupSeq(total_flops, [], [])
-    best_group_seq = MyExecPlanGroupSeq(total_flops, [None], [float('inf')])    
+    curr_group_seq = MyExecPlanGroupSeq(total_flops, [], [], [])
+    best_group_seq = MyExecPlanGroupSeq(total_flops, [None], [float('inf')], [None])    
 
 
     time_before_search = time.perf_counter()
@@ -5771,12 +7298,13 @@ def get_best_model_schedule(
         search_method_baseline,
         gen_execplans_baseline, 
         check_gap, sort_input,
-        cost_table, model_sys, curr_group_seq, best_group_seq, dict(), gpu_name, tot_gpu_num, byte_per_gpu, top_k)
+        cost_table, model_sys, curr_group_seq, best_group_seq, dict(), gpu_name, tot_gpu_num, byte_per_gpu, top_k, fully_connected_gpu_unit)
     
     time2 = time.perf_counter()
     print(f"Total search time: {time2 - time1}")
     print(f"Total time for preparation before search: {time_before_search - time1}")
     print(f"Best group seq: {str(best_group_seq)}")
+    print(f"Best group seq throughputs: {best_group_seq.get_stage_throughputs()}")
 
     return best_group_seq
 
@@ -6184,7 +7712,8 @@ if __name__ == "__main__":
         data_byte=2,
         max_group_seq_num=100, # float('inf'),
         top_k=100, 
-        similar_threshold=0.1
+        similar_threshold=0.1,
+        fully_connected_gpu_unit=2
     )
 
 

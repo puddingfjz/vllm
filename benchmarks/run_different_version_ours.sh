@@ -432,7 +432,140 @@ CUDA_VISIBLE_DEVICES=4,7 python3 schedule_multi_model.py > test_end2end_schedule
 CUDA_VISIBLE_DEVICES=4,7 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1021_2gpu_1-chain_summary_naiveSearchSpace_1.log
 CUDA_VISIBLE_DEVICES=1,2,3,4 python3 schedule_multi_model.py > test_end2end_schedule/test_multi-level_system_1031_4gpu-general_ours_1.log
 
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_0.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 1 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 2 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_2.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 3 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_3.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 4 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_4.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 5 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_5.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 6 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_1_6.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_0.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 1 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 2 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_2.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 3 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_3.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 4 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_4.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 5 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_5.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 6 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_ours_10kreq_2_6.log
+
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_0.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 1 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 2 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_2.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 3 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_3.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 4 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_4.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 5 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_5.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 6 --ratio-set 1  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_1_6.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_0.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 1 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 2 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_2.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 3 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_3.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 4 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_4.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 5 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_5.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 6 --ratio-set 2  > test_end2end_schedule/test_11118gpu-router_naiveSearchSpace_V2_10kreq_2_6.log
+
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_ours_10kreq_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_naiveSearchSpace_V2_10kreq_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_ours_10kreq_2.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_naiveSearchSpace_V2_10kreq_2.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_ours_40G_10kreq_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_naiveSearchSpace_V2_40G_10kreq_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-chain-summary_ours_40G_10kreq_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-chain-summary_naiveSearchSpace_V2_40G_10kreq_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-chain-summary_ours_40G_1kreq_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-chain-summary_naiveSearchSpace_V2_40G_1kreq_1.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_ours_1kreq_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_11118gpu-general_naiveSearchSpace_V2_1kreq_1.log
+
+
+
+
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1003_2gpu_1-chainSummary-1.log
 python3 search_exec_plans.py >> test_search/test_multi-level_system_1009_2gpu_1-chainSummary-1.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+MODELS_TO_ROUTE_NAMES = {
+    "meta/llama-2-70b-chat": "Llama 70B",
+    "mistralai/mixtral-8x7b-chat": "Mixtral 8x7B",
+    "zero-one-ai/Yi-34B-Chat": "Yi 34B",
+    "WizardLM/WizardLM-13B-V1.2": "WizardLM 13B",
+    "meta/code-llama-instruct-34b-chat": "Code Llama 34B",
+    "mistralai/mistral-7b-chat": "Mistral 7B",
+}
+
+
+# new round experiments for RouterBench
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model meta-llama/Llama-2-70b-chat-hf --num-prompts 1 --enforce-eager -tp 2 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp1_Llama-2-70b-chat-hf.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model mistralai/Mixtral-8x7B-Instruct-v0.1  --num-prompts 1 --enforce-eager -tp 2 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp2_Mixtral-8x7B-Instruct-v0.1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model 01-ai/Yi-34B-Chat  --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_Yi-34B-Chat.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model chavinlo/alpaca-13b --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_alpaca_13b.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model project-baize/baize-v2-13b --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_baize_v2_13b.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model TheBloke/koala-13B-HF --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_koala_13B_HF.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model databricks/dolly-v2-12b --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_dolly_v2_12b.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model mosaicml/mpt-7b-chat --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_mpt_7b_chat.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset ShareGPT_V3_unfiltered_cleaned_split.json --model THUDM/chatglm3-6b --num-prompts 1 --enforce-eager -tp 4 --trust-remote-code -gpuratio 0.9 -wldegree 2 --ignore-eos> NEWROUND_end2end_test/baseline_tp4_chatglm3_6b.log
+
+
+
+
 
 

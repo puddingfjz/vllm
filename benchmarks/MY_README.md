@@ -155,8 +155,9 @@ ln -s /ssddata/jingzhi/.vscode-server_my/ .vscode-server
 
 
 # 之前把huggingface缓存的位置设成了 
-export HF_DATASETS_CACHE="/export/data/jingzhi/.cache/huggingface"
-
+export HF_DATASETS_CACHE=/export/data/jingzhi/.cache/huggingface/hub
+export TRANSFORMERS_CACHE=/export/data/jingzhi/.cache/huggingface/hub
+export HUGGINGFACE_HUB_CACHE=/export/data/jingzhi/.cache/huggingface/hub
 
 # 如果需要获得huggingface的access token
 #pip install "huggingface_hub[cli]"

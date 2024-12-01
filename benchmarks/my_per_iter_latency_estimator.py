@@ -27,7 +27,17 @@ class CostTable:
     def __init__(self, 
                  logfiles: List[Tuple[str, str]], 
                  prepInp_decode_logfiles: List[Tuple[str, str]], 
-                 model_infos: List[Tuple[str, bool, Optional[str]]]) -> None:
+                 model_infos: List[Tuple[str, bool, Optional[str]]],
+                 metadata=None
+                 ) -> None:
+        
+        if metadata != None:
+            self.prefill_table, self.decode_table,\
+                self.sample_prefill_table, self.sample_decode_table, \
+                self.prepInp_prefill_table, self.prepInp_decode_table, \
+                self.model_configs, self.prepare_cost_table = metadata
+            return
+
         # {(model_name, exec_plan), table for that model}; 
         # for specific model table: key of table: (seqnum), value of table: (flops, per-iter exec latency)
         self.prefill_table: Dict[Tuple[str, Any], Dict[int, List[Tuple[float, float]]]] = dict()
@@ -53,6 +63,87 @@ class CostTable:
 
 
 
+    def store_meta_data(self, filename: str):
+        
+        model_paths = [k[0] for k in self.prefill_table.keys()]
+        (prefill_table, decode_table,\
+         sample_prefill_table, sample_decode_table, \
+            prepInp_prefill_table, prepInp_decode_table, \
+                model_configs, prepare_cost_table) = self.serialize(model_paths=model_paths)
+        
+        with open(filename, 'w') as f:
+            f.write('import my_per_iter_latency_estimator\n')
+            # f.write('from collections import defaultdict\n')
+            f.write(f"prefill_table={prefill_table}\n")
+            f.write(f"decode_table={decode_table}\n")
+            f.write(f"sample_prefill_table={sample_prefill_table}\n")
+            f.write(f"sample_decode_table={sample_decode_table}\n")
+            f.write(f"prepInp_prefill_table={prepInp_prefill_table}\n")
+            f.write(f"prepInp_decode_table={prepInp_decode_table}\n")
+            f.write(f"model_configs={model_configs}\n")
+            f.write(f"prepare_cost_table={prepare_cost_table}\n")
+            f.write(f"cost_table = my_per_iter_latency_estimator.get_cost_table_from_serialized_data(prefill_table, decode_table,"\
+                "sample_prefill_table, sample_decode_table, "\
+                "prepInp_prefill_table, prepInp_decode_table, "\
+                "model_configs, prepare_cost_table)")
+        return 
+
+        def _to_dict(to_convert):
+            return {k:dict(v) for k,v in to_convert.items()}
+        
+        prefill_table=_to_dict(self.prefill_table)
+        decode_table=_to_dict(self.decode_table)
+        sample_prefill_table=_to_dict(self.sample_prefill_table)
+        sample_decode_table=_to_dict(self.sample_decode_table)
+        prepInp_prefill_table=_to_dict(self.prepInp_prefill_table)
+        prepInp_decode_table=_to_dict(self.prepInp_decode_table)
+
+        with open(filename, 'w') as f:
+            f.write('import my_per_iter_latency_estimator\n')
+            # f.write('from collections import defaultdict\n')
+            f.write(f"prefill_table={prefill_table}\n")
+            f.write(f"decode_table={decode_table}\n")
+            f.write(f"sample_prefill_table={sample_prefill_table}\n")
+            f.write(f"sample_decode_table={sample_decode_table}\n")
+            f.write(f"prepInp_prefill_table={prepInp_prefill_table}\n")
+            f.write(f"prepInp_decode_table={prepInp_decode_table}\n")
+            f.write(f"model_configs={self.model_configs}\n")
+            f.write(f"prepare_cost_table={self.prepare_cost_table}\n")
+            metadata = (prefill_table, decode_table,\
+                sample_prefill_table, sample_decode_table, \
+                prepInp_prefill_table, prepInp_decode_table, \
+                self.model_configs, self.prepare_cost_table)
+            f.write(f"metadata = {metadata}\n")
+            f.write(f"cost_table = my_per_iter_latency_estimator.CostTable([],[],[],metadata=metadata)\n")
+
+
+    def serialize(self, model_paths: List[str]):
+        def _to_list(to_convert, model_paths):
+            keys = [k for k in to_convert.keys() if k[0] in model_paths]
+            values = list()
+            for k in keys:
+                subdict = to_convert[k]
+                subvalues = list()
+                for a, b in subdict.items():
+                    subvalues.append((a, *(b[0]), *(b[1])))
+                    assert len(subvalues[-1]) == 5
+                values.append(subvalues)
+            return keys, values
+        
+        prefill_table=_to_list(self.prefill_table, model_paths)
+        decode_table=_to_list(self.decode_table, model_paths)
+        sample_prefill_table=_to_list(self.sample_prefill_table, model_paths)
+        sample_decode_table=_to_list(self.sample_decode_table, model_paths)
+        prepInp_prefill_table=_to_list(self.prepInp_prefill_table, model_paths)
+        prepInp_decode_table=_to_list(self.prepInp_decode_table, model_paths)
+        
+        return (prefill_table, decode_table,\
+                sample_prefill_table, sample_decode_table, \
+                prepInp_prefill_table, prepInp_decode_table, \
+                self.model_configs, self.prepare_cost_table)
+    
+
+        
 
 
 
@@ -662,6 +753,38 @@ def get_cost_table():
         prepInp_decode_logfiles=prepInp_decode_logfiles,
         model_infos=model_infos)
 
+    cost_table.store_meta_data(filename='get_my_cost_table_directly.py')
+
     return cost_table
 
     
+
+
+
+def get_cost_table_from_serialized_data(
+        prefill_table, decode_table,
+        sample_prefill_table, sample_decode_table, 
+        prepInp_prefill_table, prepInp_decode_table,
+        model_configs, prepare_cost_table):
+    def _to_dict(to_convert):
+        keys, values = to_convert
+        ret = dict()
+        for k, subvalues in zip(keys, values):
+            subdict = {a[0]: ((a[1], a[2]), (a[3], a[4])) for a in subvalues}
+            ret[k] = subdict
+        return ret
+    
+    prefill_table=_to_dict(prefill_table)
+    decode_table=_to_dict(decode_table)
+    sample_prefill_table=_to_dict(sample_prefill_table)
+    sample_decode_table=_to_dict(sample_decode_table)
+    prepInp_prefill_table=_to_dict(prepInp_prefill_table)
+    prepInp_decode_table=_to_dict(prepInp_decode_table)
+
+    metadata = (prefill_table, decode_table,\
+        sample_prefill_table, sample_decode_table, \
+        prepInp_prefill_table, prepInp_decode_table, \
+        model_configs, prepare_cost_table)
+    cost_table = CostTable([],[],[],metadata=metadata)
+    
+    return cost_table
