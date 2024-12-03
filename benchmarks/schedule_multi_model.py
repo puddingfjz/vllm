@@ -444,6 +444,7 @@ def search_best_scheduling(
         top_k: int=100,
         similar_threshold: float=0.1,
         fully_connected_gpu_unit: int=4,
+        machine_name:str='lccpu',
     )->List[List[MyExecPlanState]]:
     
     # 1. first search the best scheduling
@@ -478,6 +479,7 @@ def search_best_scheduling(
         top_k=top_k,
         similar_threshold=similar_threshold,
         fully_connected_gpu_unit=fully_connected_gpu_unit,
+        machine_name=machine_name,
     )
 
 
@@ -1539,7 +1541,8 @@ def _search_best_scheduling_with_another_process(
         max_group_seq_num,
         top_k,
         similar_threshold,
-        fully_connected_gpu_unit
+        fully_connected_gpu_unit,
+        machine_name,
 ):
     print(f"in running _search_best_scheduling_with_another_process")
     with ProcessPoolExecutor(max_workers=1) as executor:
@@ -1564,7 +1567,8 @@ def _search_best_scheduling_with_another_process(
                     max_group_seq_num,
                     top_k,
                     similar_threshold,
-                    fully_connected_gpu_unit)
+                    fully_connected_gpu_unit,
+                    machine_name)
             done, not_done = wait([future])
             plan_state_group_list = list(done)[0].result()
             return plan_state_group_list
@@ -1599,6 +1603,7 @@ async def main_with_preemption(
         top_k: float = float('inf'),
         similar_threshold: float=0.1,
         fully_connected_gpu_unit: int = 4,
+        machine_name: str='lccpu',
 ):
     
     print(f"fully_connected_gpu_unit: {fully_connected_gpu_unit}")
@@ -1655,7 +1660,8 @@ async def main_with_preemption(
         max_group_seq_num = max_group_seq_num,
         top_k = top_k,
         similar_threshold=similar_threshold,
-        fully_connected_gpu_unit=fully_connected_gpu_unit)
+        fully_connected_gpu_unit=fully_connected_gpu_unit,
+        machine_name=machine_name)
     
 
     
@@ -2175,10 +2181,37 @@ def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
 
 
 
+def get_inplens_router_bench(req_num: int, model_path: str, inp_seq_ids: List[int]):
+    import json
+    inp_lens = list()
+    # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
+    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
+        prompt_dict = json.load(f)
+        prompts = prompt_dict[model_path]
+        # 
+        args = InferenceArgs(model=model_path, num_prompts=req_num)
+        from transformers import AutoTokenizer
+        # Sample the requests.
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code)
+        prompt_token_ids = tokenizer(prompts).input_ids
+        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+    
+
+    print(f"len(inp_lens):{len(inp_lens)}")
+    return inp_lens
+
+
+
 
 def _get_req_len_funcs(test_case:str):
     inp_generator, inp_merger, outlen_generator = None, None, None
-    if test_case in ['general', 'router']:
+    if test_case == 'router':
+        inp_generator = get_inplens_router_bench
+        inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+        outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+        outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
+    elif test_case == 'general':
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
@@ -2196,6 +2229,106 @@ def _get_req_len_funcs(test_case:str):
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
 
     return inp_generator, inp_merger, outlen_generator
+
+
+
+def _get_router_bench_data():
+    in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+        None, None, None, None, None
+
+    req_num = None
+    inp_seq_ids_dict = None
+    model_paths = None
+
+    # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
+    inp_req_ids = dict()
+    
+    # store information if the output of a model need to be merged to generate new out reqs
+    out_req_id_mapping = dict()
+    new_out_req_part_num = dict()
+    
+    # whether a base model's different input sources are independent or need to be merged, ...
+    independent_srcs = dict()
+    sampling_args_dict = dict()
+
+    # inp/out len generator functions for the general setting
+    model_paths = [
+        'meta-llama/Llama-2-70b-chat-hf',
+        'mistralai/Mixtral-8x7B-Instruct-v0.1',
+        'WizardLMTeam/WizardLM-13B-V1.2',
+        'meta-llama/CodeLlama-34b-Instruct-hf',
+        'mistralai/Mistral-7B-Instruct-v0.2',     
+    ]
+
+    # 1. 
+    in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
+
+
+
+    # 2. 
+    import json
+    prompt_dict = None
+    # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
+    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
+        prompt_dict = json.load(f)
+    
+    tot_inp_prompts = list()
+
+    inp_seq_ids_dict = dict()
+    req_num = 0
+    for i, model_path in enumerate(model_paths):
+        prompts = prompt_dict[model_path]
+        inp_seq_ids_dict[i] = list(range(req_num, req_num + len(prompts)))
+        inp_seq_ids_dict[-(i+1)] = list(range(req_num, req_num + len(prompts)))
+        req_num+=len(prompts)
+        tot_inp_prompts.extend(prompts)
+
+
+    print(f"new inp_seq_ids_dict: ")
+    for i, v in inp_seq_ids_dict.items():
+        print(f"model {i}, ratio: {len(v)/req_num}")
+
+
+    # 3. 
+    # inp_generator = get_inplens_router_bench
+    # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+    # # we control the max output length here
+    # outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+    
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router')
+    
+    node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
+                                    for i in range(len(model_paths))}
+
+
+    # 4. we need to prepare the dummpy requests here
+    _init_dummy_requests(None, tot_inp_prompts, model_path=model_paths[0])
+
+
+    # 5. 
+    independent_srcs = {i:False for i in range(len(model_paths))}
+
+    sampling_args2 = {                    
+        "n":1,
+        # <jingzhi> change to greedy sampling to check correctness.
+        "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+        "top_p":1.0,
+        "use_beam_search":False,
+        "ignore_eos":False, # False, # True (original),
+        "max_tokens":int(1e9)}
+    sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
+
+    print(f"\nreal model_paths: {model_paths}")
+    print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+    print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+    print(f"node_dataset_chunk_mapping: {node_dataset_chunk_mapping}")
+
+    check_gap = 16
+    sort_input = True
+
+    return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
 
 
 def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_set:int):
@@ -2216,7 +2349,9 @@ def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_s
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
     sampling_args_dict = dict()
-    if (test_case == 'general') or (test_case == 'router'):
+    if test_case == 'router':
+        return _get_router_bench_data()
+    elif (test_case == 'general'):
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
@@ -2790,7 +2925,8 @@ if __name__ == "__main__":
         top_k=20,
         similar_threshold=0.2,
         # NOTE: 1. for DSF servers: fully_connected_gpu_unit=2, for lccpus, fully_connected_gpu_unit=4.
-        fully_connected_gpu_unit=2))
+        fully_connected_gpu_unit=2,
+        machine_name='zxcpu'))
     # # asyncio.run(main_with_preemption_debug())
 
 

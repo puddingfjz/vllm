@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Dict, Union
 import itertools
 import fake_scheduling
 from my_per_iter_latency_estimator import CostTable, get_cost_table, get_cost_table_from_serialized_data
-import get_my_cost_table_directly
+import get_my_cost_table_directly, get_my_cost_table_directly_zxcpu
 import output_length_sampler
 
 from vllm.transformers_utils.config import get_config
@@ -40,7 +40,7 @@ class InferenceArgs:
         self.max_num_batched_tokens = scheduler_config.max_num_batched_tokens
 
         # !TODO: 暂时这么写，具体怎么改明天再说
-        self.max_num_batched_tokens = 8912
+        # self.max_num_batched_tokens = 8912
 
         self.max_seq_num = scheduler_config.max_num_seqs
         self.block_size=cache_config.block_size
@@ -7230,7 +7230,8 @@ def get_best_model_schedule(
         trust_remote_code:bool=True, revision:Optional[str] = None,
         gpu_name='A100-80G', tot_gpu_num = 4, byte_per_gpu=80*(1024**3), 
         data_byte=2,
-        max_group_seq_num=float('inf'), top_k=float('inf'), similar_threshold: float=0.1, fully_connected_gpu_unit:int=4):
+        max_group_seq_num=float('inf'), top_k=float('inf'), similar_threshold: float=0.1, fully_connected_gpu_unit:int=4, 
+        machine_name='lccpu'):
     """
         NOTE: ``inp_generator``, ``inp_merger``, ``outlen_generator`` are 3 functions about model inp/out lens.
     """
@@ -7244,7 +7245,12 @@ def get_best_model_schedule(
 
     # 1. first initialize cost_table
     # cost_table = get_cost_table()
-    cost_table: CostTable = get_my_cost_table_directly.cost_table
+    cost_table: CostTable = None
+    if machine_name == 'lccpu':
+        cost_table: CostTable = get_my_cost_table_directly.cost_table
+    elif machine_name == 'zxcpu':
+        cost_table: CostTable = get_my_cost_table_directly_zxcpu.cost_table
+    
     global _COST_MODEL_REF
     cost_model_serialized = cost_table.serialize(model_paths=model_paths)
     print(f"np.asarray(cost_model_serialized[0][1]).nbytes: {np.asarray(cost_model_serialized[0][1]).nbytes}")
@@ -7713,7 +7719,8 @@ if __name__ == "__main__":
         max_group_seq_num=100, # float('inf'),
         top_k=100, 
         similar_threshold=0.1,
-        fully_connected_gpu_unit=2
+        fully_connected_gpu_unit=2,
+        machine_name='lccpu',
     )
 
 

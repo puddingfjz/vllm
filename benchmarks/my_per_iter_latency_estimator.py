@@ -28,6 +28,7 @@ class CostTable:
                  logfiles: List[Tuple[str, str]], 
                  prepInp_decode_logfiles: List[Tuple[str, str]], 
                  model_infos: List[Tuple[str, bool, Optional[str]]],
+                 machine_name: str,
                  metadata=None
                  ) -> None:
         
@@ -57,7 +58,7 @@ class CostTable:
         for file_info in prepInp_decode_logfiles:
             self.init_prepInp_decode_table(*file_info)
         # 
-        self.init_prepare_cost()
+        self.init_prepare_cost(machine_name)
 
 
 
@@ -509,15 +510,21 @@ class CostTable:
         return model_name
 
 
-    def load_init_cost_from_database_file(self):
-        import model_initcost_database
-        model_init_costs = model_initcost_database.model_init_costs
+    def load_init_cost_from_database_file(self, machine_name:str):
+        model_init_costs = None
+        if machine_name == 'lccpu':
+            import model_initcost_database
+            model_init_costs = model_initcost_database.model_init_costs
+        elif machine_name == 'zxcpu':
+            import model_initcost_database
+            model_init_costs = model_initcost_database.model_init_costs
+        
         for (model_path, tp_size), init_cost in model_init_costs.items():
             model_name = self.get_model_name_from_model_path(model_path)
             self.prepare_cost_table[(model_name, (tp_size, 0.9, 2, 0))] = init_cost
 
 
-    def init_prepare_cost(self):
+    def init_prepare_cost(self, machine_name:str):
         # self.prepare_cost_table
         # we first prepare some hard data here, and we will update the table later.
         self.prepare_cost_table[('Llama-2-7b-hf', (1, 0.9, 2, 0))] = 3.7
@@ -570,7 +577,7 @@ class CostTable:
         self.prepare_cost_table[('Mixtral-8x7B-v0.1', (4, 0.9, 2, 0))] = 46.5        
 
         # get init cost from the database file
-        self.load_init_cost_from_database_file()
+        self.load_init_cost_from_database_file(machine_name)
 
 
 
@@ -751,13 +758,126 @@ def get_cost_table():
     cost_table = CostTable(
         logfiles=logfiles,
         prepInp_decode_logfiles=prepInp_decode_logfiles,
-        model_infos=model_infos)
+        model_infos=model_infos,
+        machine_name='lccpu')
 
     cost_table.store_meta_data(filename='get_my_cost_table_directly.py')
 
     return cost_table
 
+
+
+
+def get_cost_table_zxcpu():
+    '''
+        Return the log files and other parameters used to build our cost model.
     
+        Example input for CostTable:
+            model_path = 'NousResearch/Llama-2-7b-hf'
+            exec_plan = (1, 0.9, 2, 0) # (tp, gpu_ratio, wldeg, cache_gpu_num)
+            sample_config = (1, 1, -1, 0) #(temp, top_p, top_k, min_p)
+        NOTE: this version build cost table for zxcpus.
+    '''
+    def get_model_name_from_path(model_path: str):
+        pos = model_path.find('/')
+        model_name = model_path[pos+1:]
+        return model_name
+    
+    
+    sample_config = (1, 1, -1, 0)
+    logfiles = []
+    profile_num = 2
+    threshold = 1e-3
+
+    # add NEWROUND models from LLM-blender and routerbench---------------------
+    model_exec_settings = []
+    model_exec_settings.extend(
+        [(model_path, (tp, 0.9, 2, 0))
+         for model_path in [
+            'lmsys/vicuna-13b-v1.5',
+            'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+            'chavinlo/alpaca-13b',
+            'project-baize/baize-v2-13b',
+            'TheBloke/koala-13B-HF',
+            'databricks/dolly-v2-12b',
+            'mosaicml/mpt-7b-chat',
+            'meta-llama/Llama-2-70b-chat-hf',
+            'mistralai/Mixtral-8x7B-Instruct-v0.1',
+            'WizardLMTeam/WizardLM-13B-V1.2',
+            'meta-llama/CodeLlama-34b-Instruct-hf',
+            'mistralai/Mistral-7B-Instruct-v0.2',
+         ] for tp in [1,2] if not \
+            ( (model_path in [\
+                'mistralai/Mixtral-8x7B-v0.1', \
+                'meta-llama/Llama-2-70b-chat-hf', \
+                'mistralai/Mixtral-8x7B-Instruct-v0.1',]) and (tp == 1) )]
+    )
+    for model_path, exec_plan in model_exec_settings:
+        model_name = get_model_name_from_path(model_path)
+        tp, _, wldeg, _ = exec_plan
+        profile_num = 2
+        file_path = f'./Cost_Model_per_iter_zxcpu/NEWROUND_{model_name}_tp{tp}_1202_temp1.0_wldeg{wldeg}_1.log'
+        logfiles.append((model_path, exec_plan, sample_config, file_path, profile_num, threshold, 
+                    True, None))
+
+
+
+
+
+    # get decode prepInp log file info
+    # each tuple in prepInp_decode_logfiles: (model_name, exec_plan, filename)
+    prepInp_decode_logfiles = []
+
+    # each item is (model_name, trust_remote_code, revision)
+    model_infos = [(model_path, True, None) for model_path \
+                   in [
+                        # 'NousResearch/Llama-2-7b-hf', 
+                        # 'NousResearch/Llama-2-7b-chat-hf',
+                        # 'NousResearch/Llama-2-13b-hf',
+                        # 'NousResearch/Llama-2-70b-hf',
+                        # 'THUDM/chatglm3-6b',
+                        # 'EleutherAI/gpt-j-6b', 
+                        # 'EleutherAI/gpt-neox-20b',
+                        # 'baichuan-inc/Baichuan2-13B-Chat',
+                        # 'baichuan-inc/Baichuan-7B',
+                        # 'mistralai/Mixtral-8x7B-v0.1',
+                        # 
+                        # add NEWROUND models from LLM-blender---------------------
+                        'lmsys/vicuna-13b-v1.5',
+                        'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+                        'chavinlo/alpaca-13b',
+                        'project-baize/baize-v2-13b',
+                        'TheBloke/koala-13B-HF',
+                        'databricks/dolly-v2-12b',
+                        'mosaicml/mpt-7b-chat',
+                        # 
+                        'meta-llama/Llama-2-70b-chat-hf',
+                        'mistralai/Mixtral-8x7B-Instruct-v0.1',
+                        'WizardLMTeam/WizardLM-13B-V1.2',
+                        'meta-llama/CodeLlama-34b-Instruct-hf',
+                        'mistralai/Mistral-7B-Instruct-v0.2',                        
+                        ]
+                #    in ['NousResearch/Llama-2-7b-hf', 
+                #        'NousResearch/Llama-2-13b-hf',
+                #        'NousResearch/Llama-2-70b-hf']
+                ]
+    
+
+    for file_info in logfiles:
+        print('!/benchmarks'+file_info[3][1:])
+    for file_info in prepInp_decode_logfiles:
+        print('!/benchmarks'+file_info[2][1:])
+
+    cost_table = CostTable(
+        logfiles=logfiles,
+        prepInp_decode_logfiles=prepInp_decode_logfiles,
+        model_infos=model_infos,
+        machine_name='zxcpu')
+
+    cost_table.store_meta_data(filename='get_my_cost_table_directly_zxcpu.py')
+
+    return cost_table
+
 
 
 
@@ -785,6 +905,6 @@ def get_cost_table_from_serialized_data(
         sample_prefill_table, sample_decode_table, \
         prepInp_prefill_table, prepInp_decode_table, \
         model_configs, prepare_cost_table)
-    cost_table = CostTable([],[],[],metadata=metadata)
+    cost_table = CostTable([],[],[],None,metadata=metadata)
     
     return cost_table

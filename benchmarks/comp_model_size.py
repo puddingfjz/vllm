@@ -40,7 +40,7 @@ def get_vLLM_LLM(model_path, tensor_parallel_size, init_times=[]):
 
     # set os environ variables----------------------------------------------
     import os
-    os.environ['CUDA_VISIBLE_DEVICES']='1,3,0,2' # '2,3' # '3,0,1,2' # should be set before initialize cuda in torch
+    os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3' # '2,3' # '3,0,1,2' # should be set before initialize cuda in torch
     os.environ['USE_VLLM']='True'
     os.environ['DYNAMIC_INCREASE_ONCARD_WEIGHTS'] = 'False' # whether we will dynamically increase the on-card layer weights
 
@@ -271,9 +271,9 @@ def get_model_initialization_time(model_path: str, tp_size: int, model_init_cost
 if __name__ == "__main__":
 
     model_paths = [
-                    'NousResearch/Llama-2-7b-hf', 
-                #    'NousResearch/Llama-2-7b-chat-hf',
-                   'NousResearch/Llama-2-13b-hf',
+                #     'NousResearch/Llama-2-7b-hf', 
+                # #    'NousResearch/Llama-2-7b-chat-hf',
+                #    'NousResearch/Llama-2-13b-hf',
                 #    'NousResearch/Llama-2-70b-hf',
                 #    'THUDM/chatglm3-6b',
                 #    'EleutherAI/gpt-j-6b', 
@@ -289,6 +289,11 @@ if __name__ == "__main__":
                 # 'databricks/dolly-v2-12b',
                 # 'mosaicml/mpt-7b-chat',
                 # 'THUDM/chatglm3-6b',
+                'meta-llama/Llama-2-70b-chat-hf', 
+                'mistralai/Mixtral-8x7B-Instruct-v0.1',
+                'WizardLMTeam/WizardLM-13B-V1.2',
+                'meta-llama/CodeLlama-34b-Instruct-hf',
+                'mistralai/Mistral-7B-Instruct-v0.2',
                 ]
 
     # model_sizes = dict()
@@ -322,7 +327,10 @@ if __name__ == "__main__":
     # for model_path in model_paths:
     #     for tp_size in [2**i for i in range(0, int(math.log(4, 2))+1 )]:
     #     # for tp_size in [1]:
-    #         print_a_model_size_and_flops_coeff(model_path, tp_size, model_sizes, model_coeffs)
+    #         try:
+    #             print_a_model_size_and_flops_coeff(model_path, tp_size, model_sizes, model_coeffs)
+    #         except Exception as e:
+    #             print(e)
 
     # with open('model_size_database.py', 'a') as file:
     #     # file.write(f"model_sizes = {model_sizes}\n")
@@ -341,7 +349,10 @@ if __name__ == "__main__":
     for model_path in model_paths:
         for tp_size in [2**i for i in range(0, int(math.log(4, 2))+1 )]:
         # for tp_size in [1]:
-            get_model_initialization_time(model_path, tp_size, model_init_costs)
+            try:
+                get_model_initialization_time(model_path, tp_size, model_init_costs)
+            except Exception as e:
+                print(e)
 
     with open('model_initcost_database.py', 'a') as file:
         # file.write(f"model_coeffs = {model_coeffs}\n")

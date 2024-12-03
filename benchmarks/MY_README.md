@@ -232,6 +232,10 @@ git clone https://github.com/puddingfjz/vllm.git
 cd vllm
 pip3 install -e . 
 
+安装最新版的时候或许需要
+CUDACXX=/ssddata/jingzhi/cuda-12.4/bin/nvcc pip install -e  .
+
+
 # 指定numpy, torch版本
 pip install numpy==1.26.3
 

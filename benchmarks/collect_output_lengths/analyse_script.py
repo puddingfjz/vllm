@@ -36,6 +36,28 @@ suffix = '_tp2_0730_10kreq_1.log'
 
 
 
+# NEWROUND models for routerbench
+prefix = 'collect_output_lengths/no_robot/NEWROUND_'
+
+model_names = [
+                'Llama-2-70b-chat-hf',
+                'Mixtral-8x7B-Instruct-v0.1',
+                'WizardLM-13B-V1.2',
+                'CodeLlama-34b-Instruct-hf',
+                'Mistral-7B-Instruct-v0.2',     
+            ]
+
+model_paths = [
+    'meta-llama/Llama-2-70b-chat-hf',
+    'mistralai/Mixtral-8x7B-Instruct-v0.1',
+    'WizardLMTeam/WizardLM-13B-V1.2',
+    'meta-llama/CodeLlama-34b-Instruct-hf',
+    'mistralai/Mistral-7B-Instruct-v0.2',     
+]
+
+suffix = '_tp2_1202_10kreq_1.log'
+
+
 dataset = {key:list() for key in model_names}
 
 max_model_len_dict = {key:None for key in model_names}
@@ -71,10 +93,24 @@ def get_max_model_len(max_model_len_dict, key, filename):
 
 
 
+def get_max_model_len_from_engine_args(max_model_len_dict, model_paths):
+    import search_exec_plans 
+    for model_path in model_paths:
+        (model_config, cache_config, parallel_config, scheduler_config,
+        device_config, lora_config) = search_exec_plans.get_engin_args(model_path, 1)
+        max_model_len = model_config.max_model_len
+        pos = model_path.find('/')
+        model_name = model_path[pos+1:]
+        max_model_len_dict[model_name] = max_model_len
+
+
 for model in dataset.keys():
     filename = f'{model}{suffix}'
     update_dataset(dataset, model, filename)
-    get_max_model_len(max_model_len_dict, model, filename)
+    # get_max_model_len(max_model_len_dict, model, filename)
+
+
+get_max_model_len_from_engine_args(max_model_len_dict, model_paths)
 
 
 
@@ -91,6 +127,11 @@ for k, vs in dataset.items():
 # ********************************************************
 import matplotlib.pyplot as plt
 import numpy as np
+fig_path_prefix = 'Cost_Model_per_iter/figures/cdf'
+fig_path_suffix = 'norobot_0808_1.pdf'
+fig_path_prefix = 'Cost_Model_per_iter_zxcpu/figures/cdf'
+fig_path_suffix = 'norobot_1202_1.pdf'
+
 pdf_dict = dict()
 for k, vs in dataset.items():   
     if len(vs) == 0:
@@ -152,14 +193,14 @@ for k, vs in dataset.items():
     # 
     ax.grid()
     plt.legend()
-    fig.savefig(f"Cost_Model_per_iter/figures/cdf_{k}_norobot_0808_1.pdf")
+    fig.savefig(f"{fig_path_prefix}_{k}_{fig_path_suffix}")
     plt.show()    
 
 
 
 # store the pdf dict to file so that we can directly use it
 with open('./collect_output_lengths/no_robot/out_len_sampler_2.py', 'a') as file:
-    file.write(f"pdf_dict.update({json.dumps(pdf_dict)})")
+    file.write(f"\npdf_dict.update({json.dumps(pdf_dict)})\n")
 
 
 

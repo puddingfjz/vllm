@@ -237,6 +237,11 @@ def run_vllm_ori(
 
     print(f"finish init LLM engine")
 
+    # <jingzhi>
+    print(f"max_model_len: {llm.llm_engine.model_config.max_model_len}")
+    print(f"temperature: {temperature}")
+    print(f"ignore_eos: {ignore_eos}")
+
     # Add the requests to the engine.
     # for prompt, _, output_len in requests:
     #     sampling_params = SamplingParams(

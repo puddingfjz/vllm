@@ -2671,12 +2671,12 @@ def comp_flops_from_seqlens(
         inp_lens = np.asarray(inp_lens)
         out_lens = np.asarray(out_lens)
         context_tot_len_array = np.asarray([sum((2*inp_lens+out_lens-1)*out_lens/2)])
-        tp_size=1
+        tp_size=2
         flops = cost_table.comp_flops(
             tp_size,
             B_array, s_array, context_tot_len_array, is_prompt=False,
             model_path=model_path, trust_remote_code=trust_remote_code, revision=revision)[0]/1e12
-        return flops
+        return flops*tp_size
     else:
         # include both prefill and decode
         inp_lens = np.asarray(inp_lens)
@@ -2684,12 +2684,12 @@ def comp_flops_from_seqlens(
         B_array = np.asarray([sum(inp_lens+out_lens-1)])
         s_array = np.asarray([1])
         context_tot_len_array = np.asarray([sum((inp_lens+out_lens)*(inp_lens+out_lens-1)/2)])
-        tp_size=1
+        tp_size=2
         flops = cost_table.comp_flops(
             tp_size,
             B_array, s_array, context_tot_len_array, is_prompt=False,
             model_path=model_path, trust_remote_code=trust_remote_code, revision=revision)[0]/1e12
-        return flops
+        return flops*tp_size
 
 
 def comp_valid_throughput_at_stop_time(
