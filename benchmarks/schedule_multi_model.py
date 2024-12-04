@@ -278,6 +278,7 @@ def get_model_path_list() -> List[str]:
 
 
 def query_use_vllm(model_path: str) -> bool:
+    return True
     setting_dict = {
         'NousResearch/Llama-2-7b-hf': False, 
         'NousResearch/Llama-2-7b-chat-hf': False,
@@ -297,7 +298,13 @@ def query_use_vllm(model_path: str) -> bool:
         'project-baize/baize-v2-13b': True,
         'TheBloke/koala-13B-HF': True,
         'databricks/dolly-v2-12b': True,
-        'mosaicml/mpt-7b-chat': True,        
+        'mosaicml/mpt-7b-chat': True,   
+        # new models for routerbench
+        'meta-llama/Llama-2-70b-chat-hf': True,   
+        'mistralai/Mixtral-8x7B-Instruct-v0.1': True,   
+        'WizardLMTeam/WizardLM-13B-V1.2': True,   
+        'meta-llama/CodeLlama-34b-Instruct-hf': True,   
+        'mistralai/Mistral-7B-Instruct-v0.2': True,   
     }
     return setting_dict[model_path]
 
@@ -1666,7 +1673,7 @@ async def main_with_preemption(
 
     
     # # TODO: <jingzhi> FOR DEBUG
-    return
+    # return
 
     # get the NEW model system STRUCTURE from the ``plan_state_group_list``
     model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
@@ -2184,6 +2191,27 @@ def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
 def get_inplens_router_bench(req_num: int, model_path: str, inp_seq_ids: List[int]):
     import json
     inp_lens = list()
+    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
+    # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
+        prompt_dict = json.load(f)
+        prompts = prompt_dict[model_path]
+        # 
+        args = InferenceArgs(model=model_path, num_prompts=req_num)
+        from transformers import AutoTokenizer
+        # Sample the requests.
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code)
+        prompt_token_ids = tokenizer(prompts).input_ids
+        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+    
+
+    print(f"len(inp_lens):{len(inp_lens)}")
+    return inp_lens
+
+
+def get_inplens_router_bench_MCQ(req_num: int, model_path: str, inp_seq_ids: List[int]):
+    import json
+    inp_lens = list()
     # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
     with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
         prompt_dict = json.load(f)
@@ -2204,13 +2232,15 @@ def get_inplens_router_bench(req_num: int, model_path: str, inp_seq_ids: List[in
 
 
 
-def _get_req_len_funcs(test_case:str):
+def _get_req_len_funcs(test_case:str, version:str=None):
     inp_generator, inp_merger, outlen_generator = None, None, None
     if test_case == 'router':
-        inp_generator = get_inplens_router_bench
+        inp_generator = get_inplens_router_bench        
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
-        outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
+        if version == 'multiple_choice_question':
+            inp_generator = get_inplens_router_bench_MCQ
+            outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
     elif test_case == 'general':
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
@@ -2269,7 +2299,9 @@ def _get_router_bench_data():
     import json
     prompt_dict = None
     # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
-    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
+    dataset_type = 'multiple_choice_question'
+    dataset_type = 'not_multiple_choice_question'
+    with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_{dataset_type}_dataset.json', 'r') as f:
         prompt_dict = json.load(f)
     
     tot_inp_prompts = list()
@@ -2295,7 +2327,7 @@ def _get_router_bench_data():
     # # we control the max output length here
     # outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
     
-    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router')
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router', dataset_type)
     
     node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
                                     for i in range(len(model_paths))}
@@ -2307,7 +2339,9 @@ def _get_router_bench_data():
 
     # 5. 
     independent_srcs = {i:False for i in range(len(model_paths))}
-
+    max_tokens = 8192 # int(1e9)
+    if dataset_type == 'multiple_choice_question':
+        max_tokens = 1
     sampling_args2 = {                    
         "n":1,
         # <jingzhi> change to greedy sampling to check correctness.
@@ -2315,7 +2349,8 @@ def _get_router_bench_data():
         "top_p":1.0,
         "use_beam_search":False,
         "ignore_eos":False, # False, # True (original),
-        "max_tokens":int(1e9)}
+        "max_tokens":max_tokens, #int(1e9)
+        }
     sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
 
     print(f"\nreal model_paths: {model_paths}")
@@ -2920,7 +2955,7 @@ if __name__ == "__main__":
         # 
         gpu_name='A100-80G',
         byte_per_gpu=80*(1024**3),
-        tot_gpu_num=8,
+        tot_gpu_num=4,
         max_group_seq_num=20,
         top_k=20,
         similar_threshold=0.2,

@@ -183,8 +183,9 @@ _build/
 *_hip*
 
 # Benchmark dataset
-*.json
-
+# *.json
+# tmp inp prompt dataset
+/benchmarks/my_dummy_requests/my_dummy_requests.json
 
 
 # dataset files
