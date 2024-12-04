@@ -40,9 +40,19 @@ from my_per_iter_latency_estimator import get_cost_table, get_cost_table_zxcpu
 cost_table = get_cost_table_zxcpu()
 ```
 
-<!-- 7. 构建新模型的cost model (1) 收集各模型 size和flops coefficient的信息 AND 收集各个模型的initialization cost的信息 [need modify ``comp_model_size.py``] -->
+`<!-- 7. 构建新模型的cost model (1) 收集各模型 size和flops coefficient的信息 AND 收集各个模型的initialization cost的信息 [need modify ``comp_model_size.py``] -->`
 
 <!-- ```python
 python3 comp_model_size.py > Cost_Model_per_iter/NEWROUND_get_model_info.log 2> Cost_Model_per_iter/NEWROUND_get_model_info.err
 python3 comp_model_size.py >> Cost_Model_per_iter/NEWROUND_get_model_info_init_cost.log 2>> Cost_Model_per_iter/NEWROUND_get_model_info_init_cost.err
 ``` -->
+
+7. 如果要从某个服务器传输模型参数到另一个服务器
+
+```shell
+scp -r ./models--meta-llama--Llama-2-70b-chat-hf jfangak@zxcpu1:/ssddata/jingzhi/.cache/huggingface/hub/
+scp -r ./models--WizardLMTeam--WizardLM-13B-V1.2 jfangak@zxcpu1:/ssddata/jingzhi/.cache/huggingface/hub/
+scp -r ./models--mistralai--Mixtral-8x7B-Instruct-v0.1 jfangak@zxcpu1:/ssddata/jingzhi/.cache/huggingface/hub/
+scp -r ./models--mistralai--Mistral-7B-Instruct-v0.2 jfangak@zxcpu1:/ssddata/jingzhi/.cache/huggingface/hub/
+scp -r ./models--meta-llama--CodeLlama-34b-Instruct-hf jfangak@zxcpu1:/ssddata/jingzhi/.cache/huggingface/hub/
+```

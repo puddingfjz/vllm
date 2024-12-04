@@ -28,6 +28,7 @@ from multiprocessing.managers import BaseManager
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 import traceback
+from transformers import AutoTokenizer
 
 
 
@@ -65,6 +66,7 @@ class LLM_COMMUNICATOR:
             out_req_id_mapping:Dict[int, Dict[int, Tuple[int, int]]],
             new_out_req_part_num: Dict[int, int],
             independent_srcs: Dict[int, bool],
+            prompt_template_args: Dict[int, Tuple],
             ):
         """
             NOTE:
@@ -132,6 +134,13 @@ class LLM_COMMUNICATOR:
         # self._fetch_req_locks: List[Lock] = [Lock() for _ in range(model_num)]
 
 
+        # support applying prompt template to the input requests: {base model_id: (tokenizer name, other tokenizer args, template)}
+        # this is used every time we fetch an input request for a base model 
+        # (a base model is an original model in the system before any vertial fusion)
+        self.prompt_template_args: Dict[int, Tuple] = prompt_template_args
+        self.base_model_tokenizers: Dict[int, AutoTokenizer] = dict()
+        self._init_model_tokenizers()
+
 
         print(f"In INIT Communicator:")
         print(f"self._add_req_locks: {self._add_req_locks}")
@@ -139,6 +148,7 @@ class LLM_COMMUNICATOR:
         print(f"self._unavailable_req_nums: {self._unavailable_req_nums}")
         print(f"self._ungened_out_req_nums: {self._ungened_out_req_nums}")
         print(f"self.base_model_ids_dict: {self.base_model_ids_dict}")
+        print(f"self.base_model_tokenizers: {self.base_model_tokenizers:}")
 
 
 
@@ -148,6 +158,22 @@ class LLM_COMMUNICATOR:
         for src in src_seqs[1:]:
             ret += src
         return ret
+
+
+
+    def _init_model_tokenizers(self) -> None:
+        """
+            Prepare tokenizers for the base models.
+        """
+        print(f"in _init_model_tokenizers")
+
+        for base_model_id, args in self.prompt_template_args.items():
+            tokenizer_name, trust_remote_code = args
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name, trust_remote_code=trust_remote_code)
+            self.base_model_tokenizers[base_model_id]=tokenizer    
+
+            print(f"self.base_model_tokenizers[base_model_id]: {self.base_model_tokenizers[base_model_id]}", flush=True)
 
 
 
@@ -695,6 +721,30 @@ class LLM_COMMUNICATOR:
 
 
 
+    def _apply_prompt_template(
+            self, 
+            base_model_id: int, 
+            seqs: Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]
+        ) -> Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]]:
+        """
+            This function applies prompt template to the fetched inp seqs.
+            E.g., apply chat template
+        """
+        ret = seqs
+        # 1. apply chat template if possible
+        tokenizer = self.base_model_tokenizers[base_model_id]
+
+        print(f"\n\ntrying to apply chat template: base_model_id: {base_model_id}, tokenizer.chat_template: {tokenizer.chat_template}----------------\n\n")
+
+        if tokenizer.chat_template != None:
+            print(f"\n\napplying chat template----------------\n\n")
+            print(tokenizer.chat_template, flush=True)
+            ret = [(req_i, tokenizer.apply_chat_template([{"role": "user", "content": ori_prompt}], add_generation_prompt=True, tokenize=False)) \
+                      for req_i, ori_prompt in seqs]
+        
+        return ret
+
+
 
     def get_seqs(self, to_shared_id: int, dp_id: int, dp_size: int
         ) -> Tuple[Union[List[Tuple[int, str]],List[Tuple[int, List[int]]]], bool, List[int]]:
@@ -735,6 +785,7 @@ class LLM_COMMUNICATOR:
             for base_model_id in base_model_ids:
                 tmp_ret, tmp_possible_to_get_future_reqs = \
                     self.get_seqs_base_model(to_shared_id=to_shared_id, to_model_id=base_model_id, dp_id=dp_id, dp_size=dp_size)                
+                tmp_ret = self._apply_prompt_template(base_model_id, tmp_ret)
                 ret.extend(tmp_ret)
                 # print(f"base_model_id: {base_model_id}: {tmp_possible_to_get_future_reqs, tmp_ret}")
                 if tmp_possible_to_get_future_reqs:

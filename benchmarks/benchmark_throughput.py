@@ -259,6 +259,12 @@ def run_vllm_ori(
     #         prompt_token_ids=None,
     #         sampling_params=sampling_params,
     #     )
+    
+    # we need to apply chat template if possible
+    tokenizer_obj = AutoTokenizer.from_pretrained(
+        tokenizer, trust_remote_code=trust_remote_code)
+    print(f"tokenizer.chat_template: {tokenizer.chat_template}, tokenizer.chat_template!=None: {tokenizer.chat_template!=None}", flush=True)
+    
     for prompt, _, output_len in requests:
         # print(f"in len: {_}, out len: {output_len} vs {4096-_}")
         sampling_params = SamplingParams(
@@ -271,6 +277,12 @@ def run_vllm_ori(
             max_tokens=output_len if ignore_eos else (llm.llm_engine.model_config.max_model_len-_),
             # max_tokens=llm.llm_engine.model_config.max_model_len-_ # 4096-_  # output_len, #TODO(jingzhi) test when using max tokens
         )
+
+        # we need to apply chat template if possible
+        if tokenizer_obj.chat_template != None:
+            prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
+
+
         # FIXME(woosuk): Do not use internal method.
         llm._add_request(
             prompt=prompt,

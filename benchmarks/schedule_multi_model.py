@@ -1337,6 +1337,8 @@ def init_prompts_for_the_model_system(
 
     while len(visited) < tot_node_num:
         for tgt, srcs in in_edge_dict_with_dummy_inp_nodes.items():
+            if tgt in visited:
+                continue
             print(f"tgt, srcs: {tgt, srcs}", flush=True)
             if set(srcs).issubset(visited):
                 # if independent_srcs[tgt]:
@@ -1366,6 +1368,8 @@ def init_prompts_for_the_model_system(
         if not isinstance(to_add[0][1], str):
             to_add = [(req_i, tokenizer.decode(token_ids)) for req_i, token_ids in to_add]
 
+        # we need to apply chat template if possible ==> do the chat template application in communicator
+
         communicator.add_seqs(model_id, to_add)
 
     return req_num_dict
@@ -1390,7 +1394,7 @@ def get_return_str(
         NOTE: 1. we also need to consider the other inputs of the output nodes of model_id, because different input sources 
             may need to be concatenated. 
             Currently, we return str if two input sources need to be concat, even if they use the same tokenizer.
-            # TODO: 这个地方还要改
+            # TODO: 这个地方还要改 ==> 感觉就默认True是OK的，因为我们总是要apply 一些prompt template，比如chat template之类的
             2. each base model has its own ``return_str``. [暂时还没有实现这一点]
     """
     return True
@@ -1600,6 +1604,7 @@ async def main_with_preemption(
         # 
         inp_seq_ids_dict, 
         inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+        prompt_template_args: Dict[int, Tuple],
         # 
         inp_generator, inp_merger, outlen_generator,
         # 
@@ -1721,6 +1726,7 @@ async def main_with_preemption(
             in_edge_dict_with_dummy_inp_nodes,
             shared_id_2_base_model_ids_dict,
             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+            prompt_template_args,
             )
 
         # set inputs for dummy inp nodes in the system
@@ -2237,7 +2243,8 @@ def _get_req_len_funcs(test_case:str, version:str=None):
     if test_case == 'router':
         inp_generator = get_inplens_router_bench        
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
-        outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+        # outlen_generator = lambda model_name, inp_lens: np.minimum(4096, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+        outlen_generator = lambda model_name, inp_lens: output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens)
         if version == 'multiple_choice_question':
             inp_generator = get_inplens_router_bench_MCQ
             outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
@@ -2279,6 +2286,7 @@ def _get_router_bench_data():
     
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
+    prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
 
     # inp/out len generator functions for the general setting
@@ -2292,6 +2300,11 @@ def _get_router_bench_data():
 
     # 1. 
     in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
+
+    prompt_template_args = dict()
+    for i, model_path in enumerate(model_paths):
+        args = InferenceArgs(model=model_path)
+        prompt_template_args[i] = (args.tokenizer, args.trust_remote_code)
 
 
 
@@ -2325,7 +2338,7 @@ def _get_router_bench_data():
     # inp_generator = get_inplens_router_bench
     # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
     # # we control the max output length here
-    # outlen_generator = lambda model_name, inp_lens: np.minimum(8192, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+    # outlen_generator = lambda model_name, inp_lens: np.minimum(4096, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
     
     inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router', dataset_type)
     
@@ -2339,7 +2352,7 @@ def _get_router_bench_data():
 
     # 5. 
     independent_srcs = {i:False for i in range(len(model_paths))}
-    max_tokens = 8192 # int(1e9)
+    max_tokens = int(1e9) # 8192 # int(1e9)
     if dataset_type == 'multiple_choice_question':
         max_tokens = 1
     sampling_args2 = {                    
@@ -2363,7 +2376,7 @@ def _get_router_bench_data():
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
 
 
 def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_set:int):
@@ -2383,6 +2396,7 @@ def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_s
     
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
+    prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
     if test_case == 'router':
         return _get_router_bench_data()
@@ -2629,7 +2643,7 @@ def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_s
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
 
 
 
@@ -2659,6 +2673,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool, ratio_seed:int, r
     
     # whether a base model's different input sources are independent or need to be merged, ...
     independent_srcs = dict()
+    prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
     if test_case == 'general':
         # inp/out len generator functions for the general setting
@@ -2889,7 +2904,7 @@ def get_schedule_setting(test_case:str, use_real_dataset:bool, ratio_seed:int, r
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
 
 
 
@@ -2931,7 +2946,7 @@ if __name__ == "__main__":
 
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, sampling_args_dict = \
+             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict = \
         get_schedule_setting(test_case=test_case, use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
     
     asyncio.run(main_with_preemption(
@@ -2951,6 +2966,7 @@ if __name__ == "__main__":
         inp_seq_ids_dict=inp_seq_ids_dict, 
         inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
+        prompt_template_args=prompt_template_args,
         inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
         # 
         gpu_name='A100-80G',

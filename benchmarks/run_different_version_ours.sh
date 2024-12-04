@@ -664,3 +664,15 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-bas
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_maxlen_8192_2.log
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_ours_maxlen_8192_2.log
 
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_maxlen_4096_2.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_ours_maxlen_4096_2.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_maxlen_4096_3.log
+
+CUDA_VISIBLE_DEVICES=2,3,4,5 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_test_chat_template_1.log
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_Not_MCQ_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_ours_Not_MCQ_1.log
+
+
