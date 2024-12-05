@@ -56,6 +56,7 @@ model_paths = [
 ]
 
 suffix = '_tp2_1202_10kreq_1.log'
+suffix = '_tp2_1205_10kreq_1.log'
 
 
 dataset = {key:list() for key in model_names}
@@ -131,6 +132,8 @@ fig_path_prefix = 'Cost_Model_per_iter/figures/cdf'
 fig_path_suffix = 'norobot_0808_1.pdf'
 fig_path_prefix = 'Cost_Model_per_iter_zxcpu/figures/cdf'
 fig_path_suffix = 'norobot_1202_1.pdf'
+fig_path_prefix = 'Cost_Model_per_iter_zxcpu/figures/cdf'
+fig_path_suffix = 'norobot_1205_1.pdf'
 
 pdf_dict = dict()
 for k, vs in dataset.items():   

@@ -248,6 +248,7 @@ cd benchmarks
 mkdir my_dummy_requests
 mkdir test_search
 mkdir test_end2end_schedule
+mkdir Cost_Model_per_iter_zxcpu
 
 5. =====================================================
 安装完之后重新进入环境的步骤

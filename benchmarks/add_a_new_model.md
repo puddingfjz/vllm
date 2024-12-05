@@ -28,8 +28,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 benchmark_throughput.py --backend v
 5. run collect_output_lengths/analyse_script.py to get output length distribution [need modify ``analyse_script.py``]
 
 ```shell
-cd collect_output_lengths
-python3 analyse_script.py
+# cd collect_output_lengths
+python3 collect_output_lengths/analyse_script.py
 ```
 
 6. run my_per_iter_latency_estimator.get_cost_table to prepare cost model meta data for direct use later [need modify ``get_cost_table()``]

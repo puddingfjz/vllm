@@ -195,7 +195,11 @@ def do_inference(
     print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, output_lens = {[[len(req_output.prompt_token_ids), len(completion_output.token_ids), -1] for req_output in outputs for completion_output in req_output.outputs]}")
     print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, tot_inp_lens = {sum([len(req_output.prompt_token_ids) for req_output in outputs])}")
     print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, tot_out_len = {sum([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
-    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, num if outputs: {len([completion_output for req_output in outputs for completion_output in req_output.outputs])}, max_out_len = {max([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])}")
+    num_completion_output = len([completion_output for req_output in outputs for completion_output in req_output.outputs])
+    max_out_len = None
+    if num_completion_output > 0:
+        max_out_len = max([len(completion_output.token_ids) for req_output in outputs for completion_output in req_output.outputs])
+    print(f"shared_id {SHARED_CONTECT.shared_id} worker i: {worker_i}, num if outputs: {num_completion_output}, max_out_len = {max_out_len}")
     # for req_output, (_, _, output_len) in zip(outputs, requests):
     #     for completion_output in req_output.outputs:
     #         print(req_output.request_id, len(req_output.prompt_token_ids), len(completion_output.token_ids), len(req_output.prompt_token_ids)+len(completion_output.token_ids), len(req_output.prompt_token_ids)+output_len)

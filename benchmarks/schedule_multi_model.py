@@ -1049,6 +1049,7 @@ def _get_the_next_round_exec_plan_schedule(
 def _adjust_comp_gpus_for_current_launched_exec_plans(
         launched_exec_plan_states: List[MyExecPlanState],
         new_launch: List[MyExecPlanState],
+        old_launched: List[MyExecPlanState],
         tot_gpu_num: int,
         fully_connected_gpu_unit: int)->List[MyExecPlanState]:
     """
@@ -1056,9 +1057,12 @@ def _adjust_comp_gpus_for_current_launched_exec_plans(
             fully_connected_gpu_unit: the number of gpus that are fully connected, 
                 e.g., 2 if 1 gpu is only connected with 1 other gpu with NV-links;
                       4 if 1 gpu is connected by 3 other gpus with NV-links.
+            old_launched: last round launched exec plans.
         OUTPUT: 
             the plan_states that will need reload model weights.
     """
+    launched_comp_gpu_dict = {(i.exec_plan.model.model_id,i.exec_plan.get_key()): i.get_comp_gpus() for i in old_launched}
+
     launched_exec_plan_states = sorted(launched_exec_plan_states, key=lambda plan_state: plan_state.exec_plan.num_worker)
     cand_gpu_groups = np.arange(tot_gpu_num).reshape((-1, fully_connected_gpu_unit))
     # stores the cost to reload models assigned to each gpu group
@@ -1069,7 +1073,12 @@ def _adjust_comp_gpus_for_current_launched_exec_plans(
     #    get the plan_states that need to ressign gpus to (i.e., plan_state_to_reassign_gpus)
     for plan_state in launched_exec_plan_states:
         if plan_state not in new_launch:
-            gpus = plan_state.get_comp_gpus()
+            # 1. get old comp gpus
+            # gpus = plan_state.get_comp_gpus()
+            gpus = launched_comp_gpu_dict[(plan_state.exec_plan.model.model_id, plan_state.exec_plan.get_key())]
+            # ensure correct comp gpus
+            plan_state.set_comp_gpus(gpus)
+
             gpus = np.asarray(gpus)[:plan_state.exec_plan.num_worker*plan_state.exec_plan.dp_size]
             print(f"model_id: {plan_state.exec_plan.model.model_id}, gpus: {gpus}", flush=True)
             gpus, counts = np.unique(gpus // fully_connected_gpu_unit, return_counts=True)
@@ -1162,10 +1171,12 @@ def get_the_next_round_exec_plan_schedule(
     model_ids_to_stop = [i.exec_plan.model.model_id for i in launched_exec_plan_states 
                          if (i.exec_plan.model.model_id,i.exec_plan.get_key()) not in to_launch_exec_plans]
 
+    print(f"next round to_launch: {[str(plan_state) for plan_state in to_launch]}")
+
 
     # 3. change the comp gpu setting if the GPUs are not fully connected with NV-link.
     extra_new_launch = _adjust_comp_gpus_for_current_launched_exec_plans(
-        to_launch, new_launch, tot_gpu_num, fully_connected_gpu_unit)
+        to_launch, new_launch, launched_exec_plan_states, tot_gpu_num, fully_connected_gpu_unit)
     new_launch = new_launch + extra_new_launch
     model_ids_to_stop = model_ids_to_stop + [i.exec_plan.model.model_id for i in extra_new_launch]
 

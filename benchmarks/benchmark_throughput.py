@@ -263,7 +263,7 @@ def run_vllm_ori(
     # we need to apply chat template if possible
     tokenizer_obj = AutoTokenizer.from_pretrained(
         tokenizer, trust_remote_code=trust_remote_code)
-    print(f"tokenizer.chat_template: {tokenizer.chat_template}, tokenizer.chat_template!=None: {tokenizer.chat_template!=None}", flush=True)
+    print(f"tokenizer_obj.chat_template: {tokenizer_obj.chat_template}, tokenizer_obj.chat_template!=None: {tokenizer_obj.chat_template!=None}", flush=True)
     
     for prompt, _, output_len in requests:
         # print(f"in len: {_}, out len: {output_len} vs {4096-_}")
@@ -280,8 +280,8 @@ def run_vllm_ori(
 
         # we need to apply chat template if possible
         if tokenizer_obj.chat_template != None:
-            prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
-
+            prompt = tokenizer_obj.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
+            print(f"converted prompt: {prompt[:30]}...")
 
         # FIXME(woosuk): Do not use internal method.
         llm._add_request(

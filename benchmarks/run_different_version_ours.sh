@@ -573,6 +573,15 @@ CUDA_VISIBLE_DEVICES=4,5 python3 benchmark_throughput.py --backend vllm_ori --da
 CUDA_VISIBLE_DEVICES=6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model mistralai/Mistral-7B-Instruct-v0.2 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_Mistral-7B-Instruct-v0.2_tp2_1202_10kreq_1.log
 
 
+# apply chat template and re-run 
+CUDA_VISIBLE_DEVICES=0,1 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model meta-llama/Llama-2-70b-chat-hf --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_Llama-2-70b-chat-hf_tp2_1205_10kreq_1.log
+CUDA_VISIBLE_DEVICES=2,3 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model mistralai/Mixtral-8x7B-Instruct-v0.1 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_Mixtral-8x7B-Instruct-v0.1_tp2_1205_10kreq_1.log
+
+CUDA_VISIBLE_DEVICES=6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model WizardLMTeam/WizardLM-13B-V1.2 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_WizardLM-13B-V1.2_tp2_1205_10kreq_1.log
+CUDA_VISIBLE_DEVICES=4,5 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model meta-llama/CodeLlama-34b-Instruct-hf --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_CodeLlama-34b-Instruct-hf_tp2_1205_10kreq_1.log
+CUDA_VISIBLE_DEVICES=6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model mistralai/Mistral-7B-Instruct-v0.2 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature 1.0 -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_Mistral-7B-Instruct-v0.2_tp2_1205_10kreq_1.log
+
+
 # forget to get max output lengths
 
 
@@ -672,7 +681,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py --gen-execplans-bas
 CUDA_VISIBLE_DEVICES=2,3,4,5 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_test_chat_template_1.log
 
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_Not_MCQ_1.log
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_ours_Not_MCQ_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_ours_Not_MCQ_2.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1203_8gpu-router_naiveSearchSpace_V2_Not_MCQ_2.log
 
 
