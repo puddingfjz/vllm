@@ -226,6 +226,8 @@ conda deactivate
 pip3 install -U pyarrow 
 # 下载 einops
 pip install einops
+# 下载 matpyplot
+pip install matpyplot
 
 # 编译vllm
 git clone https://github.com/puddingfjz/vllm.git

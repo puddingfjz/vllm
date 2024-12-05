@@ -430,7 +430,7 @@ def _get_model_sys_structure_from_selected_plan_group_seq(
 
 
 def search_best_scheduling(
-        test_case: str,
+        test_case: str, version: str, max_token_num: str,
         gen_execplans_baseline:str,
         search_method_baseline:str,
         model_paths: List[str], 
@@ -456,7 +456,8 @@ def search_best_scheduling(
     
     # 1. first search the best scheduling
     
-    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(test_case=test_case)
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(
+        test_case=test_case, version=version, max_token_num=max_token_num)
 
     # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # search_method_baseline = 'ours' # 'naive'  'ours'
@@ -1546,7 +1547,7 @@ def test_search(
 
 
 def _search_best_scheduling_with_another_process(
-        test_case:str,
+        test_case:str, version: str, max_token_num: str,
         gen_execplans_baseline,
         search_method_baseline,
         model_paths, 
@@ -1571,7 +1572,7 @@ def _search_best_scheduling_with_another_process(
         try:
             future = executor.submit(
                 search_best_scheduling, 
-                    test_case,
+                    test_case, version, max_token_num,
                     gen_execplans_baseline,
                     search_method_baseline,
                     model_paths, 
@@ -1602,7 +1603,7 @@ def _search_best_scheduling_with_another_process(
 
 
 async def main_with_preemption(
-        test_case:str,
+        test_case:str, version: str, max_token_num: str,
         model_paths:List[str],
         gen_execplans_baseline:str,
         search_method_baseline:str,
@@ -1665,7 +1666,7 @@ async def main_with_preemption(
 
     # plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
     plan_state_group_list:List[List[MyExecPlanState]] = _search_best_scheduling_with_another_process(
-        test_case,
+        test_case, version, max_token_num,
         gen_execplans_baseline,
         search_method_baseline,
         model_paths, 
@@ -2249,13 +2250,16 @@ def get_inplens_router_bench_MCQ(req_num: int, model_path: str, inp_seq_ids: Lis
 
 
 
-def _get_req_len_funcs(test_case:str, version:str=None):
+def _get_req_len_funcs(test_case:str, version:str, max_token_num: int):
     inp_generator, inp_merger, outlen_generator = None, None, None
     if test_case == 'router':
         inp_generator = get_inplens_router_bench        
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
-        # outlen_generator = lambda model_name, inp_lens: np.minimum(4096, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
-        outlen_generator = lambda model_name, inp_lens: output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens)
+        outlen_generator = None
+        if max_token_num != None:
+            outlen_generator = lambda model_name, inp_lens: np.minimum(max_token_num, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+        else:
+            outlen_generator = lambda model_name, inp_lens: output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens)
         if version == 'multiple_choice_question':
             inp_generator = get_inplens_router_bench_MCQ
             outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
@@ -2280,7 +2284,7 @@ def _get_req_len_funcs(test_case:str, version:str=None):
 
 
 
-def _get_router_bench_data():
+def _get_router_bench_data(version:str, max_token_num:int):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2325,6 +2329,7 @@ def _get_router_bench_data():
     # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
     dataset_type = 'multiple_choice_question'
     dataset_type = 'not_multiple_choice_question'
+    dataset_type = version
     with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_{dataset_type}_dataset.json', 'r') as f:
         prompt_dict = json.load(f)
     
@@ -2351,7 +2356,9 @@ def _get_router_bench_data():
     # # we control the max output length here
     # outlen_generator = lambda model_name, inp_lens: np.minimum(4096, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
     
-    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router', dataset_type)
+    max_tokens = 4096 # int(1e9) # 8192 # int(1e9)
+    max_tokens = max_token_num
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router', dataset_type, max_tokens)
     
     node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
                                     for i in range(len(model_paths))}
@@ -2363,7 +2370,6 @@ def _get_router_bench_data():
 
     # 5. 
     independent_srcs = {i:False for i in range(len(model_paths))}
-    max_tokens = int(1e9) # 8192 # int(1e9)
     if dataset_type == 'multiple_choice_question':
         max_tokens = 1
     sampling_args2 = {                    
@@ -2390,7 +2396,9 @@ def _get_router_bench_data():
         inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
 
 
-def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_set:int):
+def _get_schedule_setting_with_real_data(
+        test_case: str, version:str, max_token_num:int, 
+        ratio_seed:int, ratio_set:int):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2410,7 +2418,7 @@ def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_s
     prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
     if test_case == 'router':
-        return _get_router_bench_data()
+        return _get_router_bench_data(version=version, max_token_num=max_token_num,)
     elif (test_case == 'general'):
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
@@ -2661,10 +2669,14 @@ def _get_schedule_setting_with_real_data(test_case: str, ratio_seed:int, ratio_s
 
 
 
-def get_schedule_setting(test_case:str, use_real_dataset:bool, ratio_seed:int, ratio_set:int):
+def get_schedule_setting(
+        test_case:str, version:str, max_token_num:int,
+        use_real_dataset:bool, ratio_seed:int, ratio_set:int):
 
     if use_real_dataset:
-        return _get_schedule_setting_with_real_data(test_case=test_case, ratio_seed=ratio_seed, ratio_set=ratio_set)
+        return _get_schedule_setting_with_real_data(
+            test_case=test_case, version=version, max_token_num=max_token_num,
+            ratio_seed=ratio_seed, ratio_set=ratio_set)
     
 
 
@@ -2948,6 +2960,8 @@ if __name__ == "__main__":
     gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     test_case = 'router' # 'general' 'map-reduce' 'chain-summary', 'router'
+    version = 'not_multiple_choice_question' # 'multiple_choice_question' # for router dataset
+    max_token_num = 4096
 
     gen_execplans_baseline = args.gen_execplans_baseline
     test_case = args.test_case
@@ -2958,10 +2972,11 @@ if __name__ == "__main__":
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
              inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict = \
-        get_schedule_setting(test_case=test_case, use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
+        get_schedule_setting(test_case=test_case, version=version, max_token_num=max_token_num, 
+                             use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
     
     asyncio.run(main_with_preemption(
-        test_case=test_case,
+        test_case=test_case, version=version, max_token_num=max_token_num,
         model_paths=model_paths,
         gen_execplans_baseline=gen_execplans_baseline,
         search_method_baseline=search_method_baseline,

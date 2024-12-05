@@ -281,14 +281,17 @@ if __name__ == "__main__":
                 #    'baichuan-inc/Baichuan2-13B-Chat',
                 #    'baichuan-inc/Baichuan-7B',
                 #    'mistralai/Mixtral-8x7B-v0.1',
-                'lmsys/vicuna-13b-v1.5',
-                'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
-                'chavinlo/alpaca-13b',
-                'project-baize/baize-v2-13b',
-                'TheBloke/koala-13B-HF',
-                'databricks/dolly-v2-12b',
-                'mosaicml/mpt-7b-chat',
-                'THUDM/chatglm3-6b',
+                # 
+                # 'lmsys/vicuna-13b-v1.5',
+                # 'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+                # 'chavinlo/alpaca-13b',
+                # 'project-baize/baize-v2-13b',
+                # 'TheBloke/koala-13B-HF',
+                # 'databricks/dolly-v2-12b',
+                # 'mosaicml/mpt-7b-chat',
+                # 'THUDM/chatglm3-6b',
+                'stabilityai/stablelm-tuned-alpha-7b',
+                # 
                 # 'meta-llama/Llama-2-70b-chat-hf', 
                 # 'mistralai/Mixtral-8x7B-Instruct-v0.1',
                 # 'WizardLMTeam/WizardLM-13B-V1.2',
@@ -322,23 +325,23 @@ if __name__ == "__main__":
 
 
 
-    # model_sizes = dict()
-    # model_coeffs = dict()
-    # for model_path in model_paths:
-    #     for tp_size in [2**i for i in range(0, int(math.log(4, 2))+1 )]:
-    #     # for tp_size in [1]:
-    #         try:
-    #             print_a_model_size_and_flops_coeff(model_path, tp_size, model_sizes, model_coeffs)
-    #         except Exception as e:
-    #             print(e)
+    model_sizes = dict()
+    model_coeffs = dict()
+    for model_path in model_paths:
+        for tp_size in [2**i for i in range(0, int(math.log(4, 2))+1 )]:
+        # for tp_size in [1]:
+            try:
+                print_a_model_size_and_flops_coeff(model_path, tp_size, model_sizes, model_coeffs)
+            except Exception as e:
+                print(e)
 
-    # with open('model_size_database.py', 'a') as file:
-    #     # file.write(f"model_sizes = {model_sizes}\n")
-    #     file.write(f"model_sizes.update({model_sizes})\n")
+    with open('model_size_database.py', 'a') as file:
+        # file.write(f"model_sizes = {model_sizes}\n")
+        file.write(f"model_sizes.update({model_sizes})\n")
 
-    # with open('model_coeff_database.py', 'a') as file:
-    #     # file.write(f"model_coeffs = {model_coeffs}\n")
-    #     file.write(f"model_coeffs.update({model_coeffs})\n")
+    with open('model_coeff_database.py', 'a') as file:
+        # file.write(f"model_coeffs = {model_coeffs}\n")
+        file.write(f"model_coeffs.update({model_coeffs})\n")
     
 
 
