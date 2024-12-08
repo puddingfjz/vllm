@@ -430,7 +430,7 @@ def _get_model_sys_structure_from_selected_plan_group_seq(
 
 
 def search_best_scheduling(
-        test_case: str, version: str, max_token_num: str,
+        test_case: str, version: str, max_token_num: str, specify_outlen: bool,
         gen_execplans_baseline:str,
         search_method_baseline:str,
         model_paths: List[str], 
@@ -457,7 +457,7 @@ def search_best_scheduling(
     # 1. first search the best scheduling
     
     inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(
-        test_case=test_case, version=version, max_token_num=max_token_num)
+        test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen)
 
     # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # search_method_baseline = 'ours' # 'naive'  'ours'
@@ -581,7 +581,8 @@ def initialize_SHARED_CONTECT(
         gpu_order_we_set: List[int],
         model_id_shared_id_mapping: Dict[int, int],
         new_out_edge_dict: Dict[int, List[int]],
-        sampling_args_dict: Dict[int, Tuple[bool, int, int]]
+        sampling_args_dict: Dict[int, Tuple[bool, int, int]],
+        seq_outlen_dict: Dict[int, Dict[int,int]],
     ) -> Tuple[List[MyExecPlanState], int, List[MyExecPlanState]]:
     '''
         Update: (1) SHARED_CONTECT events, shared_finish_status, shared_setting
@@ -607,6 +608,7 @@ def initialize_SHARED_CONTECT(
     SHARED_CONTECT.check_out_gaps = check_out_gaps
     SHARED_CONTECT.check_in_gap = check_gap
     SHARED_CONTECT.sampling_args_dict = sampling_args_dict
+    SHARED_CONTECT.seq_outlen_dict = seq_outlen_dict
 
     
     # set the initial execution plan
@@ -1252,10 +1254,10 @@ def _get_dummy_requests():
 
 def _init_dummy_requests(
         inp_lens: List[int],
-        sampled_inps: Union[List[List[int]], List[str]]=None, 
-        model_path:str=None, ):
+        sampled_inps: Union[List[List[int]], List[str]]=None,
+        out_lens_dict: Dict[str, List[int]]=None):
     import json
-    if model_path == None:
+    if sampled_inps == None:
         with open(f"./my_dummy_requests/my_dummy_requests.json", 'w') as f:
             requests = ["hi" * (input_len - 1) for input_len in inp_lens]
             json.dump(requests, f)    
@@ -1265,6 +1267,10 @@ def _init_dummy_requests(
             # NOTE: TODO: 貌似把token ids转回str非常复杂，所以干脆直接在文件里写入token ids了。
             assert sampled_inps != None
             json.dump(sampled_inps, f)
+    
+    if out_lens_dict != None:
+        with open(f"./my_dummy_requests/my_dummy_requests_outlen.json", 'w') as f:
+            json.dump(out_lens_dict, f)
 
 
 def init_prompts_for_the_model_system(
@@ -1547,7 +1553,7 @@ def test_search(
 
 
 def _search_best_scheduling_with_another_process(
-        test_case:str, version: str, max_token_num: str,
+        test_case:str, version: str, max_token_num: str, specify_outlen: bool,
         gen_execplans_baseline,
         search_method_baseline,
         model_paths, 
@@ -1572,7 +1578,7 @@ def _search_best_scheduling_with_another_process(
         try:
             future = executor.submit(
                 search_best_scheduling, 
-                    test_case, version, max_token_num,
+                    test_case, version, max_token_num, specify_outlen,
                     gen_execplans_baseline,
                     search_method_baseline,
                     model_paths, 
@@ -1603,7 +1609,7 @@ def _search_best_scheduling_with_another_process(
 
 
 async def main_with_preemption(
-        test_case:str, version: str, max_token_num: str,
+        test_case:str, version: str, max_token_num: str, specify_outlen: bool,
         model_paths:List[str],
         gen_execplans_baseline:str,
         search_method_baseline:str,
@@ -1613,6 +1619,7 @@ async def main_with_preemption(
         check_gap: int, sort_input: bool,
         num_prompts: int, 
         sampling_args_dict: Dict[int, SamplingParams],
+        seq_outlen_dict: Dict[int, Dict[int,int]],
         # 
         inp_seq_ids_dict, 
         inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
@@ -1666,7 +1673,7 @@ async def main_with_preemption(
 
     # plan_state_group_list:List[List[MyExecPlanState]] = search_best_scheduling(
     plan_state_group_list:List[List[MyExecPlanState]] = _search_best_scheduling_with_another_process(
-        test_case, version, max_token_num,
+        test_case, version, max_token_num, specify_outlen,
         gen_execplans_baseline,
         search_method_baseline,
         model_paths, 
@@ -1690,7 +1697,7 @@ async def main_with_preemption(
 
     
     # # TODO: <jingzhi> FOR DEBUG
-    # return
+    return
 
     # get the NEW model system STRUCTURE from the ``plan_state_group_list``
     model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
@@ -1719,7 +1726,8 @@ async def main_with_preemption(
         gpu_order_we_set=gpu_order_we_set,
         model_id_shared_id_mapping=model_id_shared_id_mapping,
         new_out_edge_dict=new_out_edge_dict,
-        sampling_args_dict=sampling_args_dict,)
+        sampling_args_dict=sampling_args_dict,
+        seq_outlen_dict=seq_outlen_dict)
     first_stage_model_ids = [exec_plan_state.exec_plan.model.model_id for exec_plan_state in launched_exec_plan_states]
 
 
@@ -2199,70 +2207,107 @@ def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
         prompt_token_ids = tokenizer(prompts).input_ids
         inp_lens = [len(prompt) for prompt in prompt_token_ids]
     
-    assert len(inp_lens) == req_num
-    print(f"inp_seq_ids:{inp_seq_ids}")
+    # assert len(inp_lens) == req_num
+    print(f"len(inp_lens):{len(inp_lens)}, inp_seq_ids:{inp_seq_ids}")
     return list(np.asarray(inp_lens)[inp_seq_ids])
 
 
 
 
-def get_inplens_router_bench(req_num: int, model_path: str, inp_seq_ids: List[int]):
-    import json
-    inp_lens = list()
-    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
-    # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
-        prompt_dict = json.load(f)
-        prompts = prompt_dict[model_path]
-        # 
-        args = InferenceArgs(model=model_path, num_prompts=req_num)
-        from transformers import AutoTokenizer
-        # Sample the requests.
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, trust_remote_code=args.trust_remote_code)
-        prompt_token_ids = tokenizer(prompts).input_ids
-        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+def comp_outlens(model_path: str, responses: List[str]) -> List[int]:
+    args = InferenceArgs(model=model_path, num_prompts=1)
+    from transformers import AutoTokenizer
+    # Sample the requests.
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, trust_remote_code=args.trust_remote_code)
+    response_token_ids = tokenizer(responses).input_ids
+    out_lens = [len(response) for response in response_token_ids]
+
+    print(f"len(out_lens):{len(out_lens)}")
+    return out_lens
+
+
+
+# def get_inplens_router_bench(req_num: int, model_path: str, inp_seq_ids: List[int]):
+#     import json
+#     inp_lens = list()
+#     # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
+#     with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset_with_response.json', 'r') as f:
+#         prompt_dict = json.load(f)
+#         prompts = prompt_dict[model_path]
+#         if isinstance(prompts[0], list):
+#             prompts = [record[0] for record in prompts]
+#         # 
+#         args = InferenceArgs(model=model_path, num_prompts=req_num)
+#         from transformers import AutoTokenizer
+#         # Sample the requests.
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             args.tokenizer, trust_remote_code=args.trust_remote_code)
+#         prompt_token_ids = tokenizer(prompts).input_ids
+#         inp_lens = [len(prompt) for prompt in prompt_token_ids]
     
 
-    print(f"len(inp_lens):{len(inp_lens)}")
-    return inp_lens
+#     print(f"len(inp_lens):{len(inp_lens)}")
+#     return inp_lens
 
 
-def get_inplens_router_bench_MCQ(req_num: int, model_path: str, inp_seq_ids: List[int]):
-    import json
-    inp_lens = list()
-    # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_not_multiple_choice_question_dataset.json', 'r') as f:
-    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
-        prompt_dict = json.load(f)
-        prompts = prompt_dict[model_path]
-        # 
-        args = InferenceArgs(model=model_path, num_prompts=req_num)
-        from transformers import AutoTokenizer
-        # Sample the requests.
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, trust_remote_code=args.trust_remote_code)
-        prompt_token_ids = tokenizer(prompts).input_ids
-        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+# def get_inplens_router_bench_MCQ(req_num: int, model_path: str, inp_seq_ids: List[int]):
+#     import json
+#     inp_lens = list()
+#     # with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset.json', 'r') as f:
+#     with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_multiple_choice_question_dataset_with_response.json', 'r') as f:
+#         prompt_dict = json.load(f)
+#         prompts = prompt_dict[model_path]
+#         if isinstance(prompts[0], list):
+#             prompts = [record[0] for record in prompts]
+#         # 
+#         args = InferenceArgs(model=model_path, num_prompts=req_num)
+#         from transformers import AutoTokenizer
+#         # Sample the requests.
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             args.tokenizer, trust_remote_code=args.trust_remote_code)
+#         prompt_token_ids = tokenizer(prompts).input_ids
+#         inp_lens = [len(prompt) for prompt in prompt_token_ids]
     
 
-    print(f"len(inp_lens):{len(inp_lens)}")
-    return inp_lens
+#     print(f"len(inp_lens):{len(inp_lens)}")
+#     return inp_lens
+
+
+
+def get_outlens_router_bench(model_name: str, inp_lens: List[int]):
+    import json
+    out_lens = list()
+    with open('/ssddata/jingzhi/vLLM/vllm/benchmarks/my_dummy_requests/my_dummy_requests_outlen.json', 'r') as f:
+        outlen_dict = json.load(f)
+        out_lens = outlen_dict[model_name]   
+
+    print(f"len(out_lens):{len(out_lens)}")
+    assert len(out_lens) == len(inp_lens)
+    return out_lens
 
 
 
 
-def _get_req_len_funcs(test_case:str, version:str, max_token_num: int):
+
+def _get_req_len_funcs(test_case:str, version:str, max_token_num: int, specify_outlen: bool):
     inp_generator, inp_merger, outlen_generator = None, None, None
     if test_case == 'router':
-        inp_generator = get_inplens_router_bench        
+        inp_generator = get_inplens # get_inplens_router_bench        
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = None
         if max_token_num != None:
             outlen_generator = lambda model_name, inp_lens: np.minimum(max_token_num, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
         else:
             outlen_generator = lambda model_name, inp_lens: output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens)
-        if version == 'multiple_choice_question':
-            inp_generator = get_inplens_router_bench_MCQ
-            outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
+        # if version == 'multiple_choice_question':
+        #     inp_generator = get_inplens_router_bench_MCQ
+        #     outlen_generator = lambda model_name, inp_lens: np.asarray([1]*len(inp_lens))
+        
+        if specify_outlen:
+            # set the output length to the exact value in the dataset
+            outlen_generator = get_outlens_router_bench
+
     elif test_case == 'general':
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
@@ -2284,7 +2329,7 @@ def _get_req_len_funcs(test_case:str, version:str, max_token_num: int):
 
 
 
-def _get_router_bench_data(version:str, max_token_num:int):
+def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2330,15 +2375,31 @@ def _get_router_bench_data(version:str, max_token_num:int):
     dataset_type = 'multiple_choice_question'
     dataset_type = 'not_multiple_choice_question'
     dataset_type = version
-    with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_{dataset_type}_dataset.json', 'r') as f:
+    # with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_{dataset_type}_dataset.json', 'r') as f:
+    with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/router_bench_{dataset_type}_dataset_with_responses.json', 'r') as f:
         prompt_dict = json.load(f)
     
     tot_inp_prompts = list()
 
     inp_seq_ids_dict = dict()
     req_num = 0
+    out_lens_dict = dict()
+    seq_outlen_dict = dict() # used to set sampling args for each request for each base model id
     for i, model_path in enumerate(model_paths):
-        prompts = prompt_dict[model_path]
+        data = prompt_dict[model_path]
+        prompts = data
+        seq_outlen_dict[i] = dict()
+        if isinstance(data[0], list):
+            # each record contains both prompt and response
+            prompts = [record[0] for record in data]
+            outs = [record[1] for record in data]
+            outlens = comp_outlens(model_path, outs)
+
+            model_name = model_path[model_path.find('/')+1:]
+            out_lens_dict[model_name] = outlens
+            seq_outlen_dict[i] = {req_id:out_len for req_id, out_len in \
+                 zip(range(req_num, req_num + len(prompts)), outlens)}
+        
         inp_seq_ids_dict[i] = list(range(req_num, req_num + len(prompts)))
         inp_seq_ids_dict[-(i+1)] = list(range(req_num, req_num + len(prompts)))
         req_num+=len(prompts)
@@ -2358,27 +2419,28 @@ def _get_router_bench_data(version:str, max_token_num:int):
     
     max_tokens = 4096 # int(1e9) # 8192 # int(1e9)
     max_tokens = max_token_num
-    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs('router', dataset_type, max_tokens)
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(
+        'router', dataset_type, max_tokens, specify_outlen)
     
     node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
                                     for i in range(len(model_paths))}
 
 
     # 4. we need to prepare the dummpy requests here
-    _init_dummy_requests(None, tot_inp_prompts, model_path=model_paths[0])
+    _init_dummy_requests(None, tot_inp_prompts, out_lens_dict)
 
 
     # 5. 
     independent_srcs = {i:False for i in range(len(model_paths))}
-    if dataset_type == 'multiple_choice_question':
-        max_tokens = 1
+    # if dataset_type == 'multiple_choice_question':
+    #     max_tokens = 1
     sampling_args2 = {                    
         "n":1,
         # <jingzhi> change to greedy sampling to check correctness.
         "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
         "top_p":1.0,
         "use_beam_search":False,
-        "ignore_eos":False, # False, # True (original),
+        "ignore_eos":False if not specify_outlen else True, # False, # True (original),
         "max_tokens":max_tokens, #int(1e9)
         }
     sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
@@ -2393,11 +2455,12 @@ def _get_router_bench_data(version:str, max_token_num:int):
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+            sampling_args_dict, seq_outlen_dict
 
 
 def _get_schedule_setting_with_real_data(
-        test_case: str, version:str, max_token_num:int, 
+        test_case: str, version:str, max_token_num:int, specify_outlen: bool,
         ratio_seed:int, ratio_set:int):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
@@ -2418,7 +2481,7 @@ def _get_schedule_setting_with_real_data(
     prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
     if test_case == 'router':
-        return _get_router_bench_data(version=version, max_token_num=max_token_num,)
+        return _get_router_bench_data(version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,)
     elif (test_case == 'general'):
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
@@ -2465,7 +2528,7 @@ def _get_schedule_setting_with_real_data(
             random_seed=args.seed)
         inp_prompts = [req[0] for req in requests]
         # # we need to prepare the dummpy requests here
-        _init_dummy_requests(None, inp_prompts, model_path=model_paths[0])
+        _init_dummy_requests(None, inp_prompts)
 
 
 
@@ -2527,7 +2590,7 @@ def _get_schedule_setting_with_real_data(
         independent_srcs = {i:False for i in range(len(model_paths))}
 
         # we need to prepare the dummpy requests here
-        _init_dummy_requests([chunk_size]*tot_req_num, sampled_inp_chunks, model_path=model_paths[0])
+        _init_dummy_requests([chunk_size]*tot_req_num, sampled_inp_chunks)
 
         req_num = tot_req_num
 
@@ -2630,7 +2693,7 @@ def _get_schedule_setting_with_real_data(
 
         # we need to prepare the dummpy requests here
         # _init_dummy_requests(inp_lens)
-        _init_dummy_requests(inp_lens, sampled_inps, model_path=model_paths[0])
+        _init_dummy_requests(inp_lens, sampled_inps)
         sampling_args1 = {                    
             "n":1,
             # <jingzhi> change to greedy sampling to check correctness.
@@ -2662,7 +2725,8 @@ def _get_schedule_setting_with_real_data(
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+            sampling_args_dict, seq_outlen_dict
 
 
 
@@ -2670,12 +2734,12 @@ def _get_schedule_setting_with_real_data(
 
 
 def get_schedule_setting(
-        test_case:str, version:str, max_token_num:int,
+        test_case:str, version:str, max_token_num:int, specify_outlen: bool,
         use_real_dataset:bool, ratio_seed:int, ratio_set:int):
 
     if use_real_dataset:
         return _get_schedule_setting_with_real_data(
-            test_case=test_case, version=version, max_token_num=max_token_num,
+            test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
             ratio_seed=ratio_seed, ratio_set=ratio_set)
     
 
@@ -2927,7 +2991,8 @@ def get_schedule_setting(
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict
+        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+            sampling_args_dict, seq_outlen_dict
 
 
 
@@ -2962,6 +3027,7 @@ if __name__ == "__main__":
     test_case = 'router' # 'general' 'map-reduce' 'chain-summary', 'router'
     version = 'not_multiple_choice_question' # 'multiple_choice_question' # for router dataset
     max_token_num = 4096
+    specify_outlen = True # True False
 
     gen_execplans_baseline = args.gen_execplans_baseline
     test_case = args.test_case
@@ -2971,12 +3037,13 @@ if __name__ == "__main__":
 
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
         num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, sampling_args_dict = \
-        get_schedule_setting(test_case=test_case, version=version, max_token_num=max_token_num, 
+             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict = \
+        get_schedule_setting(test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
                              use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
     
     asyncio.run(main_with_preemption(
-        test_case=test_case, version=version, max_token_num=max_token_num,
+        test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
         model_paths=model_paths,
         gen_execplans_baseline=gen_execplans_baseline,
         search_method_baseline=search_method_baseline,
@@ -2988,6 +3055,7 @@ if __name__ == "__main__":
         num_prompts=num_prompts, 
         # 
         sampling_args_dict=sampling_args_dict,
+        seq_outlen_dict=seq_outlen_dict,
         # 
         inp_seq_ids_dict=inp_seq_ids_dict, 
         inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 

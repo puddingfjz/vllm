@@ -910,6 +910,8 @@ class SHARED_CONTECT():
     # will be set when initialized and not changed during the scheduling.
     # {base model id: (ignore_eos, inp_len, out_len)}
     sampling_args_dict: Dict[int, SamplingParams] = None
+    # {base_model_id: {req_id: out_len}}
+    seq_outlen_dict: Dict[int, Dict[int, int]] = None
 
 
     # @classmethod
@@ -996,10 +998,18 @@ class SHARED_CONTECT():
         # return gpus
 
 
-    @classmethod
-    def get_sampling_args(cls, base_model_id: int)->SamplingParams:
-        return cls.sampling_args_dict[base_model_id]
+    # @classmethod
+    # def get_sampling_args(cls, base_model_id: int)->SamplingParams:
+    #     return cls.sampling_args_dict[base_model_id]
 
+
+    @classmethod
+    def get_sampling_args(cls, base_model_id: int, req_id: int)->SamplingParams:
+        sampling_args = cls.sampling_args_dict[base_model_id]
+        if sampling_args.ignore_eos:
+            # we must have specified the max token limit, update it
+            sampling_args.max_tokens = cls.seq_outlen_dict[base_model_id][req_id]
+        return sampling_args
 
 
 

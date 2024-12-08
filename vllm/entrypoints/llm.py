@@ -347,7 +347,7 @@ class LLM:
         
         if isinstance(new_inps[0][1], str):
             for (req_id, prompt), base_model_id in zip(new_inps, req_base_model_ids):
-                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id)
+                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id, req_id=req_id)
                 self._add_request(
                     prompt=prompt,
                     prompt_token_ids=None,
@@ -356,7 +356,7 @@ class LLM:
                 )
         else:
             for (req_id, prompt_token_ids), base_model_id in zip(new_inps, req_base_model_ids):
-                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id)
+                sampling_params = SHARED_CONTECT.get_sampling_args(base_model_id=base_model_id, req_id=req_id)
                 self._add_request(
                     prompt=None,
                     prompt_token_ids=prompt_token_ids,

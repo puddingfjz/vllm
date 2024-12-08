@@ -186,10 +186,12 @@ _build/
 # *.json
 # tmp inp prompt dataset
 /benchmarks/my_dummy_requests/my_dummy_requests.json
+/benchmarks/my_dummy_requests/my_dummy_requests_outlen.json
 
 
 # dataset files
 /benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json
+/benchmarks/train_data_prepared.jsonl
 
 
 # nsys profiling files
