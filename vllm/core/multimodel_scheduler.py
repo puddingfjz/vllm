@@ -63,6 +63,7 @@ class LLM_COMMUNICATOR:
             # 
             base_model_ids_dict: Dict[int, List[int]],
             inp_req_ids: Dict[int, Dict[int, List[int]]],
+            inp_req_from_which_model_which_out_reqs: Dict[int, Dict[int, Dict[int, int]]],
             out_req_id_mapping:Dict[int, Dict[int, Tuple[int, int]]],
             new_out_req_part_num: Dict[int, int],
             independent_srcs: Dict[int, bool],
@@ -104,6 +105,9 @@ class LLM_COMMUNICATOR:
         # init at the beginning
         # NOTE: req_ids is a set
         self.inp_req_ids: Dict[int, Dict[int, List[int]]] = inp_req_ids
+        self.inp_req_from_which_model_which_out_reqs: Dict[int, Dict[int, Dict[int, int]]] = inp_req_from_which_model_which_out_reqs
+        self.inp_req_from_which_model_which_out_reqs_reversed: Dict[int, Dict[int, Dict[int, List[int]]]] = None
+        self._init_inp_req_from_which_model_which_out_reqs_reversed()
 
         # store they way to reorganize out reqs from a model {model_id: {out_req_id: (new_out_req_id, ind)}}
         # NOTE: not every model has information stored in this dict, 
@@ -158,6 +162,41 @@ class LLM_COMMUNICATOR:
         for src in src_seqs[1:]:
             ret += src
         return ret
+    
+
+    def fuse_inp_srcs_based_on_template(self, src_seqs_list, base_model_id, one_src: bool):
+        if len(self.prompt_template_args[base_model_id]) <= 2:
+            # there is no given manual template
+            if one_src:
+                return src_seqs_list
+            else:
+                rets = [(req_id, ''.join(src_seqs)) for req_id, src_seqs in src_seqs_list]
+                return rets
+        else:
+            template = self.prompt_template_args[base_model_id][2]
+            if one_src:
+                return [(req_id, template.format(src_seqs)) for req_id, src_seqs in src_seqs_list]
+            else:
+                srcs_in_order = self.prompt_template_args[base_model_id][3]
+                inps = self.in_edge_dict_with_dummy_inp_nodes[base_model_id]
+                mapping = {inp:i for i, inp in enumerate(inps)}
+                return [(req_id, template.format(*[src_seqs[mapping[src]] for src in srcs_in_order])) \
+                        for req_id, src_seqs in src_seqs_list]
+
+
+
+
+
+    def _init_inp_req_from_which_model_which_out_reqs_reversed(self):
+        self.inp_req_from_which_model_which_out_reqs_reversed = dict()
+        for to_model_id, from_info in self.inp_req_from_which_model_which_out_reqs.items():
+            self.inp_req_from_which_model_which_out_reqs_reversed[to_model_id] = dict()
+            to_info = self.inp_req_from_which_model_which_out_reqs_reversed[to_model_id]
+            for from_model_id, from_req_info in from_info.items():
+                to_info[from_model_id] = {out_req_id:list() for out_req_id in from_req_info.values()}
+                to_req_info = to_info[from_model_id]
+                for inp_req_id, out_req_id in from_req_info.items():
+                    to_req_info[out_req_id].append(inp_req_id)
 
 
 
@@ -166,14 +205,25 @@ class LLM_COMMUNICATOR:
             Prepare tokenizers for the base models.
         """
         print(f"in _init_model_tokenizers")
+        _tmp_tokenizer_dict = dict()
 
         for base_model_id, args in self.prompt_template_args.items():
-            tokenizer_name, trust_remote_code = args
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name, trust_remote_code=trust_remote_code)
+            tokenizer_name, trust_remote_code = args[:2]
+
+            # check whether we have get an tokenizer for this setting
+            tokenizer = None
+            if (tokenizer_name, trust_remote_code) in _tmp_tokenizer_dict:
+                tokenizer = _tmp_tokenizer_dict[(tokenizer_name, trust_remote_code)]
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_name, trust_remote_code=trust_remote_code)
+                _tmp_tokenizer_dict[(tokenizer_name, trust_remote_code)] = tokenizer
+
+            # tokenizer = AutoTokenizer.from_pretrained(
+            #     tokenizer_name, trust_remote_code=trust_remote_code)
             self.base_model_tokenizers[base_model_id]=tokenizer    
 
-            print(f"self.base_model_tokenizers[base_model_id]: {self.base_model_tokenizers[base_model_id]}", flush=True)
+            # print(f"self.base_model_tokenizers[base_model_id]: {self.base_model_tokenizers[base_model_id]}", flush=True)
 
 
 
@@ -244,7 +294,7 @@ class LLM_COMMUNICATOR:
         remaining = sorted(remaining, key=lambda inp: inp[0])
         self.fused_inp_queues[model_id] = remaining
         self.fetched_fused_inp_start[model_id] = [i for i in range(dp_size)]
-        print(f"In _reset_state_for_model, parameters: (base_model_id, dp_size): {model_id, dp_size} self.fetched_fused_inp_start: {self.fetched_fused_inp_start} self.fused_inp_queues: {self.fused_inp_queues}\n")
+        # print(f"In _reset_state_for_model, parameters: (base_model_id, dp_size): {model_id, dp_size} self.fetched_fused_inp_start: {self.fetched_fused_inp_start} self.fused_inp_queues: {self.fused_inp_queues}\n")
 
 
 
@@ -421,9 +471,17 @@ class LLM_COMMUNICATOR:
         start = self._read_output_nums[(from_model_id, to_model_id)]
         self._read_output_nums[(from_model_id, to_model_id)] = end
         
-        if (to_model_id in self.inp_req_ids) and (from_model_id in self.inp_req_ids[to_model_id]):
-            inp_req_ids = self.inp_req_ids[to_model_id][from_model_id]
-            ret = [req for req in self.output_pool[from_model_id][start:end] if req[0] in inp_req_ids]
+        # if (to_model_id in self.inp_req_ids) and (from_model_id in self.inp_req_ids[to_model_id]):
+        #     inp_req_ids = self.inp_req_ids[to_model_id][from_model_id]
+        #     ret = [req for req in self.output_pool[from_model_id][start:end] if req[0] in inp_req_ids]
+        #     return ret
+
+        # consider the case where multiple inp reqs are from the same out req from the inp models
+        if (to_model_id in self.inp_req_from_which_model_which_out_reqs_reversed) \
+            and (from_model_id in self.inp_req_from_which_model_which_out_reqs_reversed[to_model_id]):
+            out_req_ids = self.inp_req_from_which_model_which_out_reqs_reversed[to_model_id][from_model_id]
+            _ret = [req for req in self.output_pool[from_model_id][start:end] if req[0] in out_req_ids]
+            ret = [(inp_req_id, req[1]) for req in _ret for inp_req_id in out_req_ids[req[0]]]
             return ret
         else:
             # return all the avaliable reqs
@@ -535,6 +593,10 @@ class LLM_COMMUNICATOR:
                     
             # sort the reqs by their req ids
             reqs = sorted(reqs, key=lambda x: x[0])
+
+            # here we need to consider some prompt template if any
+            reqs = self.fuse_inp_srcs_based_on_template(reqs, to_model_id, one_src=True)
+
             self.fused_inp_queues[to_model_id].extend(reqs)
 
             # print(f"self.fused_inp_queues[to_model_id]: {to_model_id}: {self.fused_inp_queues[to_model_id]}")
@@ -568,7 +630,11 @@ class LLM_COMMUNICATOR:
             # print(f"_get_fused_inp_queues, to_model_id: {to_model_id}, 7, inp_i, from_model_id: {inp_i, from_model_id}  self._available_srcs[to_model_id]: {self._available_srcs[to_model_id]}")
             
             new_complete_req_ids = sorted(new_complete_req_ids)
-            reqs = [(req_id, self.fuse_inp_srcs(self._available_srcs[to_model_id][req_id][1])) for req_id in new_complete_req_ids]
+            # reqs = [(req_id, self.fuse_inp_srcs(self._available_srcs[to_model_id][req_id][1])) for req_id in new_complete_req_ids]
+            # here we need to consider some prompt template if any
+            reqs = [(req_id, self._available_srcs[to_model_id][req_id][1]) for req_id in new_complete_req_ids]
+            reqs = self.fuse_inp_srcs_based_on_template(reqs, to_model_id, one_src=False)
+
             self.fused_inp_queues[to_model_id].extend(reqs)
 
             # print(f"self.fused_inp_queues[to_model_id]: {to_model_id}: {self.fused_inp_queues[to_model_id]}")
@@ -684,7 +750,7 @@ class LLM_COMMUNICATOR:
                         
                         self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
 
-                        print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
+                        # print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.1, ret: {ret}")
 
                         return ret, possible_to_get_future_reqs
                     else:
@@ -695,14 +761,14 @@ class LLM_COMMUNICATOR:
 
                         assert self._unavailable_req_nums[to_model_id] >= 0, f"assert self._unavailable_req_nums[to_model_id] >= 0 wrong: {self._unavailable_req_nums[to_model_id]}"
 
-                        print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
+                        # print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5.2, self._unavailable_req_nums: {self._unavailable_req_nums}")
 
                         return [], possible_to_get_future_reqs
                 else:
                     # run the normal get_seq process
                     ret = self._get_seqs(to_model_id, dp_id, dp_size)
 
-                    print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
+                    # print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 6, ret: {ret}")
 
                     self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
                     return ret, possible_to_get_future_reqs
@@ -713,7 +779,7 @@ class LLM_COMMUNICATOR:
 
                 self._update_out_req_model_id_mapping(to_shared_id, base_model_id=to_model_id, reqs=ret)
 
-                print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5")
+                # print(f"to_shared_id: {to_shared_id}, to_model_id: {to_model_id}, 5")
 
                 return ret, possible_to_get_future_reqs
 
@@ -734,11 +800,11 @@ class LLM_COMMUNICATOR:
         # 1. apply chat template if possible
         tokenizer = self.base_model_tokenizers[base_model_id]
 
-        print(f"\n\ntrying to apply chat template: base_model_id: {base_model_id}, tokenizer.chat_template: {tokenizer.chat_template}----------------\n\n")
+        # print(f"\n\ntrying to apply chat template: base_model_id: {base_model_id}, tokenizer.chat_template: {tokenizer.chat_template}----------------\n\n")
 
         if tokenizer.chat_template != None:
-            print(f"\n\napplying chat template----------------\n\n")
-            print(tokenizer.chat_template, flush=True)
+            # print(f"\n\napplying chat template----------------\n\n")
+            # print(tokenizer.chat_template, flush=True)
             ret = [(req_i, tokenizer.apply_chat_template([{"role": "user", "content": ori_prompt}], add_generation_prompt=True, tokenize=False)) \
                       for req_i, ori_prompt in seqs]
         
@@ -1005,11 +1071,19 @@ class SHARED_CONTECT():
 
     @classmethod
     def get_sampling_args(cls, base_model_id: int, req_id: int)->SamplingParams:
-        sampling_args = cls.sampling_args_dict[base_model_id]
-        if sampling_args.ignore_eos:
-            # we must have specified the max token limit, update it
-            sampling_args.max_tokens = cls.seq_outlen_dict[base_model_id][req_id]
-        return sampling_args
+        if len(cls.sampling_args_dict[base_model_id]) == 1:
+            # all requests share the same sampling params
+            return list(cls.sampling_args_dict[base_model_id].values())[0]
+        else:
+            return cls.sampling_args_dict[base_model_id][req_id]
+
+        # sampling_args = cls.sampling_args_dict[base_model_id]
+        # if sampling_args.ignore_eos:
+        #     # we must have specified the max token limit, update it
+        #     sampling_args.max_tokens = cls.seq_outlen_dict[base_model_id][req_id]
+        # print(f"cls.seq_outlen_dict[base_model_id][req_id]: {cls.seq_outlen_dict[base_model_id][req_id]}")
+        # print(sampling_args)
+        # return sampling_args
 
 
 

@@ -9,4 +9,6 @@ wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/r
 wget https://huggingface.co/datasets/liyucheng/arxiv-march-2023/resolve/main/data/train-00000-of-00001-b334c773bce22cb2.parquet
 
 wget https://huggingface.co/datasets/llm-blender/mix-instruct/resolve/main/train_data_prepared.jsonl
+
+https://huggingface.co/datasets/kmfoda/booksum/resolve/main/train.csv
 ```

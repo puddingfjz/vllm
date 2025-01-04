@@ -118,6 +118,43 @@ class CostTable:
             f.write(f"cost_table = my_per_iter_latency_estimator.CostTable([],[],[],metadata=metadata)\n")
 
 
+
+
+    def update_meta_data(self, filename: str):
+        
+        model_paths = [k[0] for k in self.prefill_table.keys()]
+        (prefill_table, decode_table,\
+         sample_prefill_table, sample_decode_table, \
+            prepInp_prefill_table, prepInp_decode_table, \
+                model_configs, prepare_cost_table) = self.serialize(model_paths=model_paths)
+        
+        with open(filename, 'a') as f:
+            # f.write('import my_per_iter_latency_estimator\n')
+            f.write(f"\n")
+            f.write(f"prefill_table[0].extend({prefill_table[0]})\n")
+            f.write(f"prefill_table[1].extend({prefill_table[1]})\n")
+            f.write(f"decode_table[0].extend({decode_table[0]})\n")
+            f.write(f"decode_table[1].extend({decode_table[1]})\n")
+            f.write(f"sample_prefill_table[0].extend({sample_prefill_table[0]})\n")
+            f.write(f"sample_prefill_table[1].extend({sample_prefill_table[1]})\n")
+            f.write(f"sample_decode_table[0].extend({sample_decode_table[0]})\n")
+            f.write(f"sample_decode_table[1].extend({sample_decode_table[1]})\n")
+            f.write(f"prepInp_prefill_table[0].extend({prepInp_prefill_table[0]})\n")
+            f.write(f"prepInp_prefill_table[1].extend({prepInp_prefill_table[1]})\n")
+            f.write(f"prepInp_decode_table[0].extend({prepInp_decode_table[0]})\n")
+            f.write(f"prepInp_decode_table[1].extend({prepInp_decode_table[1]})\n")
+            f.write(f"model_configs.update({model_configs})\n")
+            f.write(f"prepare_cost_table.update({prepare_cost_table})\n")
+            f.write(f"cost_table = my_per_iter_latency_estimator.get_cost_table_from_serialized_data(prefill_table, decode_table,"\
+                "sample_prefill_table, sample_decode_table, "\
+                "prepInp_prefill_table, prepInp_decode_table, "\
+                "model_configs, prepare_cost_table)")
+        return 
+
+
+
+
+
     def serialize(self, model_paths: List[str]):
         def _to_list(to_convert, model_paths):
             keys = [k for k in to_convert.keys() if k[0] in model_paths]
@@ -794,18 +831,21 @@ def get_cost_table_zxcpu():
     model_exec_settings.extend(
         [(model_path, (tp, 0.9, 2, 0))
          for model_path in [
-            'lmsys/vicuna-13b-v1.5',
-            'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
-            'chavinlo/alpaca-13b',
-            'project-baize/baize-v2-13b',
-            'TheBloke/koala-13B-HF',
-            'databricks/dolly-v2-12b',
-            'mosaicml/mpt-7b-chat',
-            'meta-llama/Llama-2-70b-chat-hf',
-            'mistralai/Mixtral-8x7B-Instruct-v0.1',
-            'WizardLMTeam/WizardLM-13B-V1.2',
-            'meta-llama/CodeLlama-34b-Instruct-hf',
-            'mistralai/Mistral-7B-Instruct-v0.2',
+            # 'lmsys/vicuna-13b-v1.5',
+            # 'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+            # 'chavinlo/alpaca-13b',
+            # 'project-baize/baize-v2-13b',
+            # 'TheBloke/koala-13B-HF',
+            # 'databricks/dolly-v2-12b',
+            # 'mosaicml/mpt-7b-chat',
+            # 'meta-llama/Llama-2-70b-chat-hf',
+            # 'mistralai/Mixtral-8x7B-Instruct-v0.1',
+            # 'WizardLMTeam/WizardLM-13B-V1.2',
+            # 'meta-llama/CodeLlama-34b-Instruct-hf',
+            # 'mistralai/Mistral-7B-Instruct-v0.2',
+            # 
+            'THUDM/chatglm3-6b',
+            'stabilityai/stablelm-tuned-alpha-7b',
          ] for tp in [1,2] if not \
             ( (model_path in [\
                 'mistralai/Mixtral-8x7B-v0.1', \
@@ -843,19 +883,22 @@ def get_cost_table_zxcpu():
                         # 'mistralai/Mixtral-8x7B-v0.1',
                         # 
                         # add NEWROUND models from LLM-blender---------------------
-                        'lmsys/vicuna-13b-v1.5',
-                        'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
-                        'chavinlo/alpaca-13b',
-                        'project-baize/baize-v2-13b',
-                        'TheBloke/koala-13B-HF',
-                        'databricks/dolly-v2-12b',
-                        'mosaicml/mpt-7b-chat',
+                        # 'lmsys/vicuna-13b-v1.5',
+                        # 'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+                        # 'chavinlo/alpaca-13b',
+                        # 'project-baize/baize-v2-13b',
+                        # 'TheBloke/koala-13B-HF',
+                        # 'databricks/dolly-v2-12b',
+                        # 'mosaicml/mpt-7b-chat',
+                        # # 
+                        # 'meta-llama/Llama-2-70b-chat-hf',
+                        # 'mistralai/Mixtral-8x7B-Instruct-v0.1',
+                        # 'WizardLMTeam/WizardLM-13B-V1.2',
+                        # 'meta-llama/CodeLlama-34b-Instruct-hf',
+                        # 'mistralai/Mistral-7B-Instruct-v0.2',     
                         # 
-                        'meta-llama/Llama-2-70b-chat-hf',
-                        'mistralai/Mixtral-8x7B-Instruct-v0.1',
-                        'WizardLMTeam/WizardLM-13B-V1.2',
-                        'meta-llama/CodeLlama-34b-Instruct-hf',
-                        'mistralai/Mistral-7B-Instruct-v0.2',                        
+                        'THUDM/chatglm3-6b',
+                        'stabilityai/stablelm-tuned-alpha-7b',                   
                         ]
                 #    in ['NousResearch/Llama-2-7b-hf', 
                 #        'NousResearch/Llama-2-13b-hf',
@@ -874,7 +917,8 @@ def get_cost_table_zxcpu():
         model_infos=model_infos,
         machine_name='zxcpu')
 
-    cost_table.store_meta_data(filename='get_my_cost_table_directly_zxcpu.py')
+    # cost_table.store_meta_data(filename='get_my_cost_table_directly_zxcpu.py')
+    cost_table.update_meta_data(filename='get_my_cost_table_directly_zxcpu.py')
 
     return cost_table
 

@@ -628,26 +628,26 @@ done
 
 
 # 重新跑不同temprature下的LLM-Blender里的模型，加了chat template
-for temp in 0.2 0.4 0.6 0.8
+for temp in 0.7 0.5 # 0.2 0.4 0.6 0.8
 do
     CUDA_VISIBLE_DEVICES=0,1 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model lmsys/vicuna-13b-v1.5 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_vicuna-13b-v1.5_tp2_temp${temp}_1205_10kreq_1.log
     CUDA_VISIBLE_DEVICES=0,1 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5 --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_oasst-sft-4-pythia-12b-epoch-3.5_tp2_temp${temp}_1205_10kreq_1.log
 done
 
-for temp in 0.2 0.4 0.6 0.8
+for temp in 0.7 0.5 # 0.2 0.4 0.6 0.8
 do
     CUDA_VISIBLE_DEVICES=2,3 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model chavinlo/alpaca-13b --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_alpaca-13b_tp2_temp${temp}_1205_10kreq_1.log
     CUDA_VISIBLE_DEVICES=2,3 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model project-baize/baize-v2-13b --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_baize-v2-13b_tp2_temp${temp}_1205_10kreq_1.log
 done
 
-for temp in 0.2 0.4 0.6 0.8
+for temp in 0.7 0.5 # 0.2 0.4 0.6 0.8
 do
     CUDA_VISIBLE_DEVICES=4,5 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model TheBloke/koala-13B-HF --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_koala-13B-HF_tp2_temp${temp}_1205_10kreq_1.log
     CUDA_VISIBLE_DEVICES=4,5 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model databricks/dolly-v2-12b --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_dolly-v2-12b_tp2_temp${temp}_1205_10kreq_1.log
 done
 
 
-for temp in 0.2 0.4 0.6 0.8
+for temp in 0.7 0.5 # 0.2 0.4 0.6 0.8
 do
     CUDA_VISIBLE_DEVICES=6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model mosaicml/mpt-7b-chat --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_mpt-7b-chat_tp2_temp${temp}_1205_10kreq_1.log
     CUDA_VISIBLE_DEVICES=6,7 python3 benchmark_throughput.py --backend vllm_ori --dataset no_robot.parquet --model THUDM/chatglm3-6b --num-prompts 10000 --enforce-eager -tp 2 --trust-remote-code --temperature $temp -gpuratio 0.9 -wldegree 2 > collect_output_lengths/no_robot/NEWROUND_chatglm3-6b_tp2_temp${temp}_1205_10kreq_1.log
@@ -775,4 +775,257 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-bas
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-router_naiveSearchSpace_V2_Not_MCQ_set_outlen_1.log
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-router_ours_Not_MCQ_set_outlen_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_8gpu-router_naiveSearchSpace_V2_Not_MCQ_set_outlen_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_8gpu-router_ours_Not_MCQ_set_outlen_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_8gpu-router_ours_Not_MCQ_set_outlen_topk1_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_8gpu-router_naiveSearchSpace_V2_MCQ_set_outlen_1.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_8gpu-router_ours_MCQ_set_outlen_topk1_quota1_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-router_naiveSearchSpace_V2_MCQ_set_outlen_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case router --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-router_ours_MCQ_set_outlen_topk1_quota1_1.log
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-blender_naiveSearchSpace_V2_maxlen_512_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-blender_ours_maxlen_512_1.log
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-blender_naiveSearchSpace_V2_maxlen_512_10k_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case general --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1208_4gpu-blender_ours_maxlen_512_10k_1.log
+
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_naiveSearchSpace_V2_maxlen_900_1k_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_ours_maxlen_900_1k_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_naiveSearchSpace_V2_maxlen_900_100_1.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_ours_maxlen_900_100_1.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_naiveSearchSpace_V2_maxlen_900_500_3.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_4gpu-booookscore_ours_maxlen_900_500_3.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_maxlen_900_500_4.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_maxlen_900_500_4.log
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_maxlen_900_500_8.log
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_maxlen_900_500_8.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_maxlen_900_500_9.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_maxlen_900_500_9.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_17.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_17.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_18.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_18.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_19.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_19.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_20.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_20.log
+
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_21.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_21.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_22.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_22.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_23.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_23.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_24.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_24.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_25.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_25.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_26.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_26.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_27.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_27.log
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline naive --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_naiveSearchSpace_V2_2eval_maxlen_900_500_28.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1211_8gpu-booookscore_ours_2eval_maxlen_900_500_28.log
+
+
+
+
+# 看到底为什么vertically fused model的cost estimation很慢
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline ours --test-case chain-summary --ratio-seed 0 --ratio-set 1  > test_end2end_schedule/test_1228_8gpu-booookscore_ours_2eval_maxlen_900_500_1.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 正式用命令行测试所有实验结果
+
+
+gpu_name=A100-80G
+byte_per_gpu=85899345920
+max_group_seq_num=1
+top_k=20
+similar_threshold=0.2
+fully_connected_gpu_unit=2
+machine_name=zxcpu
+
+
+gen_execplans_baseline=ours
+# gen_execplans_baseline=naive
+specify_outlen=
+# specify_outlen=--specify_outlen
+
+# chain-summary
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case chain-summary --ratio-seed 0 --ratio-set 1 --reqnum 100 --max_token_num 900 --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num 8 --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name --evaluator_num 3 --summarize_model 'lmsys/vicuna-13b-v1.5' --evaluator_model 'meta-llama/Llama-2-70b-chat-hf' > test_end2end_schedule/test_0104_8gpu-booookscore_${gen_execplans_baseline}_5eval_maxlen_900_500_1.log
+
+
+# ensemble
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case general --ratio-seed 0 --ratio-set 1 --reqnum 10000 --max_token_num 512 $specify_outlen --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num 8 --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name > test_end2end_schedule/test_1231_8gpu-llm-blender_${gen_execplans_baseline}_maxlen_512_10k_1.log
+
+
+# router
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case router --ratio-seed 0 --ratio-set 1 --reqnum 10000 --router_question_version 'not_multiple_choice_question' --max_token_num 4096  $specify_outlen --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num 8 --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name > test_end2end_schedule/test_1231_8gpu-router_${gen_execplans_baseline}_maxlen_4096_10k_1.log
+
+
+
+
+
+# 运行实验需要的各种setting
+
+# for gpu_name in A100-40G A100-80G
+for gpu_name in A100-80G
+do
+    byte_per_gpu=85899345920
+    if [ $gpu_name = A100-40G ]; then
+        byte_per_gpu=42949672960
+    fi
+    # for tot_gpu_num in 8 4
+    for tot_gpu_num in 8 4
+    do
+        gpu_ids=0,1,2,3,4,5,6,7
+        if [ $tot_gpu_num -eq 4 ]; then
+            gpu_ids=0,1,2,3
+        fi
+        for max_group_seq_num in 1 20
+        do 
+            top_k=20
+            similar_threshold=0.2
+            fully_connected_gpu_unit=2
+            machine_name=zxcpu
+
+            specify_outlen=
+            # chain-summary
+            # for summarize_model in lmsys/vicuna-13b-v1.5 mistralai/Mixtral-8x7B-Instruct-v0.1
+            for summarize_model in lmsys/vicuna-13b-v1.5 
+            do
+                summarize_model_setting=vicuna-13b-v1.5
+                if [ $summarize_model = mistralai/Mixtral-8x7B-Instruct-v0.1 ]; then
+                    summarize_model_setting=Mixtral-8x7B-Instruct-v0.1
+                fi
+                # for reqnum in 100 300 500 700
+                for reqnum in 100 300 500
+                do
+                    # for evaluator_num in 1 2 3 4 5 6 7
+                    for evaluator_num in 2 4 6 8
+                    do
+                        for gen_execplans_baseline in ours naive
+                        do
+                            if [ $max_group_seq_num -eq 20 ] && [ $gen_execplans_baseline = naive ]; then
+                                continue
+                            fi
+
+                            if [ -a test_end2end_schedule/test_1231_${tot_gpu_num}gpu-booookscore_${gen_execplans_baseline}_${gpu_name}_${machine_name}_${summarize_model_setting}_${evaluator_num}eval_maxlen_900_${reqnum}_${max_group_seq_num}_1.log ]; then
+                                echo skip test_1231_${tot_gpu_num}gpu-booookscore_${gen_execplans_baseline}_${gpu_name}_${machine_name}_${summarize_model_setting}_${evaluator_num}eval_maxlen_900_${reqnum}_${max_group_seq_num}_1.log
+                                continue
+                            fi
+
+                            CUDA_VISIBLE_DEVICES=$gpu_ids python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case chain-summary --ratio-seed 0 --ratio-set 1 --reqnum $reqnum --max_token_num 900 --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num $tot_gpu_num --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name --evaluator_num $evaluator_num --summarize_model $summarize_model --evaluator_model meta-llama/Llama-2-70b-chat-hf >> test_end2end_schedule/test_1231_${tot_gpu_num}gpu-booookscore_${gen_execplans_baseline}_${gpu_name}_${machine_name}_${summarize_model_setting}_${evaluator_num}eval_maxlen_900_${reqnum}_${max_group_seq_num}_1.log
+                        done
+                    done
+                done
+            done
+            specify_outlen=
+            # router
+            for use_specify_outlen in no yes
+            do
+                specify_outlen=
+                outlen_file_name_setting=maxlen_4096
+                if [ $use_specify_outlen = yes ]; then
+                    specify_outlen=--specify_outlen
+                    outlen_file_name_setting=setOutlen
+                fi
+
+                echo use_specify_outlen: $use_specify_outlen  specify_outlen: $specify_outlen
+
+                for gen_execplans_baseline in ours naive
+                do 
+                    if [ $max_group_seq_num -eq 20 ] && [ $gen_execplans_baseline = naive ]; then
+                        continue
+                    fi
+
+                    if [ -a test_end2end_schedule/test_1231_${tot_gpu_num}gpu-router_${gen_execplans_baseline}_${gpu_name}_${machine_name}_not_multiple_choice_question_${outlen_file_name_setting}_10000_${max_group_seq_num}_1.log ]; then
+                        echo skip test_1231_${tot_gpu_num}gpu-router_${gen_execplans_baseline}_${gpu_name}_${machine_name}_not_multiple_choice_question_${outlen_file_name_setting}_10000_${max_group_seq_num}_1.log
+                        continue
+                    fi
+
+                    CUDA_VISIBLE_DEVICES=$gpu_ids python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case router --ratio-seed 0 --ratio-set 1 --reqnum 10000 --router_question_version 'not_multiple_choice_question' --max_token_num 4096  $specify_outlen --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num $tot_gpu_num --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name >> test_end2end_schedule/test_1231_${tot_gpu_num}gpu-router_${gen_execplans_baseline}_${gpu_name}_${machine_name}_not_multiple_choice_question_${outlen_file_name_setting}_10000_${max_group_seq_num}_1.log
+                done
+            done
+            specify_outlen=
+            # ensemble
+            for reqnum in 1000 5000 10000 
+            do
+                for max_token_num in 512 256
+                do
+                    for gen_execplans_baseline in ours naive
+                    do 
+
+                        if [ $max_group_seq_num -eq 20 ] && [ $gen_execplans_baseline = naive ]; then
+                            continue
+                        fi
+
+                        if [ -a test_end2end_schedule/test_1231_${tot_gpu_num}gpu-llm-blender_${gen_execplans_baseline}_${gpu_name}_${machine_name}_maxlen_${max_token_num}_${reqnum}_${max_group_seq_num}_1.log ]; then
+                            echo skip test_1231_${tot_gpu_num}gpu-llm-blender_${gen_execplans_baseline}_${gpu_name}_${machine_name}_maxlen_${max_token_num}_${reqnum}_${max_group_seq_num}_1.log
+                            continue
+                        fi
+
+                        CUDA_VISIBLE_DEVICES=$gpu_ids python3 schedule_multi_model.py --gen-execplans-baseline $gen_execplans_baseline --test-case general --ratio-seed 0 --ratio-set 1 --reqnum $reqnum --max_token_num $max_token_num $specify_outlen --gpu_name $gpu_name --byte_per_gpu $byte_per_gpu --tot_gpu_num $tot_gpu_num --max_group_seq_num $max_group_seq_num --top_k $top_k --similar_threshold $similar_threshold --fully_connected_gpu_unit $fully_connected_gpu_unit --machine_name $machine_name >> test_end2end_schedule/test_1231_${tot_gpu_num}gpu-llm-blender_${gen_execplans_baseline}_${gpu_name}_${machine_name}_maxlen_${max_token_num}_${reqnum}_${max_group_seq_num}_1.log
+                    done
+                done
+            done
+        done
+    done
+done
+
+
+
+
 

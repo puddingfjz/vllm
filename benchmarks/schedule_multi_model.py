@@ -441,8 +441,11 @@ def search_best_scheduling(
         inp_seq_ids_dict, 
         out_req_id_mapping: Dict[int, Dict[int, Tuple[int, int]]],
         inp_req_ids: Dict[int, Dict[int, List[int]]], 
+        inp_req_from_which_model_which_out_reqs: Dict[int, Dict[int, Dict[int, int]]],
+        # 
         independent_srcs: Dict[int, bool],
         # inp_generator, inp_merger, outlen_generator,
+        prompt_templates_lens: List[int],
         # 
         gpu_name='A100-80G',
         byte_per_gpu=80*(1024**3),
@@ -473,11 +476,13 @@ def search_best_scheduling(
         inp_seq_ids_dict,
         out_req_id_mapping,
         inp_req_ids, 
+        inp_req_from_which_model_which_out_reqs,
         independent_srcs,
         # 
         inp_generator,
         inp_merger,
         outlen_generator,
+        prompt_templates_lens,
         out_edge_dict,
         sample_config=(1, 1, -1, 0),
         trust_remote_code=True, revision=None,
@@ -1326,17 +1331,22 @@ def init_prompts_for_the_model_system(
 
         print(f"model_id, (dataset, chunk_id, chunk_size): {model_id, (dataset, chunk_id, chunk_size)} prompt_lens: {[len(req) for _, req in dataset_dict[dataset]]}")
 
+        # if the dataset is chunked for chain-summary, we need to extract the chunks for the model with model_id
+        if isinstance(to_add[0][1], list):
+            to_add = [(req_i, chunks[chunk_id]) if chunk_id < len(chunks) else None for (req_i, chunks) in inp_prompts]
 
-        if dataset != None:
-            if chunk_size > 0:
-                to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
-        else:
-            if chunk_size > 0:
-                # to_add = [(i, req[max(0,(chunk_id*chunk_size-1)*2):((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
-                to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
+
+        # if dataset != None:
+        #     if chunk_size > 0:
+        #         to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
+        # else:
+        #     if chunk_size > 0:
+        #         # to_add = [(i, req[max(0,(chunk_id*chunk_size-1)*2):((chunk_id+1)*chunk_size-1)*2]) for i, req in inp_prompts if (len(req)>(chunk_id*chunk_size-1)*2)]
+        #         to_add = [(i, req[chunk_id*chunk_size:(chunk_id+1)*chunk_size]) for i, req in inp_prompts if (len(req)>chunk_id*chunk_size)]
 
         # communicator.add_seqs(model_id, to_add)
         if model_id not in inp_seq_ids_dict:
+            assert False
             prompts_dict[model_id] = to_add
             req_num_dict[model_id] = len(to_add)
         else:
@@ -1562,7 +1572,12 @@ def _search_best_scheduling_with_another_process(
         check_gap, sort_input,
         num_prompts, 
         inp_seq_ids_dict, 
-        out_req_id_mapping, inp_req_ids, independent_srcs,
+        out_req_id_mapping, inp_req_ids, 
+        inp_req_from_which_model_which_out_reqs,
+        # 
+        independent_srcs,
+        # 
+        prompt_templates_lens, 
         # 
         gpu_name,
         byte_per_gpu,
@@ -1587,8 +1602,12 @@ def _search_best_scheduling_with_another_process(
                     check_gap, sort_input,
                     num_prompts, 
                     inp_seq_ids_dict, 
-                    out_req_id_mapping, inp_req_ids, independent_srcs,
+                    out_req_id_mapping, inp_req_ids, 
+                    inp_req_from_which_model_which_out_reqs,
+                    # 
+                    independent_srcs,
                     # inp_generator, inp_merger, outlen_generator,
+                    prompt_templates_lens, 
                     # 
                     gpu_name,
                     byte_per_gpu,
@@ -1622,10 +1641,14 @@ async def main_with_preemption(
         seq_outlen_dict: Dict[int, Dict[int,int]],
         # 
         inp_seq_ids_dict, 
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+        inp_req_ids, 
+        inp_req_from_which_model_which_out_reqs,
+        # 
+        out_req_id_mapping, new_out_req_part_num, independent_srcs,
         prompt_template_args: Dict[int, Tuple],
         # 
         inp_generator, inp_merger, outlen_generator,
+        prompt_templates_lens, 
         # 
         gpu_name='A100-80G',
         byte_per_gpu=80*(1024**3),
@@ -1682,8 +1705,12 @@ async def main_with_preemption(
         check_gap, sort_input,
         num_prompts, 
         inp_seq_ids_dict, 
-        out_req_id_mapping, inp_req_ids, independent_srcs,
+        out_req_id_mapping, inp_req_ids, 
+        inp_req_from_which_model_which_out_reqs,
+        # 
+        independent_srcs,
         # inp_generator, inp_merger, outlen_generator,
+        prompt_templates_lens, 
         # 
         gpu_name,
         byte_per_gpu,
@@ -1697,7 +1724,7 @@ async def main_with_preemption(
 
     
     # # TODO: <jingzhi> FOR DEBUG
-    return
+    # return
 
     # get the NEW model system STRUCTURE from the ``plan_state_group_list``
     model_id_shared_id_mapping, model_dict, new_in_edge_dict_with_dummy_inp_nodes, new_out_edge_dict = \
@@ -1745,7 +1772,7 @@ async def main_with_preemption(
             new_model_num, # len(model_paths), 
             in_edge_dict_with_dummy_inp_nodes,
             shared_id_2_base_model_ids_dict,
-            inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs,
+            inp_req_ids, inp_req_from_which_model_which_out_reqs, out_req_id_mapping, new_out_req_part_num, independent_srcs,
             prompt_template_args,
             )
 
@@ -2192,20 +2219,39 @@ def _get_document_prompts(
 
 
 
+
+def get_token_num(model_path: str, seqs: List[str]) -> List[int]:
+    args = InferenceArgs(model=model_path, num_prompts=1)
+    from transformers import AutoTokenizer
+    # Sample the requests.
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, trust_remote_code=args.trust_remote_code)
+    token_ids = tokenizer(seqs).input_ids
+    token_nums = [len(tokens) for tokens in token_ids]
+    return token_nums
+
+
+
+
+
+
+
+
 # directly get req lengths 
 # get seqs with specific seq ids
-def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
+def get_inplens(req_num: int, model_id: int, model_path: str, inp_seq_ids: List[int]):
     import json
     inp_lens = list()
     with open("./my_dummy_requests/my_dummy_requests.json", 'r') as file:
         prompts = json.load(file)
-        args = InferenceArgs(model=model_path, num_prompts=req_num)
-        from transformers import AutoTokenizer
-        # Sample the requests.
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, trust_remote_code=args.trust_remote_code)
-        prompt_token_ids = tokenizer(prompts).input_ids
-        inp_lens = [len(prompt) for prompt in prompt_token_ids]
+        inp_lens = get_token_num(model_path, prompts)
+        # args = InferenceArgs(model=model_path, num_prompts=req_num)
+        # from transformers import AutoTokenizer
+        # # Sample the requests.
+        # tokenizer = AutoTokenizer.from_pretrained(
+        #     args.tokenizer, trust_remote_code=args.trust_remote_code)
+        # prompt_token_ids = tokenizer(prompts).input_ids
+        # inp_lens = [len(prompt) for prompt in prompt_token_ids]
     
     # assert len(inp_lens) == req_num
     print(f"len(inp_lens):{len(inp_lens)}, inp_seq_ids:{inp_seq_ids}")
@@ -2214,17 +2260,145 @@ def get_inplens(req_num: int, model_path: str, inp_seq_ids: List[int]):
 
 
 
-def comp_outlens(model_path: str, responses: List[str]) -> List[int]:
-    args = InferenceArgs(model=model_path, num_prompts=1)
-    from transformers import AutoTokenizer
-    # Sample the requests.
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=args.trust_remote_code)
-    response_token_ids = tokenizer(responses).input_ids
-    out_lens = [len(response) for response in response_token_ids]
+def get_template_chain_summary():
+    # 1. 
+    init_template = '''Below is the beginning part of a story:
 
-    print(f"len(out_lens):{len(out_lens)}")
-    return out_lens
+---
+
+{}
+
+---
+
+We are going over segments of a story sequentially to gradually update one comprehensive summary of the entire plot. Write a summary for the excerpt provided above, make sure to include vital information related to key events, backgrounds, settings, characters, their objectives, and motivations. You must briefly introduce characters, places, and other major elements if they are being mentioned for the first time in the summary. The story may feature non-linear narratives, flashbacks, switches between alternate worlds or viewpoints, etc. Therefore, you should organize the summary so it presents a consistent and chronological narrative. Despite this step-by-step process of updating the summary, you need to create a summary that seems as though it is written in one go. The summary could include multiple paragraphs.
+
+Summary:'''
+    
+    # 2. 
+    intermediate_template = '''Below is a segment from a story:
+
+---
+
+{}
+
+---
+
+Below is a summary of the story up until this point:
+
+---
+
+{}
+
+---
+
+We are going over segments of a story sequentially to gradually update one comprehensive summary of the entire plot. You are required to update the summary to incorporate any new vital information in the current excerpt. This information may relate to key events, backgrounds, settings, characters, their objectives, and motivations. You must briefly introduce characters, places, and other major elements if they are being mentioned for the first time in the summary. The story may feature non-linear narratives, flashbacks, switches between alternate worlds or viewpoints, etc. Therefore, you should organize the summary so it presents a consistent and chronological narrative. Despite this step-by-step process of updating the summary, you need to create a summary that seems as though it is written in one go. The updated summary could include multiple paragraphs.
+
+Updated summary:'''
+
+    # 3. 
+    evaluate_template = ''' Is the summary easy to understand and free of grammatical errors? Format your response in JSON, containing a 'yes' or 'no' decision, along with justifications.
+
+Summary: {}'''
+
+    return init_template, intermediate_template, evaluate_template
+
+
+
+
+# def get_inplens_chain_summary(req_num: int, model_id: int, model_path: str, inp_seq_ids: List[int]):
+#     """
+#         We do not consider the template length in the input length computation here.
+#     """
+#     import json
+#     inp_lens = list()
+#     with open("./my_dummy_requests/my_dummy_requests.json", 'r') as file:
+#         # each row is a list of chunks for each complete input prompt
+#         prompts = json.load(file)
+#         # init_template, intermediate_template, evaluate_template = get_template_chain_summary()
+#         # template = None
+
+#         max_chunk_num = len(prompts[0])
+#         if model_id < max_chunk_num:
+#             # this model is used for summarization
+#             template = init_template.format('')
+#             if model_id > 0:
+#                 template = intermediate_template.format('', '')
+
+#             prompts = [prompts[seq_id][model_id] for seq_id in inp_seq_ids]
+#         else:
+#             # this model is used for evaluation
+#             template = evaluate_template.format('')
+#             prompts = ['']*len(inp_seq_ids)
+        
+#         # comp prompt lens
+#         args = InferenceArgs(model=model_path, num_prompts=req_num)
+#         from transformers import AutoTokenizer
+#         # Sample the requests.
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             args.tokenizer, trust_remote_code=args.trust_remote_code)
+#         template_len = len(tokenizer([template]).input_ids[0])
+#         prompt_token_ids = tokenizer(prompts).input_ids
+#         inp_lens = [len(prompt)+template_len for prompt in prompt_token_ids]
+    
+#     # assert len(inp_lens) == req_num
+#     print(f"len(inp_lens):{len(inp_lens)}, inp_seq_ids:{inp_seq_ids}")
+#     return inp_lens
+
+
+
+
+
+
+def get_inplens_chain_summary(req_num: int, model_id: int, model_path: str, inp_seq_ids: List[int]):
+    """
+        We do not consider the template length in the input length computation here.
+    """
+    import json
+    inp_lens = list()
+    with open("./my_dummy_requests/my_dummy_requests.json", 'r') as file:
+        # each row is a list of chunks for each complete input prompt
+        prompts = json.load(file)
+
+        max_chunk_num = len(prompts[0])
+        if model_id < max_chunk_num:
+            # this model is used for summarization
+            prompts = [prompts[seq_id][model_id] for seq_id in inp_seq_ids]
+        else:
+            # this model is used for evaluation
+            # for this model, the inp length can be any value, 
+            # because this model does not have dummy inp node in the system
+            prompts = ['']*len(inp_seq_ids)
+        
+        # comp prompt lens
+        inp_lens = get_token_num(model_path, prompts)
+        # args = InferenceArgs(model=model_path, num_prompts=req_num)
+        # from transformers import AutoTokenizer
+        # # Sample the requests.
+        # tokenizer = AutoTokenizer.from_pretrained(
+        #     args.tokenizer, trust_remote_code=args.trust_remote_code)
+        # prompt_token_ids = tokenizer(prompts).input_ids
+        # inp_lens = [len(prompt) for prompt in prompt_token_ids]
+    
+    # assert len(inp_lens) == req_num
+    print(f"len(inp_lens):{len(inp_lens)}, inp_seq_ids:{inp_seq_ids}")
+    return inp_lens
+    # FOR DEBUG ONLY
+    return [2048 for i in inp_lens]
+
+
+
+
+# def comp_outlens(model_path: str, responses: List[str]) -> List[int]:
+#     args = InferenceArgs(model=model_path, num_prompts=1)
+#     from transformers import AutoTokenizer
+#     # Sample the requests.
+#     tokenizer = AutoTokenizer.from_pretrained(
+#         args.tokenizer, trust_remote_code=args.trust_remote_code)
+#     response_token_ids = tokenizer(responses).input_ids
+#     out_lens = [len(response) for response in response_token_ids]
+
+#     print(f"len(out_lens):{len(out_lens)}")
+#     return out_lens
 
 
 
@@ -2312,6 +2486,8 @@ def _get_req_len_funcs(test_case:str, version:str, max_token_num: int, specify_o
         inp_generator = get_inplens
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
         outlen_generator = output_length_sampler.sample_out_len_for_given_model
+        if max_token_num != None:
+            outlen_generator = lambda model_name, inp_lens: np.minimum(max_token_num, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
     elif test_case == 'map-reduce':
         chunk_size = 512
         fixed_output_size = 50
@@ -2319,17 +2495,25 @@ def _get_req_len_funcs(test_case:str, version:str, max_token_num: int, specify_o
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists[1:]))] # not consider model original inplens
         outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
     elif test_case == 'chain-summary':
-        chunk_size = 512
-        fixed_output_size = 50
-        inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
+        inp_generator = get_inplens_chain_summary
         inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
-        outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+        outlen_generator = output_length_sampler.sample_out_len_for_given_model
+        if max_token_num != None:
+            outlen_generator = lambda model_name, inp_lens: np.minimum(max_token_num, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+        # 
+        # chunk_size = 512
+        # fixed_output_size = 50
+        # inp_generator = lambda req_num, model_path, inp_seq_ids_dict: [chunk_size]*req_num
+        # inp_merger = lambda inp_lists: [sum(i) for i in zip(*(inp_lists))] # consider model original inplens
+        # outlen_generator = lambda model_name, inplens: np.asarray([fixed_output_size]*len(inplens))
+        # outlen_generator = lambda model_name, inplens: np.minimum(4096-np.asarray(inplens), max_token_num)
+        # outlen_generator = lambda model_name, inplens: np.asarray([max_token_num]*len(inplens))
 
     return inp_generator, inp_merger, outlen_generator
 
 
 
-def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool):
+def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool, reqnum: int):
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2339,6 +2523,7 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
 
     # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
     inp_req_ids = dict()
+    inp_req_from_which_model_which_out_reqs = dict()
     
     # store information if the output of a model need to be merged to generate new out reqs
     out_req_id_mapping = dict()
@@ -2348,6 +2533,9 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
     independent_srcs = dict()
     prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
+
+    # store prompt template information, 1 value for 1 base model
+    prompt_templates_lens = list()
 
     # inp/out len generator functions for the general setting
     model_paths = [
@@ -2393,7 +2581,8 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
             # each record contains both prompt and response
             prompts = [record[0] for record in data]
             outs = [record[1] for record in data]
-            outlens = comp_outlens(model_path, outs)
+            # outlens = comp_outlens(model_path, outs)
+            outlens = get_token_num(model_path, outs)
 
             model_name = model_path[model_path.find('/')+1:]
             out_lens_dict[model_name] = outlens
@@ -2434,6 +2623,7 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
     independent_srcs = {i:False for i in range(len(model_paths))}
     # if dataset_type == 'multiple_choice_question':
     #     max_tokens = 1
+    
     sampling_args2 = {                    
         "n":1,
         # <jingzhi> change to greedy sampling to check correctness.
@@ -2443,7 +2633,22 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
         "ignore_eos":False if not specify_outlen else True, # False, # True (original),
         "max_tokens":max_tokens, #int(1e9)
         }
-    sampling_args_dict = {base_model_id:SamplingParams(**sampling_args2) for base_model_id in range(len(model_paths))}
+    sampling_args_dict = {base_model_id:{0: SamplingParams(**sampling_args2)} for base_model_id in range(len(model_paths))}
+
+    if specify_outlen:
+        # create a SamplingParams for each req:
+        get_sampling_args = lambda _max_tokens: {                  
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False if not specify_outlen else True, # False, # True (original),
+            "max_tokens":_max_tokens, #int(1e9)
+            }
+        sampling_args_dict = {base_model_id: {req_id: SamplingParams(**get_sampling_args(outlen)) for req_id, outlen in vs.items()}\
+                            for base_model_id, vs in seq_outlen_dict.items()}
+
 
     print(f"\nreal model_paths: {model_paths}")
     print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
@@ -2454,14 +2659,28 @@ def _get_router_bench_data(version:str, max_token_num:int, specify_outlen: bool)
     sort_input = True
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
-        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
-            sampling_args_dict, seq_outlen_dict
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+        prompt_templates_lens, node_dataset_chunk_mapping, \
+        inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+            out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict
 
 
-def _get_schedule_setting_with_real_data(
-        test_case: str, version:str, max_token_num:int, specify_outlen: bool,
-        ratio_seed:int, ratio_set:int):
+
+
+
+
+
+
+
+def _get_llm_blender_data(version:str, max_token_num:int, specify_outlen: bool, reqnum: int):
+    """
+        Get the real data from MixInstruct of LLM-Blender.
+    """
+
+    print(f"running in _get_llm_blender_data")
+
+
     in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
         None, None, None, None, None
 
@@ -2471,6 +2690,7 @@ def _get_schedule_setting_with_real_data(
 
     # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
     inp_req_ids = dict()
+    inp_req_from_which_model_which_out_reqs = dict()
     
     # store information if the output of a model need to be merged to generate new out reqs
     out_req_id_mapping = dict()
@@ -2480,9 +2700,429 @@ def _get_schedule_setting_with_real_data(
     independent_srcs = dict()
     prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
+
+    # store prompt template information, 1 value for 1 base model
+    prompt_templates_lens = list()
+
+    # the models used in LLM-Blender that vLLM supports
+    model_paths = [
+        'lmsys/vicuna-13b-v1.5',
+        'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+        'chavinlo/alpaca-13b',
+        'project-baize/baize-v2-13b',
+        'TheBloke/koala-13B-HF',
+        'databricks/dolly-v2-12b',
+        'mosaicml/mpt-7b-chat',
+        'THUDM/chatglm3-6b',
+        'stabilityai/stablelm-tuned-alpha-7b',
+    ]
+
+    # 1. 
+    in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
+
+    prompt_template_args = dict()
+    for i, model_path in enumerate(model_paths):
+        args = InferenceArgs(model=model_path)
+        prompt_template_args[i] = (args.tokenizer, args.trust_remote_code)
+
+
+
+    # 2. compute tot_inp_prompts, inp_seq_ids_dict, out_lens_dict, seq_outlen_dict
+    import json
+    tot_inp_prompts = list()
+    inp_seq_ids_dict = dict()
+    req_num = 10000
+    req_num = reqnum
+    out_lens_dict = dict() # outlen list for each model
+    seq_outlen_dict = dict() # used to set sampling args for each request for each base model id    
+
+    # the models in the MixInstruct dataset are different from those we prepared, so we cannot set the output length for each request 
+    # according to the data in MixInstruct.
+    '''
+    models_to_keep = {
+        'vicuna-13b-1.1':'eachadea/vicuna-13b-1.1', 
+        'stablelm-tuned-alpha-7b':'stabilityai/stablelm-tuned-alpha-7b', 
+        'koala-7B-HF':'TheBloke/koala-7B-HF', 
+        'dolly-v2-12b':'databricks/dolly-v2-12b', 
+        'chatglm-6b':'THUDM/chatglm3-6b', 
+        'oasst-sft-4-pythia-12b-epoch-3.5':'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5', 
+        'llama-7b-hf-baize-lora-bf16':'huggyllama/llama-7b',  
+        'mpt-7b-instruct':'mosaicml/mpt-7b-instruct', 
+        'alpaca-native':'chavinlo/alpaca-native',
+    }
+    '''
+    
+    tot_outs = dict()
+    with open(f'/ssddata/jingzhi/vLLM/vllm/benchmarks/train_data_prepared.jsonl', 'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            record = json.loads(line)
+            prompt = record['instruction'] + record['input']
+            tot_inp_prompts.append(prompt)
+            # 
+            for cand in record['candidates']:
+                if cand['model'] not in tot_outs:
+                    tot_outs[cand['model']] = list()
+                tot_outs[cand['model']].append(cand['text'])
+
+    # get the outlen for each req for each model in the MixInstruct dataset as the reference of how we can set max out len
+    '''
+    from transformers import AutoTokenizer
+    for model, outs in tot_outs.items():
+        if model not in models_to_keep:
+            continue
+        tokenizer = AutoTokenizer.from_pretrained(
+            models_to_keep[model], trust_remote_code=True)
+        outs_token_ids = tokenizer(outs).input_ids
+        out_lens_dict[model] = [len(response) for response in outs_token_ids]
+
+
+    max([max(outlens) for outlens in out_lens_dict.values()]) # max out len is 490
+    [sum(outlens)/len(outlens) for outlens in out_lens_dict.values()] # results are: [175.86117, 163.89527, 193.54333, 236.69952, 163.1489, 80.77952, 244.94657, 253.01595, 108.97055]
+
+    '''
+
+    # sample a subset of prompts
+    import random
+    random.seed(0)
+    tot_inp_prompts = random.sample(tot_inp_prompts, min(req_num, len(tot_inp_prompts)))
+
+    print(f"len(tot_inp_prompts): {len(tot_inp_prompts)}")
+
+    inp_seq_ids_dict = {i: list(range(len(tot_inp_prompts))) for i in range(len(model_paths))}
+    inp_seq_ids_dict.update({-(i+1): list(range(len(tot_inp_prompts))) for i in range(len(model_paths))})
+
+
+    # 3. 
+    # inp_generator = get_inplens_router_bench
+    # inp_merger = lambda inp_lists: [sum(i) for i in zip(*inp_lists)] # concat all inputs from input models together
+    # # we control the max output length here
+    # outlen_generator = lambda model_name, inp_lens: np.minimum(4096, output_length_sampler.sample_out_len_for_given_model(model_name, inp_lens))
+    
+    max_tokens = 4096 # int(1e9) # 8192 # int(1e9)
+    max_tokens = max_token_num
+    assert specify_outlen == False
+    dataset_type = None
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(
+        'general', dataset_type, max_tokens, specify_outlen)
+    
+    node_dataset_chunk_mapping = {-(i+1): (None, 0, -1) \
+                                    for i in range(len(model_paths))}
+
+
+    # 4. we need to prepare the dummpy requests here
+    _init_dummy_requests(None, tot_inp_prompts)
+
+
+    # 5. 
+    independent_srcs = {i:False for i in range(len(model_paths))}
+    # if dataset_type == 'multiple_choice_question':
+    #     max_tokens = 1
+    
+    sampling_args2 = {                    
+        "n":1,
+        # <jingzhi> change to greedy sampling to check correctness.
+        "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+        "top_p":1.0,
+        "use_beam_search":False,
+        "ignore_eos":False if not specify_outlen else True, # False, # True (original),
+        "max_tokens":max_tokens, #int(1e9)
+        }
+    sampling_args_dict = {base_model_id:{0: SamplingParams(**sampling_args2)} for base_model_id in range(len(model_paths))}
+
+    if specify_outlen:
+        # create a SamplingParams for each req:
+        get_sampling_args = lambda _max_tokens: {                  
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False if not specify_outlen else True, # False, # True (original),
+            "max_tokens":_max_tokens, #int(1e9)
+            }
+        sampling_args_dict = {base_model_id: {req_id: SamplingParams(**get_sampling_args(outlen)) for req_id, outlen in vs.items()}\
+                            for base_model_id, vs in seq_outlen_dict.items()}
+
+
+    print(f"\nreal model_paths: {model_paths}")
+    print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+    print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+    print(f"node_dataset_chunk_mapping: {node_dataset_chunk_mapping}")
+
+    check_gap = 16
+    sort_input = True
+
+    return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+        prompt_templates_lens, node_dataset_chunk_mapping, \
+        inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+            out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict
+
+
+
+
+
+
+
+
+
+
+def _get_booookscore_data(version:str, max_token_num:int, specify_outlen: bool, reqnum: int, 
+                          evaluator_num: int, summarize_model: str, evaluator_model: str):
+    """
+        Get the real data from the documents chunked by BooookScore.
+        Include the data from Arxiv, booookscore, and booksum.
+        NOTE:
+            the prompt template will not be considered when we prepare the input, 
+            i.e., (1) comp inp len for search and (2) add inp req to the dummy inp nodes for scheduling.
+    """
+
+    print(f"running in _get_booookscore_data")
+
+
+    in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+        None, None, None, None, None
+
+    req_num = None
+    inp_seq_ids_dict = None
+    model_paths = None
+
+    # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
+    inp_req_ids = dict()
+    inp_req_from_which_model_which_out_reqs = dict()
+    
+    # store information if the output of a model need to be merged to generate new out reqs
+    out_req_id_mapping = dict()
+    new_out_req_part_num = dict()
+    
+    # whether a base model's different input sources are independent or need to be merged, ...
+    independent_srcs = dict()
+    prompt_template_args: Dict[int, Tuple] = None
+    sampling_args_dict = dict()
+
+    # store prompt template information, 1 value for 1 base model
+    prompt_templates_lens = list()
+
+
+    # 1. compute tot_inp_prompts---------------------------------------------------------------
+    tot_inp_prompts = list()
+    inp_seq_ids_dict = dict()
+    # NOTE: here is a parameter to set
+    req_num = 50 # 10000
+    req_num = reqnum
+    out_lens_dict = dict() # outlen list for each model
+    seq_outlen_dict = dict() # used to set sampling args for each request for each base model id    
+
+
+    # NOTE: here is a parameter to set
+    data_files = [
+        '/ssddata/jingzhi/vLLM/BooookScore/all_books_chunked_2048.pkl', 
+        # '/ssddata/jingzhi/vLLM/BooookScore/arxiv_data_chunked_2048.pkl',
+        '/ssddata/jingzhi/vLLM/BooookScore/booksum_data_chunked_2048.pkl'
+        ]
+    
+    print(f"data_files: {data_files}")
+
+    chunk_lists = list() # chunk_lists[0] is the list of all chunks in document 0
+    import pickle
+    for data_file in data_files:
+        with open(data_file, 'rb') as file:
+            data = pickle.load(file)
+            chunk_lists.extend(list(data.values()))
+    
+    tot_inp_prompts = chunk_lists
+
+    # sample a subset of prompts
+    import random
+    random.seed(0)
+    req_num = min(req_num, len(tot_inp_prompts))
+    tot_inp_prompts = random.sample(tot_inp_prompts, req_num)
+    tot_inp_prompts = sorted(tot_inp_prompts, key=lambda chunks: len(chunks), reverse=True)
+
+    print(f"len(tot_inp_prompts): {len(tot_inp_prompts)}")
+
+
+    # 2. get model_paths, inp_seq_ids_dict, in_edge_dict_with_dummy_inp_nodes, inp_req_ids--------------------
+    # NOTE: here is a parameter to set
+    evaluate_item_num = 10
+    evaluate_item_num = evaluator_num
+
+    max_chunk_num = len(tot_inp_prompts[0])
+    chunk_nums = np.asarray([len(chunks) for chunks in tot_inp_prompts])
+    print(f"chunk_nums: {list(chunk_nums)}")
+    inp_seq_ids_dict = {i: list(range(sum(chunk_nums > i))) for i in range(max_chunk_num)}
+    for i in range(max_chunk_num):
+        inp_seq_ids_dict[-(i+1)] = inp_seq_ids_dict[i].copy()
+    inp_seq_ids_dict[max_chunk_num] = list(range(req_num*evaluate_item_num))
+
+
+    # inp_req_ids = {max_chunk_num: {i:sorted(set(inp_seq_ids_dict[i])-set(inp_seq_ids_dict[i+1])) for i in range(max_chunk_num-1)}}
+    # inp_req_ids[max_chunk_num][max_chunk_num-1] = inp_seq_ids_dict[max_chunk_num-1].copy()
+
+    inp_req_from_which_model_which_out_reqs = {max_chunk_num: dict()}
+    for i in range(max_chunk_num-1):
+        inp_req_from_which_model_which_out_reqs[max_chunk_num][i] = \
+            {out_i*evaluate_item_num+inp_i: out_i \
+                for inp_i in range(evaluate_item_num) \
+                    for out_i in sorted(set(inp_seq_ids_dict[i])-set(inp_seq_ids_dict[i+1]))}
+    inp_req_from_which_model_which_out_reqs[max_chunk_num][max_chunk_num-1] = \
+            {out_i*evaluate_item_num+inp_i: out_i \
+                for inp_i in range(evaluate_item_num) \
+                    for out_i in inp_seq_ids_dict[max_chunk_num-1]}
+
+
+    in_edge_dict_with_dummy_inp_nodes = {0:[-1]}
+    in_edge_dict_with_dummy_inp_nodes.update({i:[-(i+1), i-1] for i in range(1, max_chunk_num)})
+    in_edge_dict_with_dummy_inp_nodes[max_chunk_num] = list(range(max_chunk_num)) # 这里没有把template看作dummy input node
+
+    # NOTE: here is a parameter to set
+    summ_model = 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+    # summ_model = 'NousResearch/Llama-2-13b-hf'
+    # summ_model = 'lmsys/vicuna-13b-v1.5'
+    evaluate_model = 'meta-llama/Llama-2-70b-chat-hf'
+    # evaluate_model = 'NousResearch/Llama-2-70b-hf'
+
+    summ_model = summarize_model
+    evaluate_model = evaluator_model
+    
+    # get prompt template and prompt template length
+    init_template, intermediate_template, evaluate_template = get_template_chain_summary()
+    prompt_templates = [init_template] + [intermediate_template]*(max_chunk_num-1) + [evaluate_template]
+    prompt_templates_lens = get_token_num(summ_model, prompt_templates[:-1]) + \
+        get_token_num(evaluate_model, prompt_templates[-1:])
+    
+    # FOR DEBUG-----------------------------------------------
+    # prompt_templates_lens = [0] * len(prompt_templates)
+    # --------------------------------------------------------
+    
+    prompt_template_args = dict()
+    args = InferenceArgs(model=summ_model)
+    for i in range(max_chunk_num):
+        if i == 0:
+            prompt_template_args[i] = (args.tokenizer, args.trust_remote_code, prompt_templates[i])
+        else:
+            prompt_template_args[i] = (args.tokenizer, args.trust_remote_code, prompt_templates[i], (-(i+1), i-1))
+    args = InferenceArgs(model=evaluate_model)
+    prompt_template_args[max_chunk_num] = (args.tokenizer, args.trust_remote_code, prompt_templates[max_chunk_num])
+    
+    
+    # the models used in LLM-Blender that vLLM supports
+    model_paths = [summ_model]*max_chunk_num + [evaluate_model]
+
+
+    # 3. inp_generator, inp_merger, outlen_generator ------------------------------------------
+    max_tokens = 4096 # int(1e9) # 8192 # int(1e9)
+    max_tokens = max_token_num 
+    assert specify_outlen == False
+    dataset_type = None
+    inp_generator, inp_merger, outlen_generator = _get_req_len_funcs(
+        'chain-summary', dataset_type, max_tokens, specify_outlen)
+    
+    # dummy inp -(i+1) corresponds to chunk i
+    node_dataset_chunk_mapping = {-(i+1): (None, i, -1) \
+                                    for i in range(max_chunk_num)}
+
+
+
+
+    # 4. we need to prepare the dummpy requests here
+    _init_dummy_requests(None, tot_inp_prompts)
+
+
+    # 5. 
+    independent_srcs = {i:False for i in range(max_chunk_num)}
+    independent_srcs[max_chunk_num] = True
+    
+    sampling_args2 = {                    
+        "n":1,
+        # <jingzhi> change to greedy sampling to check correctness.
+        "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+        "top_p":1.0,
+        "use_beam_search":False,
+        "ignore_eos":False if not specify_outlen else True, # False, # True (original),
+        "max_tokens":max_tokens, #int(1e9)
+        }
+    sampling_args_dict = {base_model_id:{0: SamplingParams(**sampling_args2)} for base_model_id in range(len(model_paths))}
+
+    if specify_outlen:
+        # create a SamplingParams for each req:
+        get_sampling_args = lambda _max_tokens: {                  
+            "n":1,
+            # <jingzhi> change to greedy sampling to check correctness.
+            "temperature":1.0, # 0 or 1e-6 (greedy), #1.0
+            "top_p":1.0,
+            "use_beam_search":False,
+            "ignore_eos":False if not specify_outlen else True, # False, # True (original),
+            "max_tokens":_max_tokens, #int(1e9)
+            }
+        sampling_args_dict = {base_model_id: {req_id: SamplingParams(**get_sampling_args(outlen)) for req_id, outlen in vs.items()}\
+                            for base_model_id, vs in seq_outlen_dict.items()}
+
+
+    print(f"\nreal model_paths: {model_paths}")
+    print(f"\nreq_num: {req_num}, evaluate_item_num: {evaluate_item_num}")
+    print(f"\nreal in_edge_dict_with_dummy_inp_nodes: {in_edge_dict_with_dummy_inp_nodes}")
+    print(f"\nreal inp_seq_ids_dict: {inp_seq_ids_dict}\n")
+    print(f"node_dataset_chunk_mapping: {node_dataset_chunk_mapping}")
+    print(f"\nreal inp_req_ids: {inp_req_ids}\n")
+    print(f"\nreal inp_req_from_which_model_which_out_reqs: {inp_req_from_which_model_which_out_reqs}\n")
+    print(f"\nreal independent_srcs: {independent_srcs}\n")
+
+    check_gap = 16
+    sort_input = True
+
+    return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+        prompt_templates_lens, node_dataset_chunk_mapping, \
+        inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+            out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict
+
+
+
+
+
+
+
+
+
+
+
+
+def _get_schedule_setting_with_real_data(
+        test_case: str, version:str, max_token_num:int, specify_outlen: bool,
+        ratio_seed:int, ratio_set:int, reqnum: int,
+        evaluator_num:int, summarize_model:str, evaluator_model:str):
+    in_edge_dict_with_dummy_inp_nodes, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping = \
+        None, None, None, None, None
+
+    req_num = None
+    inp_seq_ids_dict = None
+    model_paths = None
+
+    # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
+    inp_req_ids = dict()
+    inp_req_from_which_model_which_out_reqs = dict()
+    
+    # store information if the output of a model need to be merged to generate new out reqs
+    out_req_id_mapping = dict()
+    new_out_req_part_num = dict()
+    
+    # whether a base model's different input sources are independent or need to be merged, ...
+    independent_srcs = dict()
+    prompt_template_args: Dict[int, Tuple] = None
+    sampling_args_dict = dict()
+
+    # store prompt template information, 1 value for 1 base model
+    prompt_templates_lens = list()
+
+
     if test_case == 'router':
-        return _get_router_bench_data(version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,)
+        return _get_router_bench_data(version=version, max_token_num=max_token_num, specify_outlen=specify_outlen, reqnum=reqnum)
     elif (test_case == 'general'):
+        return _get_llm_blender_data(version=None, max_token_num=max_token_num, specify_outlen=specify_outlen, reqnum=reqnum)
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
         in_edge_dict_with_dummy_inp_nodes = {i:[-(i+1)] for i in range(len(model_paths))}
@@ -2619,6 +3259,8 @@ def _get_schedule_setting_with_real_data(
 
 
     elif test_case == 'chain-summary':
+        return _get_booookscore_data(version=version, max_token_num=max_token_num, specify_outlen=specify_outlen, reqnum=reqnum,
+                                     evaluator_num=evaluator_num, summarize_model=summarize_model, evaluator_model=evaluator_model)
         # # chain summary
         req_num = 1000
         chunk_size = 2048 # 512
@@ -2724,9 +3366,11 @@ def _get_schedule_setting_with_real_data(
     sort_input = True
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
-        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
-            sampling_args_dict, seq_outlen_dict
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+        prompt_templates_lens, node_dataset_chunk_mapping, \
+        inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+            out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict
 
 
 
@@ -2735,12 +3379,14 @@ def _get_schedule_setting_with_real_data(
 
 def get_schedule_setting(
         test_case:str, version:str, max_token_num:int, specify_outlen: bool,
-        use_real_dataset:bool, ratio_seed:int, ratio_set:int):
+        use_real_dataset:bool, ratio_seed:int, ratio_set:int, reqnum: int,
+        evaluator_num:int, summarize_model:str, evaluator_model:str):
 
     if use_real_dataset:
         return _get_schedule_setting_with_real_data(
             test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
-            ratio_seed=ratio_seed, ratio_set=ratio_set)
+            ratio_seed=ratio_seed, ratio_set=ratio_set, reqnum=reqnum,
+            evaluator_num=evaluator_num, summarize_model=summarize_model, evaluator_model=evaluator_model)
     
 
 
@@ -2753,6 +3399,7 @@ def get_schedule_setting(
 
     # store the inp model of each inp seq for a model if it does not take all out seqs from each inp model
     inp_req_ids = dict()
+    inp_req_from_which_model_which_out_reqs = dict()
     
     # store information if the output of a model need to be merged to generate new out reqs
     out_req_id_mapping = dict()
@@ -2762,6 +3409,11 @@ def get_schedule_setting(
     independent_srcs = dict()
     prompt_template_args: Dict[int, Tuple] = None
     sampling_args_dict = dict()
+
+    # store prompt template information, 1 value for 1 base model
+    prompt_templates_lens = list()
+
+
     if test_case == 'general':
         # inp/out len generator functions for the general setting
         model_paths = get_model_path_list()
@@ -2990,15 +3642,17 @@ def get_schedule_setting(
     sort_input = True
 
     return model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
-        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-        inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
-            sampling_args_dict, seq_outlen_dict
+        req_num, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+        prompt_templates_lens, node_dataset_chunk_mapping, \
+        inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+            out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                sampling_args_dict, seq_outlen_dict
 
 
 
 
 if __name__ == "__main__":
-    print("start")
+    print(f"start: --abs: {time.perf_counter()}")
     # --------------------------------------------------------------------
 
     parser = argparse.ArgumentParser(description="args of end 2 end test")
@@ -3018,29 +3672,120 @@ if __name__ == "__main__":
     parser.add_argument("--ratio-set",
                         type=int)    
     
+
+    parser.add_argument("--reqnum",
+                        type=int)
+    
+
+    parser.add_argument("--router_question_version",
+                        type=str, 
+                        choices=['multiple_choice_question', 'not_multiple_choice_question'],
+                        default='multiple_choice_question')
+    
+
+    parser.add_argument("--max_token_num",
+                        type=int,
+                        default=900)
+
+
+    parser.add_argument('--specify_outlen', 
+                        action='store_true')
+
+
+    parser.add_argument("--gpu_name",
+                        type=str,
+                        default='A100-80G')
+
+
+    parser.add_argument("--byte_per_gpu",
+                        type=int,
+                        default=80*(1024**3))
+    
+
+    parser.add_argument("--tot_gpu_num",
+                        type=int,
+                        default=8)
+
+
+    # the number of seqs we search
+    parser.add_argument("--max_group_seq_num",
+                        type=int,
+                        default=1)
+
+
+    parser.add_argument("--top_k",
+                        type=int,
+                        default=20)
+
+    parser.add_argument("--similar_threshold",
+                        type=float,
+                        default=0.2)
+    
+
+    parser.add_argument("--fully_connected_gpu_unit",
+                        type=int,
+                        default=2)
+    
+
+    parser.add_argument("--machine_name",
+                        type=str,
+                        choices=['zxcpu', 'lccpu'],
+                        default='zxcpu')
+    
+
+    parser.add_argument("--evaluator_num",
+                        type=int,
+                        default=5)    
+
+
+    parser.add_argument("--summarize_model",
+                        type=str,
+                        choices=['mistralai/Mixtral-8x7B-Instruct-v0.1', 'lmsys/vicuna-13b-v1.5'],
+                        default='lmsys/vicuna-13b-v1.5')
+    
+
+    parser.add_argument("--evaluator_model",
+                        type=str,
+                        choices=['meta-llama/Llama-2-70b-chat-hf'],
+                        default='meta-llama/Llama-2-70b-chat-hf')
+    
+
     args = parser.parse_args()
+
+
+    for arg, value in vars(args).items():
+        print(f"{arg}: {value}")
+
 
     # # gen_execplans_baseline = 'ours' # 'naive'  'ours'
     # # search_method_baseline = 'ours' # 'naive'  'ours'
     gen_execplans_baseline = 'ours' # 'naive'  'ours'
     search_method_baseline = 'ours' # 'naive'  'ours'
     test_case = 'router' # 'general' 'map-reduce' 'chain-summary', 'router'
-    version = 'not_multiple_choice_question' # 'multiple_choice_question' # for router dataset
-    max_token_num = 4096
-    specify_outlen = True # True False
+    version = 'multiple_choice_question' # 'multiple_choice_question' # for router dataset
+    max_token_num = 900 # 4096 512
+    specify_outlen = False # True False
 
     gen_execplans_baseline = args.gen_execplans_baseline
     test_case = args.test_case
     ratio_seed = args.ratio_seed
     ratio_set = args.ratio_set
+    reqnum = args.reqnum
+    version = args.router_question_version
+    max_token_num = args.max_token_num
+    specify_outlen = args.specify_outlen
+
 
 
     model_paths, check_gap, sort_input, in_edge_dict_with_dummy_inp_nodes, \
-        num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, node_dataset_chunk_mapping, \
-             inp_req_ids, out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
-                sampling_args_dict, seq_outlen_dict = \
+        num_prompts, inp_seq_ids_dict, inp_generator, inp_merger, outlen_generator, \
+            prompt_templates_lens, node_dataset_chunk_mapping, \
+                inp_req_ids, inp_req_from_which_model_which_out_reqs, \
+                    out_req_id_mapping, new_out_req_part_num, independent_srcs, prompt_template_args, \
+                        sampling_args_dict, seq_outlen_dict = \
         get_schedule_setting(test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
-                             use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set)
+                             use_real_dataset=True, ratio_seed=ratio_seed, ratio_set=ratio_set, reqnum=reqnum,
+                             evaluator_num=args.evaluator_num, summarize_model=args.summarize_model, evaluator_model=args.evaluator_model)
     
     asyncio.run(main_with_preemption(
         test_case=test_case, version=version, max_token_num=max_token_num, specify_outlen=specify_outlen,
@@ -3058,20 +3803,25 @@ if __name__ == "__main__":
         seq_outlen_dict=seq_outlen_dict,
         # 
         inp_seq_ids_dict=inp_seq_ids_dict, 
-        inp_req_ids=inp_req_ids, out_req_id_mapping=out_req_id_mapping, 
+        inp_req_ids=inp_req_ids, 
+        inp_req_from_which_model_which_out_reqs=inp_req_from_which_model_which_out_reqs,
+        # 
+        out_req_id_mapping=out_req_id_mapping, 
         new_out_req_part_num=new_out_req_part_num, independent_srcs=independent_srcs,
         prompt_template_args=prompt_template_args,
         inp_generator=inp_generator, inp_merger=inp_merger, outlen_generator=outlen_generator,
+        prompt_templates_lens=prompt_templates_lens, 
         # 
-        gpu_name='A100-80G',
-        byte_per_gpu=80*(1024**3),
-        tot_gpu_num=4,
-        max_group_seq_num=20,
-        top_k=20,
-        similar_threshold=0.2,
+        gpu_name=args.gpu_name,  # 'A100-80G',
+        byte_per_gpu=args.byte_per_gpu,  # 80*(1024**3),
+        tot_gpu_num=args.tot_gpu_num,  # 8,
+        max_group_seq_num=args.max_group_seq_num,  # 20,
+        top_k=args.top_k,  # 20,
+        similar_threshold=args.similar_threshold,  # 0.2,
         # NOTE: 1. for DSF servers: fully_connected_gpu_unit=2, for lccpus, fully_connected_gpu_unit=4.
-        fully_connected_gpu_unit=2,
-        machine_name='zxcpu'))
+        fully_connected_gpu_unit=args.fully_connected_gpu_unit,  # 2,
+        machine_name=args.machine_name,  # 'zxcpu' # 'zxcpu' 'lccpu'
+        ))
     # # asyncio.run(main_with_preemption_debug())
 
 

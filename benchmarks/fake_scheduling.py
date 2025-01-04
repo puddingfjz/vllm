@@ -5,7 +5,7 @@ we obtain from experiment results (on the no-robot dataset).
 """
 
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import numpy as np
 from my_per_iter_latency_estimator import CostTable
 from vllm.engine.metrics import MyThroughputLogger
@@ -695,6 +695,78 @@ def _update_seq_info_with_known_arrive_time(
 
 
 
+# <jingzhi> this version is faster
+def _update_seq_info_with_known_arrive_time_fast_version(
+        time_when_check: float,
+        running_seq_ids: List[int],
+        pointer: int,
+        # 
+        ref_seq_ids: List[int],
+        inp_lens: List[int],
+        out_lens: List[int],
+        arrive_times: List[float],        
+        # 
+        # {seq_id: [(inp_len, out_len, arrive_time, infer_progress)]}
+        unknown_seq_info: Dict[int, List[Tuple[int, int, float, List[int]]]],
+        # 
+        infer_progress,
+        ):
+    """
+        This function update the info of the seqs whose arrive time become known every time there is 
+        new output generated.
+        NOTE:
+            1. the seqs in ref_seq_ids_list, ..., and fixed_ref_seq_ids_list, are sorted by the seq ids. --> !! no such requirement !!
+            2. we need to sort the ready seqs by their arrive times.
+    """
+    # if len(ref_seq_ids_list) == 0:
+    #     return ref_seq_ids, inp_lens, out_lens, arrive_times, \
+    #         ref_seq_ids_list, inp_lens_list, out_lens_list, arrive_times_list
+
+
+    # we use a list to store the info (inplen, outlen, arrive_time) of each req that is assigned to this dp worker
+
+    # 0. get the seqs whose arrive times are known and not finished
+    running_or_pending_seq_ids = np.concatenate((running_seq_ids, ref_seq_ids[pointer:]))
+
+    # 1. get the newly known seqs
+    seq_ids_to_add = np.asarray(sorted(set(unknown_seq_info.keys()).difference(running_or_pending_seq_ids)), dtype=np.int64)
+    infos_to_add = [unknown_seq_info[seq_id][0] for seq_id in seq_ids_to_add]
+    inp_lens_to_add = [info[0] for info in infos_to_add]
+    out_lens_to_add = [info[1] for info in infos_to_add]
+    arrive_times_to_add = np.maximum([info[2] for info in infos_to_add], time_when_check) 
+
+
+    # 2. update infer_progress
+    for seq_id in seq_ids_to_add:
+        infer_progress[seq_id] = unknown_seq_info[seq_id][0][3]
+
+
+    # 3. add the seqs to the ready lists
+    ref_seq_ids = np.concatenate((ref_seq_ids, seq_ids_to_add))
+    inp_lens = np.concatenate((inp_lens, inp_lens_to_add))
+    out_lens = np.concatenate((out_lens, out_lens_to_add))
+    arrive_times = np.concatenate((arrive_times, arrive_times_to_add))
+
+    # sort the ready seqs by their arrive_times
+    order = np.argsort(arrive_times[pointer:], kind='stable')
+    ref_seq_ids[pointer:] = ref_seq_ids[pointer:][order]
+    inp_lens[pointer:] = inp_lens[pointer:][order]
+    out_lens[pointer:] = out_lens[pointer:][order]
+    arrive_times[pointer:] = arrive_times[pointer:][order]
+
+
+    # 4. remove the seqs from the cand lists
+    for seq_id in seq_ids_to_add:
+        unknown_seq_info[seq_id] = unknown_seq_info[seq_id][1:]
+        if len(unknown_seq_info[seq_id]) == 0:
+            del unknown_seq_info[seq_id]
+
+
+
+    return ref_seq_ids, inp_lens, out_lens, arrive_times
+    
+
+
 
 
 
@@ -1380,7 +1452,8 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline(
 
 
 
-def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
+# <12.29: thsi version is correct but slow>
+def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse_slow_version(
         # info of seqs whose arrive_times are known
         inp_lens: List[int], out_lens: List[int], arrive_times: List[float], ref_seq_ids: List[int],
         # 
@@ -1566,7 +1639,18 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
     # NOTE: record the finished seq ids
     finished_seq_ids = list()
 
+
+    # <jingzhi> For DEBUG
+    import time
+    round_num = 0
+    time_start = time.perf_counter()
+
     while unfinished_reqnum:
+
+        time1 = time.perf_counter()
+        round_num+=1
+        print(f"round_num: {round_num}")
+
 
         # TODO: 这个地方如果当前所有input都available了，也不需要再query了。
         # before getting new prompts, query if there is newly available requests
@@ -1619,6 +1703,8 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
             # print(f"inp_lens: {inp_lens}")
             # print(f"out_lens: {out_lens}")
             # print(f"pointer: {pointer}")
+            print(f"check new seq: {time.perf_counter()-time1}")
+            time1 = time.perf_counter()
 
 
         # old_running_seqs_num = running_seqs_num
@@ -1823,6 +1909,8 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
 
         
         # print(f"unfinished_reqnum: {unfinished_reqnum}")
+        print(f"update steps: {time.perf_counter()-time1}")
+        time1 = time.perf_counter()
 
         # 
         # now go back to the top of the loop
@@ -1832,6 +1920,9 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
     # for i, step in enumerate(prefill_logs):
     #     print(f"prefill step {i}: {step}")
     # 
+    
+    print(f"tot schedule time: {time.perf_counter() - time_start}")
+    
     assert tot_iter_num == (len(logs) + len(prefill_logs)), (tot_iter_num, len(logs), len(prefill_logs), ori_inplens, ori_outlens, max_seq_num, max_block_num, max_num_batched_tokens, block_size) 
     # return logs, prefill_logs, is_prefill_steps, infer_progress
     return cumsum_latencys, is_prefill_steps, full_infer_progress
@@ -1839,6 +1930,506 @@ def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
 
 
 
+
+# <12.29: this version is faster>
+def _fake_FCFS_schedule_continuous_model_level_pipeline_vertical_fuse(
+        # info of seqs whose arrive_times are known
+        inp_lens: List[int], out_lens: List[int], arrive_times: List[float], ref_seq_ids: List[int],
+        # 
+        ref_seq_ids_list: List[List[int]],
+        inp_lens_list: List[List[int]],
+        out_lens_list: List[List[int]],
+        arrive_times_list: List[List[int]],        
+        # 
+        check_gap: int,
+        max_seq_num: int, max_block_num: int, max_num_batched_tokens: int, 
+        block_size: int,
+        sort_input: bool,
+        cost_estimate_args,
+        ):
+    '''
+        Do the fake scheduling using the first-come-first-serve policy.
+        inp_lens: the input lengths of the requests.
+        out_lens: the output lengths of the requests.
+        max_seq_num: the maximum number of requests running concurrently.
+        max_cache_slot_num: the maximum number of tokens whose KV cache can be stored at the same time.
+        cost_estimate_args: {"cost_table"=cost_table, "model_name"=model_name, "exec_plan"=exec_plan, "sample_config"=sample_config, 
+                "trust_remote_code"=trust_remote_code, "revision"=revision}
+
+        Output: [not only output fake scheduling logs, but also output latency]
+            cumsum_latencys, is_prefill_steps, infer_progress
+
+        There is only two constraints when trying to add a running request:
+            (1) max_seq_num; (2) max_cache_slot_num (consider watermark=0.01).
+        NOTE:
+            (1) We ignore the block size here to make the fake schedule faster.
+                --> it seems there will be a lot of request kill when block size is 1, 
+                --> so we HAVE TO CONSIDER block size!
+            (2) For prefill stage, we also consider  
+                ``max_num_batched_tokens'' and TODO ``scheduler_config.max_paddings''. [Try this first]
+            (3) When killing seqs, consider if there is an extra block for each sequence.
+
+        NOTE: for continuous model-level pipeline, e.g., we may have model A -> model B, but A, B run in 
+            the same execution stage.
+            In this function, we will check whether there is new input requests every k (``check_gap'') inference steps,
+            according to ``arrive_times''.
+            If yes, we will add the new requests into the waiting list; 
+            else, we do nothing but keep doing inference.
+        
+        This function runs K (i.e., check_gap) step fake scheduling starting from the given inference progress.
+        NOTE:
+            1. if before we finish the K inference steps we run out of requests, we stop the inference process 
+            and turn to waiting more available input requests.
+            2. in the current code, ``sort_input`` performs differently from the version that we must query every 
+            check_gap steps.
+            3. this version supports the vertical fusion of models.
+    '''
+    ''' ！我们假设关于是否对两个模型进行vertical fusion的操作在一开始就决定，把它当成一种计算图层面的优化。
+    如果两个模型被vertically地fuse了，那对应的model info object 也发生了变化，这个model info object 会有不止一个inp list，
+    每个inp list都来自被fuse的model，然后我们也要对应修改 inp_edge_dict 和 out_edge_dict。
+    '''
+
+
+    def has_enough_cache(block_num_used, new_token_num, consider_watermark=False):
+        # return token_num_stored < max_cache_slot_num
+        new_block_num = (new_token_num + block_size - 1) // block_size
+        if consider_watermark:
+            watermark_blocks = 0.01 * max_block_num
+            return max_block_num - block_num_used - new_block_num >= watermark_blocks
+        return (block_num_used + new_block_num) <= max_block_num
+    def add_block_num_used(block_num_used, new_token_num):
+        new_block_num = (new_token_num + block_size - 1) // block_size
+        block_num_used = block_num_used + new_block_num
+        return block_num_used
+    def get_max_iter_num(block_num_used, running_seqs_num, running_seqs):
+        # iter_num = (max_cache_slot_num - token_num_stored) // running_seqs_num
+        # iter_num = min(min(running_seqs[2][:running_seqs_num]), iter_num)
+
+        # first compute how many blocks can be assigned to each running seq at most
+        # print(f"in get_max_iter_num: block_num_used: {block_num_used}, running_seqs_num: {running_seqs_num}")
+        iter_num = ((max_block_num - block_num_used) // running_seqs_num) * block_size
+        # print(f"iter_num: {iter_num}")
+        
+        # then the running seqs cannot run >= 16 iters
+        extra_iter_nums = ((-running_seqs[1][:running_seqs_num] + 1) % block_size) + 1
+        # print(f"in get_max_iter_num: extra_iter_nums: {extra_iter_nums.tolist()}")
+        extra_iter_nums, counts = np.unique(extra_iter_nums, return_counts=True)
+        # print(f"in get_max_iter_num: extra_iter_nums: {extra_iter_nums.tolist()}, counts: {counts.tolist()}")
+        block_num_left = (max_block_num - block_num_used) % running_seqs_num
+        # print(f"in get_max_iter_num: block_num_left: {block_num_left}")
+        # print(f"in get_max_iter_num: np.nonzero(np.cumsum(counts) > block_num_left): {np.nonzero(np.cumsum(counts) > block_num_left)}")
+        extra_iter_num = extra_iter_nums[np.nonzero(np.cumsum(counts) > block_num_left)[0][0]]-1
+        iter_num += extra_iter_num
+        # print(f"in get_max_iter_num: extra_iter_num: {extra_iter_num}")
+        # print(f"iter_num: {iter_num}, {type(iter_num)}")
+        # print(f"extra_iter_nums: {extra_iter_nums}, {type(extra_iter_nums[0])}")
+        # print(f"{extra_iter_nums, counts, block_num_left, extra_iter_num}")
+
+        # now consider the remaining iters for each running seq
+        iter_num = min(min(running_seqs[2][:running_seqs_num]), iter_num)
+
+        # print(f"{min(running_seqs[2][:running_seqs_num])}")
+
+        return iter_num
+    def get_tot_token_num(running_seqs_num, running_seqs):
+        return sum(running_seqs[1][:running_seqs_num])
+    def get_max_seqlen(running_seqs_num, running_seqs):
+        return max(running_seqs[1][:running_seqs_num])
+    # 
+
+
+    # convert input list to np arrays
+    # copy the input information so that we can modify them
+    # TODO: 这里需要用copy吗
+    # inp_lens_list = np.asarray(inp_lens_list.copy())
+    # out_lens_list = np.asarray(out_lens_list.copy())
+    # arrive_times_list = np.asarray(arrive_times_list.copy())
+    # fixed_ref_seq_ids_list = ref_seq_ids_list
+    # ref_seq_ids_list = np.asarray(ref_seq_ids_list.copy(), dtype=np.int64)
+
+    inp_lens_list = [np.asarray(_.copy()) for _ in inp_lens_list]
+    out_lens_list = [np.asarray(_.copy()) for _ in out_lens_list]
+    arrive_times_list = [np.asarray(_.copy()) for _ in arrive_times_list]
+    fixed_ref_seq_ids_list = ref_seq_ids_list
+    ref_seq_ids_list = [np.asarray(_.copy(), dtype=np.int64) for _ in ref_seq_ids_list]
+
+    
+    ref_seq_ids = np.asarray(ref_seq_ids, dtype=np.int64)
+    inp_lens = np.asarray(inp_lens.copy())
+    out_lens = np.asarray(out_lens.copy())
+    arrive_times = np.asarray(arrive_times.copy())
+
+    # print(f"ref_seq_ids: {ref_seq_ids}")
+    # print(f"ref_seq_ids_list: {ref_seq_ids_list}")
+    # print(f"arrive_times: {arrive_times}")
+    # print(f"arrive_times_list: {arrive_times_list}")
+
+    # currently, the first cand model is the model 1 (not model 0) of the fused models
+    curr_model_level_id = 1
+
+    # these variables stores the seqs whose arrive times has been known
+    # inp_lens = inp_lens_list[0].copy()
+    # out_lens = out_lens_list[0].copy()
+    # arrive_times = arrive_times_list[0].copy()
+    # ref_seq_ids = ref_seq_ids_list[0].copy()
+
+
+    # TODO: remove this copy as it is only used for assertion
+    ori_inplens = inp_lens.copy()
+    ori_outlens = out_lens.copy()
+
+    # unfinished_reqnum = len(inp_lens)
+    # NOTE: here we regard the same req running in differet models as individual reqs, 
+    # but for other metadata, there is only one set of data (like infer_progress) for the same seq
+    req_nums = [len(inp_lens)]+[len(_inp_lens) for _inp_lens in inp_lens_list]
+    unfinished_reqnum = sum(req_nums)
+    # uniq_reqnum = len(inp_lens)
+    running_seqs = np.zeros((3, max_seq_num), dtype=np.int32) # three rows: index (i.e., seq_id), gened token num, remaining token num
+    # seq_ids = np.asarray(list(range(len(inp_lens))))
+    # seq_ids: initial available seq_ids is empty
+    seq_ids = np.asarray(list(), dtype=np.int64)
+    pointer = 0 # pointing to the next index of requests to consider
+    running_seqs_num = 0
+    # token_num_stored = 0 # for a seq, the number of token stored is (seq - 1)
+    block_num_used = 0
+    logs = list()
+    prefill_logs = list() # each item is (seqnum, tot_token_num, attention_sum, max_seqlen)
+    
+    # store the inference progress of each sequence, for each seq, we store its continuous infer iter ranges
+    # infer_progress = list([] for _ in range(uniq_reqnum))
+    full_infer_progress = list([[[] for _ in range(req_num)] for req_num in req_nums])
+    # infer_progress = [full_infer_progress[0][_] for _ in range(req_nums[0])]
+    # NOTE: change to dict here
+    infer_progress = {seq_id:full_infer_progress[0][i] for i, seq_id in enumerate(ref_seq_ids)}
+    # stores whether each step is a prefill step or not
+    is_prefill_steps: List[bool] = list()
+    tot_iter_num: int = 0 # the current total iteration number, == len(logs) + len(prefill_logs)
+
+
+    # store info for the seqs with unknown arrive time
+    uniq_seq_ids = sorted(set(np.concatenate(ref_seq_ids_list)))
+    unknown_seq_info: Dict[int, List[Tuple[int, int, float, List[int]]]] = {seq_id:list() for seq_id in uniq_seq_ids}
+    for _seq_ids, _inp_lens, _out_lens, _arrive_times, _infer_progresses \
+        in zip(ref_seq_ids_list, inp_lens_list, out_lens_list, arrive_times_list, full_infer_progress[1:]):
+        for _seq_id, _inp_len, _out_len, _arrive_time, _infer_progress \
+            in zip(_seq_ids, _inp_lens, _out_lens, _arrive_times, _infer_progresses):
+            unknown_seq_info[_seq_id].append((_inp_len, _out_len, _arrive_time, _infer_progress))
+
+
+    # parameter to control checking newly available requests
+    last_iter_seqs = list()
+    last_iter_seq_ids = list()
+    need_query_available_requests = True
+    must_record_first_step = False
+    tot_inference_time = 0
+
+    # store the accumulated latency values we get
+    cumsum_latencys: List[float] = np.asarray(list())
+
+    # NOTE: record the finished seq ids
+    finished_seq_ids = list()
+
+
+    # <jingzhi> For DEBUG
+    import time
+    # round_num = 0
+    time_start = time.perf_counter()
+
+    while unfinished_reqnum:
+
+        # time1 = time.perf_counter()
+        # round_num+=1
+        # print(f"round_num: {round_num}")
+
+
+        # TODO: 这个地方如果当前所有input都available了，也不需要再query了。
+        # before getting new prompts, query if there is newly available requests
+        # tot_inference_time is only updated when all requests finish but no new requests currently
+        # print(f"at the beginning of the round: need_query_available_requests: {need_query_available_requests}")
+        
+        # if (running_seqs_num == 0) or \
+        #     (need_query_available_requests and (tot_iter_num % check_gap == 0)):
+        if ((running_seqs_num == 0) and (pointer==len(seq_ids))) or \
+            (need_query_available_requests and (tot_iter_num % check_gap == 0)):
+
+            # print(f"before query available requests, tot_inference_time: {tot_inference_time}")
+
+            # print(f"Going to check new input requests. Conditions to determine checking:")
+            # print(f"running_seqs_num: {running_seqs_num}")
+            # print(f"need_query_available_requests: {need_query_available_requests}")
+            # print(f"tot_iter_num: {tot_iter_num}")
+            # print(f"len(seq_ids): {len(seq_ids)}")
+            # print(f"pointer: {pointer}")
+            
+            
+            # we first check whether there are seqs whose arrive times become known
+            # ref_seq_ids, inp_lens, out_lens, arrive_times, \
+            #     ref_seq_ids_list, inp_lens_list, out_lens_list, arrive_times_list= \
+            #         _update_seq_info_with_known_arrive_time(
+            #             tot_inference_time, running_seqs[0][:running_seqs_num], pointer,
+            #             ref_seq_ids, inp_lens, out_lens, arrive_times,
+            #             ref_seq_ids_list, inp_lens_list, out_lens_list, arrive_times_list,
+            #             infer_progress, full_infer_progress, fixed_ref_seq_ids_list
+            #             )
+            
+            ref_seq_ids, inp_lens, out_lens, arrive_times = \
+                _update_seq_info_with_known_arrive_time_fast_version(
+                    tot_inference_time, running_seqs[0][:running_seqs_num], pointer,
+                    ref_seq_ids, inp_lens, out_lens, arrive_times,      
+                    # 
+                    # {seq_id: [(inp_len, out_len, arrive_time, infer_progress)]}
+                    unknown_seq_info,
+                    infer_progress,
+                    )
+
+
+            finished_seq_ids = list()
+
+            # print(f"ref_seq_ids: {ref_seq_ids}")
+
+            seq_ids, inp_lens, out_lens, arrive_times, ref_seq_ids, tot_inference_time = \
+                _check_new_input_requests_support_vertical_fuse(
+                    sort_input, seq_ids, ref_seq_ids, inp_lens, out_lens, arrive_times, 
+                    tot_inference_time, pointer, running_seqs_num)
+            
+            # print(f"seq_ids: {seq_ids}")
+        
+            # print(f"_check_new_input_requests: new seq_ids: {seq_ids}")
+            # print(f"arrive_times: {arrive_times}")
+            # print(f"query available requests: ____________________")
+            # print(f"seq_ids: {seq_ids}")
+            # print(f"arrive_times: {arrive_times}")
+            # print(f"tot_inference_time: {tot_inference_time}")
+            # print(f"running_seqs: {running_seqs}")
+            # print(f"running_seqs_num: {running_seqs_num}")
+            # print(f"inp_lens: {inp_lens}")
+            # print(f"out_lens: {out_lens}")
+            # print(f"pointer: {pointer}")
+            # print(f"check new seq: {time.perf_counter()-time1}")
+            # time1 = time.perf_counter()
+
+
+        # old_running_seqs_num = running_seqs_num
+        new_prompt_lens: List[int] = list()
+        new_prompt_ids: List[int] = list()
+        while (pointer < len(seq_ids)) and has_enough_cache(block_num_used,1,consider_watermark=True) and (running_seqs_num < max_seq_num):
+            # we try to add new requests
+            # if token_num_stored + inp_lens[pointer] <= max_cache_slot_num:
+            if has_enough_cache(block_num_used, inp_lens[pointer],consider_watermark=True):
+                running_seqs[0][running_seqs_num] = seq_ids[pointer] # pointer
+                running_seqs[1][running_seqs_num] = inp_lens[pointer] + 1
+                running_seqs[2][running_seqs_num] = out_lens[pointer] - 1
+
+
+                new_prompt_lens.append(inp_lens[pointer])
+                new_prompt_ids.append(seq_ids[pointer])
+                if running_seqs[2][running_seqs_num] == 0:
+                    # this seq is finished
+                    unfinished_reqnum -= 1
+                    pointer += 1
+                    continue
+
+
+                # token_num_stored = token_num_stored + inp_lens[pointer]
+                block_num_used = add_block_num_used(block_num_used, inp_lens[pointer])
+                pointer += 1
+                running_seqs_num += 1
+            else:
+                break
+
+
+
+        # reset need_query_available_requests
+        # TODO: 这个条件要改
+        # if (len(seq_ids)<len(inp_lens)) \
+        if (len(seq_ids)<sum(req_nums)) \
+            and (pointer == len(seq_ids)) \
+            and has_enough_cache(block_num_used,1,consider_watermark=True) \
+                and (running_seqs_num < max_seq_num) \
+                    and (len(seq_ids) < len(ref_seq_ids)):
+            # if there are unavailable reqs 
+            # and available reqs are used up but there are remaining other resources
+            # and there are reqs with known arrive time but not ready previously
+            need_query_available_requests = True
+        else:
+            need_query_available_requests = False
+
+
+        # print(f"set need_query_available_requests conditions")
+        # print(f"need_query_available_requests: {need_query_available_requests}")
+        # print(f"len(seq_ids)<len(inp_lens): {len(seq_ids),len(inp_lens)}")
+        # print(f"pointer == len(seq_ids): {pointer , len(seq_ids)}")
+        # print(f"has_enough_cache(block_num_used,1,consider_watermark=True): {has_enough_cache(block_num_used,1,consider_watermark=True) }")
+        # print(f"running_seqs_num < max_seq_num: {running_seqs_num, max_seq_num }")
+
+
+        # update prefill logs
+        # new_prompt_lens = np.asarray(running_seqs[1][old_running_seqs_num:running_seqs_num])-1
+        # new_prompt_ids = running_seqs[0][old_running_seqs_num:running_seqs_num]
+        new_prompt_lens = np.asarray(new_prompt_lens)
+        new_prompt_ids = np.asarray(new_prompt_ids)
+        ori_prefill_logs_num = len(prefill_logs)
+
+        # print(f"new_prompt_ids: {new_prompt_ids}")
+        # print(f"must_record_first_step: {must_record_first_step}, tot_iter_num: {tot_iter_num}, last_iter_seqs: {last_iter_seqs}, last_iter_seq_ids: {last_iter_seq_ids}")
+
+        # if len(new_prompt_lens) > 0:
+        #     print(f"pointer: {pointer}, start new seqs: {new_prompt_lens}")
+        # tot_iter_num = update_prefill_logs(prefill_logs, new_prompt_lens, max_num_batched_tokens,
+        #                     new_prompt_ids, infer_progress, tot_iter_num)
+        # print(f"in _fake_FCFS_schedule_continuous_model_level_pipeline")
+        ori_last_iter_seq_ids = last_iter_seq_ids.copy()
+        last_iter_seqs, last_iter_seq_ids, tot_iter_num = update_prefill_logs(prefill_logs, new_prompt_lens, max_num_batched_tokens,
+                            new_prompt_ids, infer_progress, tot_iter_num, 
+                            need_query_available_requests, check_gap, last_iter_seqs, last_iter_seq_ids, 
+                            must_record_first_step)
+        is_prefill_steps.extend([True]*(tot_iter_num - len(is_prefill_steps)))
+
+        # print(f"infer_progress: {infer_progress}\n")
+        # print(f"full_infer_progress: {full_infer_progress}\n")
+
+        # get the seqs which finishes after the prefill stage
+        run_prompt_ids = np.setdiff1d(
+            np.concatenate((new_prompt_ids, ori_last_iter_seq_ids)), last_iter_seq_ids, 
+            assume_unique=True)
+        finished_seq_ids.extend(
+            np.setdiff1d(run_prompt_ids, running_seqs[0][:running_seqs_num], assume_unique=True))
+        
+
+
+        # print(f"new prefill_logs: {prefill_logs[ori_prefill_logs_num:]}")
+        # print(f"running_seqs_num: {running_seqs_num}")
+
+        # we need first estimate the costs of all the new steps
+        tot_latency, prefill_latencys, decode_latencys = \
+            _estimate_prefill_and_decode_cost_from_predicted_logs(
+                prefill_logs=prefill_logs[ori_prefill_logs_num:], decode_logs=list(), **cost_estimate_args)
+
+        cumsum_latencys = np.concatenate((cumsum_latencys, np.cumsum(prefill_latencys)+tot_inference_time))
+        if len(cumsum_latencys) > 0:
+            tot_inference_time = cumsum_latencys[-1]
+        
+        # assert (len(cumsum_latencys) == len(prefill_logs) + len(logs)) and (len(cumsum_latencys) == tot_iter_num)
+        # print(f"len(prefill_logs): {len(prefill_logs)}, len(is_prefill_steps): {len(is_prefill_steps)}, ori_prefill_logs_num: {ori_prefill_logs_num}")
+        # print(f"len(prefill_latencys): {len(prefill_latencys)}: {np.cumsum(prefill_latencys)}")
+        # print(f"len(cumsum_latencys): {len(cumsum_latencys)}, len(infer_progress): {len(infer_progress)}, tot_iter_num: {tot_iter_num}, len(prefill_logs): {len(prefill_logs)}, len(logs): {len(logs)}")
+
+        # we may need to go back to query newly available input requests
+        if len(last_iter_seqs) > 0:
+            must_record_first_step = True
+            # print(f"go back to check inps\n")
+            continue
+        elif len(new_prompt_ids) > 0:
+            # already add at least 1 new step
+            must_record_first_step = False
+
+        if running_seqs_num == 0:
+            # no need to run the code below
+            # print(f"go back to check inps\n")
+            continue
+
+        # ------------prefill stage ends---------------------------------------------------------------
+        # 
+        # kill some running reqs if the cache is not enough
+        
+        # print(f"tot_iter_num: {tot_iter_num}")
+        # print(f"before kill_seqs_for_more_cache_space: ")
+        # print(f"running_seqs: {running_seqs}")
+        # print(f"running_seqs_num: {running_seqs_num}")
+
+        block_num_used, running_seqs_num, inp_lens, out_lens, seq_ids, pointer = \
+            kill_seqs_for_more_cache_space(
+                running_seqs, 
+                max_block_num, block_size, running_seqs_num, 
+                inp_lens, out_lens, seq_ids, pointer)
+
+        # print(f"after kill_seqs_for_more_cache_space: running_seqs_num: {running_seqs_num}")
+
+        # 
+        # collect decoding stage logs
+        # 1. compute the number of iters the current running reqs can run
+        # consider: available cache slots, seq remaining output tokens
+        iter_num = get_max_iter_num(block_num_used, running_seqs_num, running_seqs)
+        # print(f"iter_num: {iter_num}")
+        
+
+        # because of kill_seqs_for_more_cache_space, the ``need_query_available_requests`` value may need to be updated
+        if pointer < len(seq_ids):
+            need_query_available_requests = False
+
+        # compare iter_num with check_gap
+        if need_query_available_requests:
+            iter_num = min(iter_num, (tot_iter_num + must_record_first_step + check_gap - 1) // check_gap * check_gap \
+                - tot_iter_num)
+            must_record_first_step = False
+            # iter_num must < check_gap
+            if iter_num == 0:
+                must_record_first_step = True
+                # print(f"go back to check inps --decoding 0 step\n")
+                continue
+
+        # print(f"tot_iter_num: {tot_iter_num}")
+        # print(f"iter_num: {iter_num}")
+        # print(f"{running_seqs[0][:running_seqs_num].tolist()}")
+        # print(f"{running_seqs[1][:running_seqs_num].tolist()}")
+        # print(f"{running_seqs[2][:running_seqs_num].tolist()}")
+        tot_token_num = get_tot_token_num(running_seqs_num, running_seqs)
+        curr_max_seqlen = get_max_seqlen(running_seqs_num, running_seqs)
+        logs.extend([(running_seqs_num, 
+                      tot_token_num + running_seqs_num*i,
+                      tot_token_num + running_seqs_num*i,
+                      curr_max_seqlen + i) \
+                     for i in range(iter_num)])
+        _store_infer_state(tot_iter_num, tot_iter_num+iter_num-1, infer_progress, running_seqs[0][:running_seqs_num])
+        is_prefill_steps.extend([False]*iter_num)
+        tot_iter_num += iter_num
+
+        # print(f"new decode logs: {logs[-iter_num:]}")
+        # print(f"full_infer_progress: {full_infer_progress}\n")
+
+        # 
+        # 2. update the status of the running seqs
+        running_seqs[1][:running_seqs_num] = running_seqs[1][:running_seqs_num] + iter_num
+        running_seqs[2][:running_seqs_num] = running_seqs[2][:running_seqs_num] - iter_num
+
+        # get the finished seq ids
+        finished_seq_ids.extend(running_seqs[0][:running_seqs_num][running_seqs[2][:running_seqs_num]==0])
+
+        # remove finished reqs
+        running_seqs_num, unfinished_reqnum, block_num_used = \
+            remove_finished_seqs(running_seqs, running_seqs_num, unfinished_reqnum, block_size)
+
+        # we need update tot_inference_time
+        tot_latency, prefill_latencys, decode_latencys = \
+            _estimate_prefill_and_decode_cost_from_predicted_logs(
+                prefill_logs=list(), decode_logs=logs[-iter_num:], **cost_estimate_args)
+
+        cumsum_latencys = np.concatenate((cumsum_latencys, np.cumsum(decode_latencys)+tot_inference_time))
+        tot_inference_time = cumsum_latencys[-1]
+
+        # assert (len(cumsum_latencys) == len(prefill_logs) + len(logs)) and (len(cumsum_latencys) == tot_iter_num)
+        # print(f"len(decode_latencys): {len(decode_latencys)}: {np.cumsum(decode_latencys)}")
+        # print(f"len(cumsum_latencys): {len(cumsum_latencys)}, len(infer_progress): {len(infer_progress)}, tot_iter_num: {tot_iter_num}, len(prefill_logs): {len(prefill_logs)}, len(logs): {len(logs)}")
+
+        
+        # print(f"unfinished_reqnum: {unfinished_reqnum}")
+        # print(f"update steps: {time.perf_counter()-time1}")
+        # time1 = time.perf_counter()
+
+        # 
+        # now go back to the top of the loop
+    # here we finish the fake scheduling.
+    # for i, step in enumerate(logs):
+    #     print(f"step {i}: {step}")
+    # for i, step in enumerate(prefill_logs):
+    #     print(f"prefill step {i}: {step}")
+    # 
+    
+    print(f"tot schedule time: {time.perf_counter() - time_start}")
+    
+    assert tot_iter_num == (len(logs) + len(prefill_logs)), (tot_iter_num, len(logs), len(prefill_logs), ori_inplens, ori_outlens, max_seq_num, max_block_num, max_num_batched_tokens, block_size) 
+    # return logs, prefill_logs, is_prefill_steps, infer_progress
+    return cumsum_latencys, is_prefill_steps, full_infer_progress
 
 
 

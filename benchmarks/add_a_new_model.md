@@ -7,7 +7,7 @@ huggingface-cli download mosaicml/mpt-7b-chat
 ```
 
 2. get model size, flops coeffs, and init cost.
-   构建新模型的cost model (1) 收集各模型 size和flops coefficient的信息 AND 收集各个模型的initialization cost的信息 [need modify ``comp_model_size.py``].
+   构建新模型的cost model (1) 收集各模型 size和flops coefficient的信息 AND 收集各个模型的initialization cost的信息 [need modify ``comp_model_size.py``].  **这里更新的init_cost需要重新更新per-iter-latency cost model才能生效（i.e.，执行step 6）**
 
 ```shell
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 comp_model_size.py

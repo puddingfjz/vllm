@@ -59,6 +59,56 @@ suffix = '_tp2_1202_10kreq_1.log'
 suffix = '_tp2_1205_10kreq_1.log'
 
 
+# NEWROUND models for routerbench and LLM-Blender, with different temperature
+prefix = 'collect_output_lengths/no_robot/NEWROUND_'
+
+
+model_names = [
+                # models in RouterBench
+                'Llama-2-70b-chat-hf',
+                'Mixtral-8x7B-Instruct-v0.1',
+                'WizardLM-13B-V1.2',
+                'CodeLlama-34b-Instruct-hf',
+                'Mistral-7B-Instruct-v0.2',     
+                # models in LLM-Blender
+                'vicuna-13b-v1.5',
+                'oasst-sft-4-pythia-12b-epoch-3.5',
+                'alpaca-13b',
+                'baize-v2-13b',
+                'koala-13B-HF',
+                'dolly-v2-12b',
+                'mpt-7b-chat',
+                'chatglm3-6b',
+                'stablelm-tuned-alpha-7b'
+            ]
+
+
+model_paths = [
+    'meta-llama/Llama-2-70b-chat-hf',
+    'mistralai/Mixtral-8x7B-Instruct-v0.1',
+    'WizardLMTeam/WizardLM-13B-V1.2',
+    'meta-llama/CodeLlama-34b-Instruct-hf',
+    'mistralai/Mistral-7B-Instruct-v0.2',     
+    # 
+    'lmsys/vicuna-13b-v1.5',
+    'OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5',
+    'chavinlo/alpaca-13b',
+    'project-baize/baize-v2-13b',
+    'TheBloke/koala-13B-HF',
+    'databricks/dolly-v2-12b',
+    'mosaicml/mpt-7b-chat',
+    'THUDM/chatglm3-6b',
+    'stabilityai/stablelm-tuned-alpha-7b'
+]
+
+
+
+
+suffix = lambda temp: '_tp2_1205_10kreq_1.log' if temp == 1.0 else f'_tp2_temp{temp}_1205_10kreq_1.log'
+temp = 0.8
+
+
+
 dataset = {key:list() for key in model_names}
 
 max_model_len_dict = {key:None for key in model_names}
@@ -106,7 +156,8 @@ def get_max_model_len_from_engine_args(max_model_len_dict, model_paths):
 
 
 for model in dataset.keys():
-    filename = f'{model}{suffix}'
+    # filename = f'{model}{suffix}'
+    filename = f'{model}{suffix(temp=temp)}'
     update_dataset(dataset, model, filename)
     # get_max_model_len(max_model_len_dict, model, filename)
 
@@ -134,6 +185,7 @@ fig_path_prefix = 'Cost_Model_per_iter_zxcpu/figures/cdf'
 fig_path_suffix = 'norobot_1202_1.pdf'
 fig_path_prefix = 'Cost_Model_per_iter_zxcpu/figures/cdf'
 fig_path_suffix = 'norobot_1205_1.pdf'
+fig_path_suffix = f'norobot_temp{temp}_1205_1.pdf'
 
 pdf_dict = dict()
 for k, vs in dataset.items():   
@@ -168,7 +220,8 @@ for k, vs in dataset.items():
     assert (pdf[-1] == 0) and (cdf[-1] == cdf[-2])
     pdf[-1] = 1 - cdf[-2]
     assert sum(pdf) == 1
-    pdf_dict[k] = pdf.tolist()
+    # pdf_dict[k] = pdf.tolist()
+    pdf_dict[(k, temp)] = pdf.tolist()
     # 
     # plot the cdf together with the cumulative outlen distribution per inp for this model
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -203,7 +256,8 @@ for k, vs in dataset.items():
 
 # store the pdf dict to file so that we can directly use it
 with open('./collect_output_lengths/no_robot/out_len_sampler_2.py', 'a') as file:
-    file.write(f"\npdf_dict.update({json.dumps(pdf_dict)})\n")
+    # file.write(f"\npdf_dict.update({json.dumps(pdf_dict)})\n")
+    file.write(f"\npdf_dict.update({pdf_dict})\n")
 
 
 
